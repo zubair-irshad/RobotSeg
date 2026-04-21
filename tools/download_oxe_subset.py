@@ -229,7 +229,17 @@ def main():
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset_map = {}
+    # Merge into any existing dataset_map.json from prior runs so we don't
+    # clobber entries from earlier invocations.
+    map_path = args.out_dir / "dataset_map.json"
+    if map_path.exists():
+        try:
+            dataset_map = json.loads(map_path.read_text())
+        except json.JSONDecodeError:
+            dataset_map = {}
+    else:
+        dataset_map = {}
+
     for name in names:
         if name not in OXE_DATASETS:
             print(f"[skip] unknown dataset: {name}")
@@ -239,9 +249,7 @@ def main():
             num_episodes=args.num_episodes, frame_stride=args.frame_stride,
         )
         # Persist incrementally so a crash mid-run still yields useful output
-        (args.out_dir / "dataset_map.json").write_text(
-            json.dumps(dataset_map, indent=2)
-        )
+        map_path.write_text(json.dumps(dataset_map, indent=2))
 
     print(f"\nDone. Wrote {args.out_dir / 'dataset_map.json'}")
 

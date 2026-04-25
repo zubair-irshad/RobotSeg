@@ -1,23 +1,19 @@
 """Qualitative-only RobotSeg inference on arbitrary image-folder sequences
 (e.g. the OXE subset produced by tools/download_oxe_subset.py).
 
-Derived from inference_auto_semi_vrs.py, with:
-  - no GT mask dependency (no mask_gt_info/*.npy required)
-  - only `input == "auto"` mode (no prompts needed)
-  - configurable --image_root (a dir of per-sequence subdirs of .jpg frames)
-  - saves binary masks + colored overlays for visual inspection
-  - saves per-frame mask centroid to centroids.json (for PnP downstream)
-
-Layout expected:
-    <image_root>/
-      <seq_name_1>/ 00000.jpg 00001.jpg ...
-      <seq_name_2>/ ...
+Supports running multiple categories (e.g. arm + gripper) in a single pass.
+Per-category binary masks are saved under <save_root>/<seq>/<instance_id>/.
+When more than one category is requested, a combined overlay is produced
+under <save_root>/<seq>/combined/, with each category drawn in its own color
+and the gripper centroid (treated as the end-effector) marked.
 
 Layout produced:
     <save_root>/<seq_name>/<instance_id>/
       00000.png              # binary mask
-      00000_overlay.jpg      # overlay (if --save_overlay)
-      centroids.json         # {frame_name: [cx, cy] or null}
+      00000_overlay.jpg      # per-category overlay (if --save_overlay)
+      centroids.json
+    <save_root>/<seq_name>/combined/
+      00000.jpg              # arm + gripper overlay + EE centroid marker
 """
 
 import os
@@ -33,27 +29,55 @@ from tqdm import tqdm
 
 
 CATEGORY2ID = {"arm": "000", "gripper": "001", "robot": "002"}
-OVERLAY_COLOR = np.array([0, 255, 0], dtype=np.uint8)  # green
+# BGR colors per category
+CATEGORY_COLOR = {
+    "arm":     np.array([0, 255, 0],   dtype=np.uint8),  # green
+    "gripper": np.array([0, 0, 255],   dtype=np.uint8),  # red
+    "robot":   np.array([255, 0, 0],   dtype=np.uint8),  # blue
+}
 
 
 def _save_png(path, arr):
     cv2.imwrite(path, arr)
 
 
-def _save_overlay(path, image_bgr, mask_u8, alpha=0.5):
+def _save_overlay(path, image_bgr, mask_u8, color, alpha=0.5):
     overlay = image_bgr.copy()
     sel = mask_u8 > 127
-    overlay[sel] = ((1 - alpha) * image_bgr[sel] + alpha * OVERLAY_COLOR).astype(np.uint8)
+    overlay[sel] = ((1 - alpha) * image_bgr[sel] + alpha * color).astype(np.uint8)
     cv2.imwrite(path, overlay)
 
 
-def _save_centroid_viz(path, image_bgr, centroid):
+def _save_centroid_viz(path, image_bgr, centroid, color=(0, 0, 255)):
     viz = image_bgr.copy()
     if centroid is not None:
         cx, cy = int(round(centroid[0])), int(round(centroid[1]))
-        cv2.drawMarker(viz, (cx, cy), (0, 0, 255),
+        cv2.drawMarker(viz, (cx, cy), color,
                        markerType=cv2.MARKER_CROSS, markerSize=24, thickness=2)
         cv2.circle(viz, (cx, cy), 6, (0, 255, 255), 2)
+    cv2.imwrite(path, viz)
+
+
+def _save_combined(path, image_bgr, masks_by_cat, ee_centroid, alpha=0.5):
+    """Overlay multiple category masks with their colors, and mark EE centroid."""
+    viz = image_bgr.copy().astype(np.float32)
+    for cat, mask in masks_by_cat.items():
+        if mask is None:
+            continue
+        sel = mask > 127
+        if not np.any(sel):
+            continue
+        color = CATEGORY_COLOR[cat].astype(np.float32)
+        viz[sel] = (1 - alpha) * viz[sel] + alpha * color
+    viz = viz.astype(np.uint8)
+
+    if ee_centroid is not None:
+        cx, cy = int(round(ee_centroid[0])), int(round(ee_centroid[1]))
+        cv2.drawMarker(viz, (cx, cy), (255, 255, 255),
+                       markerType=cv2.MARKER_CROSS, markerSize=26, thickness=3)
+        cv2.circle(viz, (cx, cy), 7, (0, 255, 255), 2)
+        cv2.putText(viz, "EE", (cx + 10, cy - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
     cv2.imwrite(path, viz)
 
 
@@ -62,6 +86,41 @@ def _mask_centroid(mask_u8):
     if xs.size == 0:
         return None
     return [float(xs.mean()), float(ys.mean())]
+
+
+def _run_category(predictor, torch, seq_path, category, start_idx=0):
+    """Run inference for a single category over the whole sequence.
+    Returns (frame_indices_sorted, stacked_masks_uint8 [N,H,W])."""
+    state = predictor.init_state(
+        video_path=seq_path,
+        async_loading_frames=False,
+        offload_video_to_cpu=False,
+        offload_state_to_cpu=False,
+    )
+    _, object_ids, masks = predictor.add_new_robot(
+        inference_state=state,
+        frame_idx=start_idx,
+        obj_id=0,
+        robot=category,
+    )
+    first = {oid: (masks[i] > 0.0) for i, oid in enumerate(object_ids)}
+
+    gpu_masks = [first[0][0]]
+    frame_indices = [start_idx]
+
+    for out_idx, out_obj_ids, out_logits in predictor.propagate_in_video(
+        inference_state=state, robot=category
+    ):
+        if out_idx == start_idx:
+            continue
+        gpu_masks.append((out_logits[0] > 0.0)[0])
+        frame_indices.append(out_idx)
+
+    stacked = (torch.stack(gpu_masks, 0).cpu().numpy() * 255).astype(np.uint8)
+    order = np.argsort(frame_indices)
+    frame_indices = [frame_indices[i] for i in order]
+    stacked = stacked[order]
+    return frame_indices, stacked
 
 
 def process_sequences(args, gpu_id, seq_list):
@@ -77,7 +136,6 @@ def process_sequences(args, gpu_id, seq_list):
     checkpoint = f"../checkpoints/{args.ckpt}.pt"
     predictor = build_robotseg_video_predictor(model_cfg, checkpoint)
 
-    instance_id = CATEGORY2ID[args.category.lower()]
     save_pool = ThreadPoolExecutor(max_workers=8)
 
     for seq_name in tqdm(seq_list, desc=f"GPU {gpu_id}"):
@@ -89,71 +147,114 @@ def process_sequences(args, gpu_id, seq_list):
             continue
         frame_stems = [os.path.splitext(f)[0] for f in frame_files]
 
-        out_dir = os.path.join(args.save_root, seq_name, instance_id)
-        if os.path.isdir(out_dir) and os.listdir(out_dir) and not args.overwrite:
+        # Decide which categories still need running
+        cats_to_run = []
+        per_cat_outdirs = {}
+        for cat in args.categories:
+            instance_id = CATEGORY2ID[cat]
+            out_dir = os.path.join(args.save_root, seq_name, instance_id)
+            per_cat_outdirs[cat] = out_dir
+            if os.path.isdir(out_dir) and os.listdir(out_dir) and not args.overwrite:
+                continue
+            cats_to_run.append(cat)
+            os.makedirs(out_dir, exist_ok=True)
+
+        # If everything already exists and combined is not requested, skip.
+        do_combined = (
+            (args.save_overlay or args.save_centroid_viz)
+            and len(args.categories) > 1
+        )
+        combined_dir = os.path.join(args.save_root, seq_name, "combined")
+        if do_combined:
+            os.makedirs(combined_dir, exist_ok=True)
+        if not cats_to_run and not (do_combined and args.overwrite):
             continue
-        os.makedirs(out_dir, exist_ok=True)
+
+        # Load images once if we'll need them for any visualization.
+        need_images = args.save_overlay or args.save_centroid_viz or do_combined
+
+        # Run each category that needs running.
+        masks_by_cat = {}     # cat -> dict[stem] = mask_u8
+        centroids_by_cat = {} # cat -> dict[stem] = [cx,cy] or None
+
+        # Also pull existing masks for cats already on disk so combined can use them.
+        for cat in args.categories:
+            if cat in cats_to_run:
+                continue
+            out_dir = per_cat_outdirs[cat]
+            d = {}
+            for stem in frame_stems:
+                p = os.path.join(out_dir, f"{stem}.png")
+                if os.path.exists(p):
+                    d[stem] = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+            if d:
+                masks_by_cat[cat] = d
+                cj = os.path.join(out_dir, "centroids.json")
+                if os.path.exists(cj):
+                    with open(cj) as f:
+                        centroids_by_cat[cat] = json.load(f)
 
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-            state = predictor.init_state(
-                video_path=seq_path,
-                async_loading_frames=False,
-                offload_video_to_cpu=False,
-                offload_state_to_cpu=False,
-            )
+            for cat in cats_to_run:
+                instance_id = CATEGORY2ID[cat]
+                out_dir = per_cat_outdirs[cat]
+                color = CATEGORY_COLOR[cat]
+                frame_indices, stacked = _run_category(predictor, torch, seq_path, cat)
 
-            # auto mode: prompt-free, starts from frame 0
-            start_idx = 0
-            _, object_ids, masks = predictor.add_new_robot(
-                inference_state=state,
-                frame_idx=start_idx,
-                obj_id=0,
-                robot=args.category,
-            )
-            first = {oid: (masks[i] > 0.0) for i, oid in enumerate(object_ids)}
+                centroids = {}
+                cat_masks = {}
+                for k, idx in enumerate(frame_indices):
+                    stem = frame_stems[idx]
+                    mask = stacked[k]
+                    cat_masks[stem] = mask
+                    save_pool.submit(_save_png, os.path.join(out_dir, f"{stem}.png"), mask)
+                    centroids[stem] = _mask_centroid(mask)
 
-            gpu_masks = [first[0][0]]
-            frame_indices = [start_idx]
+                    if (args.save_overlay or args.save_centroid_viz) and need_images:
+                        img_path = os.path.join(seq_path, frame_files[idx])
+                        img = cv2.imread(img_path)
+                        if img is not None:
+                            if args.save_overlay:
+                                save_pool.submit(
+                                    _save_overlay,
+                                    os.path.join(out_dir, f"{stem}_overlay.jpg"),
+                                    img, mask, color,
+                                )
+                            if args.save_centroid_viz:
+                                save_pool.submit(
+                                    _save_centroid_viz,
+                                    os.path.join(out_dir, f"{stem}_centroid.jpg"),
+                                    img, centroids[stem],
+                                )
 
-            for out_idx, out_obj_ids, out_logits in predictor.propagate_in_video(
-                inference_state=state, robot=args.category
-            ):
-                if out_idx == start_idx:
+                masks_by_cat[cat] = cat_masks
+                centroids_by_cat[cat] = centroids
+                with open(os.path.join(out_dir, "centroids.json"), "w") as f:
+                    json.dump(centroids, f, indent=2)
+
+        # Combined overlay (one image per frame, all categories together,
+        # with EE = gripper centroid annotated when available).
+        if do_combined:
+            ee_cat = "gripper" if "gripper" in masks_by_cat else None
+            for idx, stem in enumerate(frame_stems):
+                per_cat_mask = {
+                    cat: masks_by_cat.get(cat, {}).get(stem)
+                    for cat in args.categories
+                }
+                if all(m is None for m in per_cat_mask.values()):
                     continue
-                gpu_masks.append((out_logits[0] > 0.0)[0])
-                frame_indices.append(out_idx)
-
-        stacked = (torch.stack(gpu_masks, 0).cpu().numpy() * 255).astype(np.uint8)
-        order = np.argsort(frame_indices)
-        frame_indices = [frame_indices[i] for i in order]
-        stacked = stacked[order]
-
-        centroids = {}
-        for k, idx in enumerate(frame_indices):
-            stem = frame_stems[idx]
-            mask = stacked[k]
-            save_pool.submit(_save_png, os.path.join(out_dir, f"{stem}.png"), mask)
-            centroids[stem] = _mask_centroid(mask)
-
-            if args.save_overlay or args.save_centroid_viz:
                 img_path = os.path.join(seq_path, frame_files[idx])
                 img = cv2.imread(img_path)
-                if img is not None:
-                    if args.save_overlay:
-                        save_pool.submit(
-                            _save_overlay,
-                            os.path.join(out_dir, f"{stem}_overlay.jpg"),
-                            img, mask,
-                        )
-                    if args.save_centroid_viz:
-                        save_pool.submit(
-                            _save_centroid_viz,
-                            os.path.join(out_dir, f"{stem}_centroid.jpg"),
-                            img, centroids[stem],
-                        )
-
-        with open(os.path.join(out_dir, "centroids.json"), "w") as f:
-            json.dump(centroids, f, indent=2)
+                if img is None:
+                    continue
+                ee = None
+                if ee_cat is not None:
+                    ee = centroids_by_cat.get(ee_cat, {}).get(stem)
+                save_pool.submit(
+                    _save_combined,
+                    os.path.join(combined_dir, f"{stem}.jpg"),
+                    img, per_cat_mask, ee,
+                )
 
     save_pool.shutdown(wait=True)
 
@@ -163,7 +264,10 @@ def main():
     p.add_argument("--image_root", required=True,
                    help="Dir containing per-sequence frame subdirs.")
     p.add_argument("--save_root", required=True)
-    p.add_argument("--category", required=True, choices=list(CATEGORY2ID))
+    p.add_argument("--category", default=None, choices=list(CATEGORY2ID),
+                   help="Single category (legacy). Use --categories to pass several.")
+    p.add_argument("--categories", default=None,
+                   help="Comma-separated categories, e.g. arm,gripper")
     p.add_argument("--ckpt", default="robotseg")
     p.add_argument("--yaml", default="robotseg-infer.yaml")
     p.add_argument("--save_overlay", action="store_true")
@@ -171,6 +275,16 @@ def main():
                    help="Save per-frame image with mask centroid marker drawn.")
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()
+
+    if args.categories:
+        args.categories = [c.strip().lower() for c in args.categories.split(",") if c.strip()]
+    elif args.category:
+        args.categories = [args.category.lower()]
+    else:
+        raise SystemExit("Pass --categories arm,gripper (or legacy --category).")
+    for c in args.categories:
+        if c not in CATEGORY2ID:
+            raise SystemExit(f"Unknown category {c}; valid: {list(CATEGORY2ID)}")
 
     seqs = sorted(
         d for d in os.listdir(args.image_root)
@@ -182,7 +296,6 @@ def main():
     # If sequences are nested one level deeper (our OXE layout puts
     # frames under <episode>/frames/*.jpg), rewrite image_root to point
     # at <episode>/frames by creating a flattened view.
-    # Simplest: detect and auto-expand.
     expanded = []
     new_root_map = {}
     for s in seqs:
@@ -191,7 +304,6 @@ def main():
             expanded.append(s)
             new_root_map[s] = maybe_frames
     if expanded and len(expanded) == len(seqs):
-        # create a symlink root so predictor.init_state sees flat layout
         link_root = os.path.join(args.save_root, "_frames_view")
         os.makedirs(link_root, exist_ok=True)
         for s, real in new_root_map.items():

@@ -110,9 +110,9 @@ def process_sequences(args, gpu_id, seq_list):
                 obj_id=0,
                 robot=args.category,
             )
-            first = {oid: (masks[i] > 0.0).cpu().numpy() for i, oid in enumerate(object_ids)}
+            first = {oid: (masks[i] > 0.0) for i, oid in enumerate(object_ids)}
 
-            gpu_masks = [torch.as_tensor(first[0][0])]
+            gpu_masks = [first[0][0]]
             frame_indices = [start_idx]
 
             for out_idx, out_obj_ids, out_logits in predictor.propagate_in_video(

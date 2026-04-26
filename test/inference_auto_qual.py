@@ -81,31 +81,71 @@ def _save_combined(path, image_bgr, masks_by_cat, ee_centroid, alpha=0.5):
     cv2.imwrite(path, viz)
 
 
-def _mask_centroid(mask_u8):
-    ys, xs = np.where(mask_u8 > 127)
-    if xs.size == 0:
+def _entry_centroid(entry):
+    """Extract a centroid [cx,cy] from a centroids.json entry that may be
+    legacy list form or new dict form."""
+    if entry is None:
         return None
-    return [float(xs.mean()), float(ys.mean())]
+    if isinstance(entry, dict):
+        return entry.get("centroid")
+    return entry
+
+
+def _mask_stats(mask_u8, prob_u8=None):
+    """Per-frame mask stats: centroid + confidence + area + #components.
+
+    Confidence is mean/max sigmoid probability inside the binary mask.
+    Without prob_u8, confidence is reported as 1.0 (legacy)."""
+    sel = mask_u8 > 127
+    h, w = mask_u8.shape
+    n = int(sel.sum())
+    if n == 0:
+        return {
+            "centroid": None,
+            "area_frac": 0.0,
+            "conf_mean": 0.0,
+            "conf_max": 0.0,
+            "n_components": 0,
+        }
+    ys, xs = np.where(sel)
+    centroid = [float(xs.mean()), float(ys.mean())]
+    n_components = int(cv2.connectedComponents(mask_u8 // 255)[0] - 1)
+    if prob_u8 is not None:
+        p = prob_u8[sel].astype(np.float32) / 255.0
+        conf_mean = float(p.mean())
+        conf_max = float(p.max())
+    else:
+        conf_mean = 1.0
+        conf_max = 1.0
+    return {
+        "centroid": centroid,
+        "area_frac": n / float(h * w),
+        "conf_mean": conf_mean,
+        "conf_max": conf_max,
+        "n_components": n_components,
+    }
 
 
 def _run_category(predictor, torch, seq_path, category, start_idx=0):
     """Run inference for a single category over the whole sequence.
-    Returns (frame_indices_sorted, stacked_masks_uint8 [N,H,W])."""
+
+    Returns (frame_indices_sorted, masks_u8 [N,H,W], probs_u8 [N,H,W])
+    where probs_u8 is sigmoid(logits) quantized to uint8 (per-pixel
+    confidence)."""
     state = predictor.init_state(
         video_path=seq_path,
         async_loading_frames=False,
         offload_video_to_cpu=False,
         offload_state_to_cpu=False,
     )
-    _, object_ids, masks = predictor.add_new_robot(
+    _, object_ids, masks_logits = predictor.add_new_robot(
         inference_state=state,
         frame_idx=start_idx,
         obj_id=0,
         robot=category,
     )
-    first = {oid: (masks[i] > 0.0) for i, oid in enumerate(object_ids)}
 
-    gpu_masks = [first[0][0]]
+    gpu_logits = [masks_logits[0][0]]  # logits for object 0
     frame_indices = [start_idx]
 
     for out_idx, out_obj_ids, out_logits in predictor.propagate_in_video(
@@ -113,14 +153,19 @@ def _run_category(predictor, torch, seq_path, category, start_idx=0):
     ):
         if out_idx == start_idx:
             continue
-        gpu_masks.append((out_logits[0] > 0.0)[0])
+        gpu_logits.append(out_logits[0][0])
         frame_indices.append(out_idx)
 
-    stacked = (torch.stack(gpu_masks, 0).cpu().numpy() * 255).astype(np.uint8)
+    logits = torch.stack(gpu_logits, 0)
+    probs = torch.sigmoid(logits)
+    masks_u8 = ((probs > 0.5).cpu().numpy() * 255).astype(np.uint8)
+    probs_u8 = (probs.float().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+
     order = np.argsort(frame_indices)
     frame_indices = [frame_indices[i] for i in order]
-    stacked = stacked[order]
-    return frame_indices, stacked
+    masks_u8 = masks_u8[order]
+    probs_u8 = probs_u8[order]
+    return frame_indices, masks_u8, probs_u8
 
 
 def process_sequences(args, gpu_id, seq_list):
@@ -199,16 +244,22 @@ def process_sequences(args, gpu_id, seq_list):
                 instance_id = CATEGORY2ID[cat]
                 out_dir = per_cat_outdirs[cat]
                 color = CATEGORY_COLOR[cat]
-                frame_indices, stacked = _run_category(predictor, torch, seq_path, cat)
+                frame_indices, stacked, probs = _run_category(predictor, torch, seq_path, cat)
 
-                centroids = {}
+                stats_by_stem = {}
                 cat_masks = {}
                 for k, idx in enumerate(frame_indices):
                     stem = frame_stems[idx]
                     mask = stacked[k]
+                    prob = probs[k]
                     cat_masks[stem] = mask
                     save_pool.submit(_save_png, os.path.join(out_dir, f"{stem}.png"), mask)
-                    centroids[stem] = _mask_centroid(mask)
+                    if args.save_prob:
+                        save_pool.submit(
+                            _save_png, os.path.join(out_dir, f"{stem}_prob.png"), prob
+                        )
+                    stats_by_stem[stem] = _mask_stats(mask, prob)
+                    centroid = stats_by_stem[stem]["centroid"]
 
                     if (args.save_overlay or args.save_centroid_viz) and need_images:
                         img_path = os.path.join(seq_path, frame_files[idx])
@@ -224,13 +275,13 @@ def process_sequences(args, gpu_id, seq_list):
                                 save_pool.submit(
                                     _save_centroid_viz,
                                     os.path.join(out_dir, f"{stem}_centroid.jpg"),
-                                    img, centroids[stem],
+                                    img, centroid,
                                 )
 
                 masks_by_cat[cat] = cat_masks
-                centroids_by_cat[cat] = centroids
+                centroids_by_cat[cat] = stats_by_stem
                 with open(os.path.join(out_dir, "centroids.json"), "w") as f:
-                    json.dump(centroids, f, indent=2)
+                    json.dump(stats_by_stem, f, indent=2)
 
         # Combined overlay (one image per frame, all categories together,
         # with EE = gripper centroid annotated when available).
@@ -249,7 +300,7 @@ def process_sequences(args, gpu_id, seq_list):
                     continue
                 ee = None
                 if ee_cat is not None:
-                    ee = centroids_by_cat.get(ee_cat, {}).get(stem)
+                    ee = _entry_centroid(centroids_by_cat.get(ee_cat, {}).get(stem))
                 save_pool.submit(
                     _save_combined,
                     os.path.join(combined_dir, f"{stem}.jpg"),
@@ -273,6 +324,8 @@ def main():
     p.add_argument("--save_overlay", action="store_true")
     p.add_argument("--save_centroid_viz", action="store_true",
                    help="Save per-frame image with mask centroid marker drawn.")
+    p.add_argument("--save_prob", action="store_true",
+                   help="Save per-frame sigmoid probability map as <stem>_prob.png.")
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()
 

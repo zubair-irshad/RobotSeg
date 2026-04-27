@@ -34,12 +34,11 @@ from oxe_registry import OXE_DATASETS  # noqa: E402
 # Mirrors EE_XYZ_DIMS in pnp_oxe.py
 CLAIMED_EE_DIMS = {
     "taco_play": (0, 3),
-    "fanuc_manipulation_v2": (0, 3),
     "berkeley_autolab_ur5": (7, 10),
     "ucsd_pick_and_place_dataset_converted_externally_to_rlds": (0, 3),
     "bridge": (0, 3),
-    "cmu_stretch": (0, 3),
     "fractal20220817_data": (0, 3),
+    "kuka": (0, 3),
     "droid": (0, 3),
 }
 
@@ -83,13 +82,25 @@ def inspect_dataset(name: str, cfg: dict):
         print("  [skip] empty episode")
         return
 
-    if state_key not in steps[0]["observation"]:
+    def _nested(obs, key):
+        if key in obs:
+            return obs[key]
+        cur = obs
+        for part in key.split("/"):
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            else:
+                return None
+        return cur
+
+    if _nested(steps[0]["observation"], state_key) is None:
         print(f"  [warn] state_key '{state_key}' not in observation. "
               f"Available: {list(steps[0]['observation'].keys())}")
         return
 
     states = np.stack(
-        [np.asarray(s["observation"][state_key]).ravel() for s in steps], axis=0
+        [np.asarray(_nested(s["observation"], state_key)).ravel() for s in steps],
+        axis=0,
     )
     print(f"  state shape over episode: {states.shape}, dtype={states.dtype}")
     print(f"  first  state[0]: {np.array2string(states[0], precision=4, suppress_small=True)}")

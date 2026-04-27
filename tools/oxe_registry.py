@@ -58,15 +58,17 @@ OXE_DATASETS = {
         "fps_note": "5 Hz",
     },
     # --- Kuka iiwa ---
+    # Verified by tools/inspect_oxe_state.py: observation actually does
+    # carry the EE pose under a nested key.
     "kuka": {
         "embodiment": "Kuka iiwa",
         "version": "0.1.0",
         "rgb_keys": ["image"],
-        "state_key": None,  # dataset has no proprio state field
+        "state_key": "clip_function_input/base_pose_tool_reached",
         "action_key": "action",
         "state_schema": (
-            "No proprio state; action[7] = delta ee pose + gripper. "
-            "For PnP you need EE xyz accumulated from actions — NOT RECOMMENDED."
+            "clip_function_input/base_pose_tool_reached[7]: xyz(0:3), quat(3:7). "
+            "EE xyz for PnP = [0:3]."
         ),
         "fps_note": "10 Hz",
     },
@@ -121,6 +123,11 @@ OXE_DATASETS = {
         "fps_note": "50 Hz",
     },
     # --- xArm ---
+    # WARNING: state values are NOT in meters (per inspect_oxe_state.py the
+    # range is ~2.9 in dim 0). Rotation from PnP will be correct, but the
+    # estimated translation will be in whatever scaled units this dataset
+    # publishes (decimeters? raw encoder?). Don't compare its translation
+    # against datasets that publish meters without rescaling first.
     "ucsd_pick_and_place_dataset_converted_externally_to_rlds": {
         "embodiment": "xArm",
         "version": "0.1.0",
@@ -128,7 +135,8 @@ OXE_DATASETS = {
         "state_key": "state",
         "action_key": "action",
         "state_schema": (
-            "state[7]: ee_xyz(0:3), ee_euler(3:6), gripper(6). EE xyz = [0:3]."
+            "state[7]: ee_xyz(0:3), ee_euler(3:6), gripper(6). "
+            "EE xyz = [0:3] but UNITS ARE NOT METERS."
         ),
         "fps_note": "~5 Hz",
     },
@@ -158,6 +166,10 @@ OXE_DATASETS = {
         "fps_note": "~10 Hz",
     },
     # --- Hello Stretch ---
+    # WARNING: PnP-degenerate. state[1] (y) is identically 0 across every
+    # episode (Stretch's arm has no y-DoF in the base frame). The 3D EE
+    # points lie on a single x–z plane, which makes solvePnP unstable
+    # from sparse 2D centroids. Excluded from DEFAULT_DATASETS_FOR_PNP.
     "cmu_stretch": {
         "embodiment": "Hello Stretch",
         "version": "0.1.0",
@@ -165,7 +177,8 @@ OXE_DATASETS = {
         "state_key": "state",
         "action_key": "action",
         "state_schema": (
-            "state[4]: ee_xyz(0:3), gripper(3). EE xyz = [0:3]."
+            "state[4]: arm_extension(0), 0(1), lift(2), wrist_yaw(3). "
+            "EE xyz in base = (state[0], 0, state[2]) — coplanar."
         ),
         "fps_note": "~5 Hz",
     },
@@ -173,13 +186,18 @@ OXE_DATASETS = {
 
 # A conservative default subset that have usable EE xyz directly in state
 # (best for PnP stress-testing). Override with --datasets on the CLI.
+# Verified end-to-end via tools/inspect_oxe_state.py.
+#   - cmu_stretch dropped: y dim of state is identically 0 → coplanar
+#     EE points → degenerate PnP.
+#   - fanuc_manipulation_v2 dropped: GCS bucket no longer hosts it.
+#   - ucsd_pick_and_place kept but its translation is in dataset units,
+#     not meters (rotation is unaffected).
 DEFAULT_DATASETS_FOR_PNP = [
     "taco_play",
-    "fanuc_manipulation_v2",
     "berkeley_autolab_ur5",
     "ucsd_pick_and_place_dataset_converted_externally_to_rlds",
     "bridge",
-    "cmu_stretch",
     "fractal20220817_data",
+    "kuka",
     "droid",
 ]

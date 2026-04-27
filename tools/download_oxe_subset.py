@@ -82,6 +82,23 @@ def _to_numpy(x):
     return x
 
 
+def _nested_get(obs, key):
+    """Look up a possibly-nested key like 'clip_function_input/base_pose_tool_reached'.
+
+    Some OXE shards expose the key as flat with the slash kept as a literal,
+    others expose it as a nested dict. Try flat first, then nested traversal.
+    Returns None if not found."""
+    if key in obs:
+        return obs[key]
+    cur = obs
+    for part in key.split("/"):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return None
+    return cur
+
+
 def _pick_rgb_key(obs: dict, candidates: list[str]) -> str | None:
     for k in candidates:
         if k in obs:
@@ -124,8 +141,10 @@ def process_episode(episode, cfg: dict, ep_dir: Path, frame_stride: int) -> dict
         Image.fromarray(img).save(frames_dir / f"{len(kept_idx):05d}.jpg", quality=92)
         kept_idx.append(i)
 
-        if state_key is not None and state_key in step["observation"]:
-            states.append(np.asarray(step["observation"][state_key]).ravel())
+        if state_key is not None:
+            v = _nested_get(step["observation"], state_key)
+            if v is not None:
+                states.append(np.asarray(v).ravel())
         if action_key is not None and action_key in step:
             a = step[action_key]
             # action may be a dict (Google robot) or array

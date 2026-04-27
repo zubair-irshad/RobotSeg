@@ -58,17 +58,17 @@ from oxe_registry import OXE_DATASETS  # noqa: E402
 # Where in trajectory["state"] the EE xyz lives, parsed from the registry schema.
 EE_XYZ_DIMS: dict[str, tuple[int, int]] = {
     "taco_play": (0, 3),
-    "fanuc_manipulation_v2": (0, 3),
     "berkeley_autolab_ur5": (7, 10),
     "ucsd_pick_and_place_dataset_converted_externally_to_rlds": (0, 3),
     "bridge": (0, 3),
-    "cmu_stretch": (0, 3),
-    # fractal: registry now sets state_key to 'base_pose_tool_reached'
-    # per AugE's processor, so state[:, :3] gives EE xyz directly.
+    # fractal: registry sets state_key='base_pose_tool_reached'.
     "fractal20220817_data": (0, 3),
+    # kuka: registry sets state_key='clip_function_input/base_pose_tool_reached'.
+    "kuka": (0, 3),
     "droid": (0, 3),
-    # Datasets with no proprio state (kuka, roboturk) require action
-    # integration and are skipped here.
+    # NOT included: cmu_stretch (state[1]≡0 → coplanar EE → degenerate
+    # PnP); roboturk (no proprio state); fanuc_manipulation_v2 (GCS path
+    # broken); aloha_mobile (GCS path broken).
 }
 
 

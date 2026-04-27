@@ -63,8 +63,12 @@ EE_XYZ_DIMS: dict[str, tuple[int, int]] = {
     "ucsd_pick_and_place_dataset_converted_externally_to_rlds": (0, 3),
     "bridge": (0, 3),
     "cmu_stretch": (0, 3),
-    # Datasets with no proprio state (kuka, fractal20220817_data, roboturk) require
-    # action integration and are skipped here.
+    # fractal: registry now sets state_key to 'base_pose_tool_reached'
+    # per AugE's processor, so state[:, :3] gives EE xyz directly.
+    "fractal20220817_data": (0, 3),
+    "droid": (0, 3),
+    # Datasets with no proprio state (kuka, roboturk) require action
+    # integration and are skipped here.
 }
 
 
@@ -106,6 +110,9 @@ def _read_image_size(seq_frames_dir: Path) -> tuple[int, int] | None:
 
 def _filter_frames(centroids_json, ee_xyz_seq, W, H, args):
     """Return (pts3d Nx3, pts2d Nx2, kept_stems, rejected) post-filter."""
+    img_area = float(W * H)
+    min_area_eff = max(args.min_area, args.min_area_px / img_area)
+
     pts3d, pts2d, kept, rej = [], [], [], []
     for stem, entry in centroids_json.items():
         idx = int(stem)
@@ -124,7 +131,7 @@ def _filter_frames(centroids_json, ee_xyz_seq, W, H, args):
         if conf < args.min_conf:
             rej.append((stem, f"low-conf({conf:.2f})"))
             continue
-        if area < args.min_area:
+        if area < min_area_eff:
             rej.append((stem, f"area-small({area:.4f})"))
             continue
         if area > args.max_area:
@@ -150,16 +157,18 @@ def _filter_frames(centroids_json, ee_xyz_seq, W, H, args):
 
 def _solve_pnp(pts3d, pts2d, K_mat, args):
     """Returns dict with rvec, tvec, T_cam2base, inlier_idx (into pts3d), rmse."""
-    if len(pts3d) < 6:
+    if len(pts3d) < max(4, args.min_inliers):
         return None
     dist = np.zeros(5)
+    # EPNP for >=5 points, ITERATIVE for 4 (which needs at least 4 coplanar/3D pts).
+    flags = cv2.SOLVEPNP_EPNP if len(pts3d) >= 5 else cv2.SOLVEPNP_ITERATIVE
     ok, rvec, tvec, inliers = cv2.solvePnPRansac(
         pts3d.astype(np.float64), pts2d.astype(np.float64),
         K_mat, dist,
         iterationsCount=2000,
         reprojectionError=float(args.reproj_thresh),
         confidence=0.999,
-        flags=cv2.SOLVEPNP_EPNP,
+        flags=flags,
     )
     if not ok or inliers is None or len(inliers) < args.min_inliers:
         return None
@@ -353,8 +362,11 @@ def main():
 
     # filtering
     p.add_argument("--min_conf", type=float, default=0.5)
-    p.add_argument("--min_area", type=float, default=0.0008,
-                   help="Minimum mask area as fraction of image (~0.08%%).")
+    p.add_argument("--min_area", type=float, default=0.0002,
+                   help="Minimum mask area as fraction of image (~0.02%%). "
+                        "Floored at --min_area_px regardless.")
+    p.add_argument("--min_area_px", type=int, default=16,
+                   help="Absolute pixel floor for the gripper mask.")
     p.add_argument("--max_area", type=float, default=0.4)
     p.add_argument("--edge_margin", type=int, default=4,
                    help="Reject centroids within N px of any image border.")
@@ -363,8 +375,9 @@ def main():
 
     # PnP
     p.add_argument("--reproj_thresh", type=float, default=8.0)
-    p.add_argument("--min_inliers", type=int, default=8)
-    p.add_argument("--max_rmse", type=float, default=15.0)
+    p.add_argument("--min_inliers", type=int, default=5,
+                   help="EPNP needs >=4; we require a few more for stability.")
+    p.add_argument("--max_rmse", type=float, default=20.0)
     p.add_argument("--min_inlier_frac", type=float, default=0.4)
 
     p.add_argument("--viz", action="store_true",
@@ -412,7 +425,11 @@ def main():
             tag = r.get("status", "?")
             extra = ""
             if "rmse_px" in r:
-                extra = f"  rmse={r['rmse_px']:.2f}px  inliers={r['num_inliers']}/{r['num_kept_after_filter']}"
+                extra = (f"  rmse={r['rmse_px']:.2f}px  "
+                         f"inliers={r['num_inliers']}/{r['num_kept_after_filter']}")
+            elif "rejection_breakdown" in r:
+                extra = (f"  kept={r['num_kept_after_filter']}/{r['num_total']}"
+                         f"  reasons={r['rejection_breakdown']}")
             print(f"  [{ds}/{ep_seg.name}] {tag}{extra}")
 
         bad = [r["episode"] for r in results if r.get("status", "").startswith("bad")]

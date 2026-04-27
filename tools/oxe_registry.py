@@ -71,18 +71,39 @@ OXE_DATASETS = {
         "fps_note": "10 Hz",
     },
     # --- Google Everyday Robot ---
+    # Per AugE (process_fractal20220817_data): EE pose is published as
+    #   observation['base_pose_tool_reached'] = [x, y, z, qw, qx, qy, qz]
+    # in the robot base frame (suitable for PnP).
     "fractal20220817_data": {
         "embodiment": "Google Everyday Robot",
         "version": "0.1.0",
         "rgb_keys": ["image"],
-        "state_key": None,
+        "state_key": "base_pose_tool_reached",
         "action_key": "action",
         "state_schema": (
-            "No explicit EE xyz in state. action dict has "
-            "world_vector(3), rotation_delta(3), gripper_closedness_action(1). "
-            "EE xyz must be integrated — limited PnP utility."
+            "base_pose_tool_reached[7]: xyz(0:3), quat(3:7). "
+            "EE xyz for PnP = [0:3]."
         ),
         "fps_note": "3 Hz",
+    },
+    # --- DROID (Franka) ---
+    # DROID publishes cartesian_position (xyz+euler) and joint_position
+    # directly under steps.observation. Multiple cameras are available;
+    # exterior_image_1_left is fixed third-person.
+    "droid": {
+        "embodiment": "Franka",
+        "version": "1.0.0",
+        "rgb_keys": [
+            "exterior_image_1_left", "exterior_image_2_left",
+            "wrist_image_left",
+        ],
+        "state_key": "cartesian_position",
+        "action_key": "action",
+        "state_schema": (
+            "cartesian_position[6]: xyz(0:3), euler(3:6). "
+            "EE xyz for PnP = [0:3]. (joint_position[7] also in observation.)"
+        ),
+        "fps_note": "15 Hz",
     },
     # --- MobileALOHA ---
     # Dataset published as part of OXE under this name.
@@ -159,4 +180,6 @@ DEFAULT_DATASETS_FOR_PNP = [
     "ucsd_pick_and_place_dataset_converted_externally_to_rlds",
     "bridge",
     "cmu_stretch",
+    "fractal20220817_data",
+    "droid",
 ]

@@ -82,6 +82,89 @@ def _to_numpy(x):
     return x
 
 
+# ----- camera intrinsics extraction -------------------------------------
+# Scan the RLDS feature spec / a step / episode_metadata for anything that
+# looks like camera intrinsics, so we don't have to guess at PnP time.
+# Returns a list of dicts: {"source": str, "path": str, "data": ...}.
+
+INTRINSIC_KEY_HINTS = (
+    "intrinsic", "camera_matrix", "calibration", "focal", "fov",
+    "cam_K", "camera_k",
+)
+
+
+def _flatten_dict(d, prefix=""):
+    out = {}
+    if isinstance(d, dict):
+        for k, v in d.items():
+            sub = f"{prefix}/{k}" if prefix else k
+            if isinstance(v, dict):
+                out.update(_flatten_dict(v, sub))
+            else:
+                out[sub] = v
+    return out
+
+
+def _looks_like_K(arr) -> bool:
+    a = np.asarray(arr)
+    if a.dtype.kind not in "fui":
+        return False
+    if a.shape == (3, 3) or a.shape == (9,) or a.shape == (4,):
+        return True
+    return False
+
+
+def _scan_for_intrinsics(d, prefix=""):
+    """Return list of (path, value) where path name OR value shape suggests K."""
+    found = []
+    flat = _flatten_dict(d, prefix)
+    for path, v in flat.items():
+        name = path.lower()
+        is_named = any(h in name for h in INTRINSIC_KEY_HINTS)
+        try:
+            looks_K = _looks_like_K(v)
+        except Exception:
+            looks_K = False
+        if is_named or (looks_K and ("cam" in name or "image" in name)):
+            try:
+                found.append((path, np.asarray(v).tolist()))
+            except Exception:
+                pass
+    return found
+
+
+def extract_intrinsics(episode, first_step) -> dict | None:
+    """Look for intrinsics in episode_metadata + first step's observation/step.
+
+    Returns a dict to dump as camera.json, or None if nothing found.
+    """
+    candidates = []
+    try:
+        ep_meta = episode["episode_metadata"]
+    except (KeyError, TypeError):
+        ep_meta = None
+    if ep_meta:
+        candidates += [("episode_metadata", p, v)
+                       for p, v in _scan_for_intrinsics(_to_numpy(ep_meta))]
+
+    obs = first_step.get("observation", {}) if isinstance(first_step, dict) else {}
+    if obs:
+        candidates += [("observation", p, v)
+                       for p, v in _scan_for_intrinsics(_to_numpy(obs))]
+
+    step_top = {k: v for k, v in first_step.items() if k != "observation"} \
+        if isinstance(first_step, dict) else {}
+    if step_top:
+        candidates += [("step", p, v)
+                       for p, v in _scan_for_intrinsics(_to_numpy(step_top))]
+
+    if not candidates:
+        return None
+
+    return {"raw": [{"source": s, "path": p, "data": v}
+                    for s, p, v in candidates]}
+
+
 def _nested_get(obs, key):
     """Look up a possibly-nested key like 'clip_function_input/base_pose_tool_reached'.
 
@@ -120,6 +203,11 @@ def process_episode(episode, cfg: dict, ep_dir: Path, frame_stride: int) -> dict
     steps = list(episode["steps"].as_numpy_iterator())
     if not steps:
         return {"num_frames_saved": 0, "num_steps_total": 0}
+
+    # Save any intrinsics-like fields the RLDS publishes so PnP doesn't guess.
+    cam_meta = extract_intrinsics(episode, steps[0])
+    if cam_meta is not None:
+        (ep_dir / "camera.json").write_text(json.dumps(cam_meta, indent=2))
 
     first_obs = steps[0]["observation"]
     rgb_key = _pick_rgb_key(first_obs, cfg["rgb_keys"])

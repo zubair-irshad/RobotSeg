@@ -87,6 +87,46 @@ def _entry_to_record(entry):
     return entry, 1.0, 0.0, 1
 
 
+def _K_from_camera_json(cam_json: dict, W: int, H: int) -> dict | None:
+    """Pick the most plausible 3x3 K from a saved camera.json (written by
+    download_oxe_subset.py). Returns None if nothing usable found.
+
+    Heuristic: prefer a (3,3) tensor with positive diagonal and cx/cy
+    inside the image. Accept (9,) flattened too.
+    """
+    raw = cam_json.get("raw", []) if isinstance(cam_json, dict) else []
+    best = None
+    for entry in raw:
+        data = entry.get("data")
+        try:
+            arr = np.asarray(data, dtype=np.float64)
+        except Exception:
+            continue
+        if arr.size == 9:
+            K = arr.reshape(3, 3)
+        elif arr.shape == (4,) and "intrinsic" in entry.get("path", "").lower():
+            # (fx, fy, cx, cy) packed
+            fx, fy, cx, cy = arr.tolist()
+            K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1.0]])
+        else:
+            continue
+        fx, fy = K[0, 0], K[1, 1]
+        cx, cy = K[0, 2], K[1, 2]
+        if fx <= 0 or fy <= 0:
+            continue
+        if not (0 <= cx <= W and 0 <= cy <= H):
+            continue
+        cand = {"fx": float(fx), "fy": float(fy),
+                "cx": float(cx), "cy": float(cy),
+                "width": W, "height": H,
+                "source": entry.get("path", "rlds")}
+        # prefer entries whose cx/cy are near image center
+        score = -(abs(cx - 0.5 * W) + abs(cy - 0.5 * H))
+        if best is None or score > best[0]:
+            best = (score, cand)
+    return best[1] if best else None
+
+
 def _default_K(W: int, H: int, hfov_deg: float) -> dict:
     fx = 0.5 * W / math.tan(0.5 * math.radians(hfov_deg))
     return {"fx": fx, "fy": fx, "cx": 0.5 * W, "cy": 0.5 * H,
@@ -265,7 +305,26 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
     if img_size is None:
         return {"status": "skip-no-image", "episode": ep_dir_seg.name}
     W, H = img_size
-    K = K_override if K_override is not None else _default_K(W, H, args.hfov_deg)
+
+    # Resolution order for K: --K_json override > per-episode camera.json
+    # (saved by download_oxe_subset.py from the RLDS spec) > HFOV guess.
+    K = None
+    if K_override is not None:
+        K = dict(K_override)
+        K.setdefault("width", W)
+        K.setdefault("height", H)
+        K["source"] = "K_json"
+    if K is None:
+        cam_path = ep_dir_oxe / "camera.json"
+        if cam_path.exists():
+            try:
+                cam_json = json.loads(cam_path.read_text())
+                K = _K_from_camera_json(cam_json, W, H)
+            except Exception:
+                K = None
+    if K is None:
+        K = _default_K(W, H, args.hfov_deg)
+        K["source"] = f"hfov={args.hfov_deg}deg"
     K_mat = _K_to_mat(K)
 
     pts3d, pts2d, kept_stems, rejected = _filter_frames(

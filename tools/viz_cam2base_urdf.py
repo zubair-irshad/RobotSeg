@@ -121,6 +121,16 @@ def main():
                    default=[0.0, 0.0, 0.0],
                    metavar=("X", "Y", "Z"),
                    help="Translation (m) of URDF root in dataset base frame.")
+    p.add_argument("--debug_markers", action="store_true", default=True,
+                   help="Overlay BASE (URDF root projection) and EE (eef_xyz "
+                        "projection) markers. Use to diagnose whether the "
+                        "silhouette mismatch is from T_cam2base or from "
+                        "joint angles / URDF internals.")
+    p.add_argument("--no_debug_markers", dest="debug_markers", action="store_false")
+    p.add_argument("--zero_pose", action="store_true",
+                   help="Render the URDF at q=0 ignoring the dataset's joint "
+                        "angles. Useful to see whether T_cam2base alone places "
+                        "the robot correctly when the rest pose is known.")
     args = p.parse_args()
 
     if args.dataset not in JOINT_DIMS:
@@ -232,12 +242,56 @@ def main():
                     grip = float(np.clip(1.0 - raw / 0.085, 0.0, 1.0))
                 else:
                     grip = float(np.clip(raw, 0.0, 1.0))
+            if args.zero_pose:
+                q_arm = np.zeros_like(q_arm)
+                grip = 0.0
             mask = masker.render(
                 K=K, T_cam2base=T_cam2base_for_render,
                 joint_positions=q_arm, gripper_position=grip,
                 image_hw=(img.shape[0], img.shape[1]),
             )
             viz = _overlay(img, mask)
+
+            # Debug overlays: project the URDF root origin (where the
+            # masker thinks the robot base is) and the dataset's EE xyz
+            # (which we know lands at the actual gripper). Read both off
+            # the same K and T_cam2base used for rendering.
+            if args.debug_markers:
+                K_mat = np.array([[K["fx"], 0, K["cx"]],
+                                  [0, K["fy"], K["cy"]],
+                                  [0, 0, 1.0]], dtype=np.float64)
+                T_base2cam_render = np.linalg.inv(T_cam2base_for_render)
+
+                def _proj(p_root):
+                    p_cam = T_base2cam_render @ np.array([*p_root, 1.0])
+                    if p_cam[2] <= 0.05:
+                        return None
+                    u = K_mat[0, 0] * p_cam[0] / p_cam[2] + K_mat[0, 2]
+                    v = K_mat[1, 1] * p_cam[1] / p_cam[2] + K_mat[1, 2]
+                    return int(round(u)), int(round(v))
+
+                # 🔵 URDF root origin (= robot base in URDF's frame)
+                base_uv = _proj([0.0, 0.0, 0.0])
+                if base_uv is not None:
+                    cv2.drawMarker(viz, base_uv, (255, 0, 0),
+                                   cv2.MARKER_CROSS, 32, 3)
+                    cv2.putText(viz, "BASE", (base_uv[0]+8, base_uv[1]-8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+
+                # 🟢 EE position from eef_xyz (this we trust since you said
+                # it lands at the actual gripper). For UR5, that's
+                # state[7:10]. We use the rotated version because we're
+                # rendering in the URDF root frame.
+                if state.shape[1] >= 10:
+                    ee_in_base = np.asarray(state[idx, 7:10], dtype=float)
+                    ee_in_root = (np.linalg.inv(T_root_in_base)
+                                  @ np.array([*ee_in_base, 1.0]))[:3]
+                    ee_uv = _proj(ee_in_root)
+                    if ee_uv is not None:
+                        cv2.drawMarker(viz, ee_uv, (0, 255, 0),
+                                       cv2.MARKER_TILTED_CROSS, 32, 3)
+                        cv2.putText(viz, "EE", (ee_uv[0]+8, ee_uv[1]-8),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             cv2.imwrite(str(out_dir / f"{stem}.jpg"), viz)
 
         print(f"[ok] {ep}: wrote {out_dir}")

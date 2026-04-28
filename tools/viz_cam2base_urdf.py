@@ -178,10 +178,15 @@ def main():
     for ep in targets:
         pnp = json.loads((ds_seg / ep / "pnp.json").read_text())
         T_cam2base = np.asarray(pnp["T_cam2base"], dtype=np.float64)
-        # Move T_cam2base into the URDF root frame so render() projects
-        # verts that live in 'base_link' / 'world' correctly:
-        #   T_cam2root = T_cam2base @ T_base2root = T_cam2base @ inv(T_root2base)
-        T_cam2base_for_render = T_cam2base @ np.linalg.inv(T_root_in_base)
+        # Re-express the camera pose in the URDF root frame. If the URDF
+        # root (e.g. base_link) is related to the dataset's base frame by
+        #   T_root_in_base  (pose of root expressed in base),
+        # then the same camera, expressed in root, is
+        #   T_cam_in_root = inv(T_root_in_base) @ T_cam_in_base.
+        # This is a LEFT-multiplication; a right-multiplication would
+        # rotate the camera's local axes instead of changing the frame
+        # the verts live in.
+        T_cam2base_for_render = np.linalg.inv(T_root_in_base) @ T_cam2base
         K = pnp["K"]
         traj = np.load(ds_oxe / ep / "trajectory.npz")
         state = traj["state"]

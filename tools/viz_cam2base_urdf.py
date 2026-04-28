@@ -131,6 +131,16 @@ def main():
                    help="Render the URDF at q=0 ignoring the dataset's joint "
                         "angles. Useful to see whether T_cam2base alone places "
                         "the robot correctly when the rest pose is known.")
+    p.add_argument("--joint_signs", nargs="+", type=float, default=None,
+                   metavar="S",
+                   help="Per-joint sign multiplier applied to q_dataset before "
+                        "feeding the URDF. Length must match arm DOF. "
+                        "Common UR fixes: '1 -1 -1 -1 1 1' or '1 -1 -1 1 1 1'.")
+    p.add_argument("--joint_offsets_rad", nargs="+", type=float, default=None,
+                   metavar="O",
+                   help="Per-joint additive offset (rad) added AFTER signs. "
+                        "ros-industrial UR5 sometimes needs offsets near "
+                        "+/- pi/2 on shoulder_lift.")
     args = p.parse_args()
 
     if args.dataset not in JOINT_DIMS:
@@ -228,6 +238,22 @@ def main():
             # yourdfpy silently clamps to URDF limits, which gives a
             # visually wrong pose. Joint angles modulo 2π are kinematically
             # equivalent for revolute joints, so wrap into [-π, π].
+            if args.wrap_revolute:
+                q_arm = ((q_arm + np.pi) % (2 * np.pi)) - np.pi
+            # Per-joint sign flip + additive offset. UR datasets often
+            # publish joints in a convention that disagrees with the URDF
+            # by a sign on shoulder_lift/elbow/wrist_1 and/or a π/2 offset
+            # on shoulder_lift. Apply those here:
+            #   q_urdf[i] = signs[i] * q_dataset[i] + offsets[i]
+            if args.joint_signs is not None:
+                signs = np.asarray(args.joint_signs, dtype=float)
+                if len(signs) >= len(q_arm):
+                    q_arm = signs[:len(q_arm)] * q_arm
+            if args.joint_offsets_rad is not None:
+                offs = np.asarray(args.joint_offsets_rad, dtype=float)
+                if len(offs) >= len(q_arm):
+                    q_arm = q_arm + offs[:len(q_arm)]
+            # Re-wrap after sign/offset since they can push outside [-π,π].
             if args.wrap_revolute:
                 q_arm = ((q_arm + np.pi) % (2 * np.pi)) - np.pi
             if grip_idx is None:

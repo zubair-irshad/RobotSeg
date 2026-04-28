@@ -27,6 +27,10 @@ import sys
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 from urdf_robot_masker import URDFRobotMasker  # noqa: E402
+try:
+    from mjcf_robot_masker import MuJoCoRobotMasker  # noqa: E402
+except Exception:  # mujoco not installed yet
+    MuJoCoRobotMasker = None
 
 
 # Per-dataset: how to dig joint angles + a normalized gripper position
@@ -86,8 +90,16 @@ def main():
     p.add_argument("--oxe_root", type=Path, required=True)
     p.add_argument("--mask_root", type=Path, required=True)
     p.add_argument("--dataset", required=True)
-    p.add_argument("--urdf", type=Path, required=True)
+    p.add_argument("--urdf", type=Path, default=None,
+                   help="URDF path (yourdfpy backend). Required unless --mjcf is used.")
+    p.add_argument("--mjcf", type=Path, default=None,
+                   help="MuJoCo MJCF path (e.g. AugE's "
+                        "robot_xml/universal_robots_ur5e/ur5e.xml). When set, "
+                        "uses MuJoCo for kinematics + mesh assets and ignores "
+                        "URDF-specific flags (joint_signs, base_offset, etc.).")
     p.add_argument("--mesh_dir", type=Path, default=None)
+    p.add_argument("--arm_dof", type=int, default=6,
+                   help="Number of arm DOFs to push into MJCF qpos[:n].")
     p.add_argument("--episodes", nargs="+", default=None,
                    help="Subset of episode_XXXX names. Default: all OK ones.")
     p.add_argument("--max_frames_per_ep", type=int, default=20)
@@ -156,14 +168,30 @@ def main():
     gripper_joint_name = (args.gripper_joint_name or
                           GRIPPER_JOINT_NAMES.get(args.dataset, "finger_joint"))
 
-    masker = URDFRobotMasker(
-        urdf_path=args.urdf, mesh_dir=args.mesh_dir,
-        downsample=args.downsample, dilate_px=args.dilate_px,
-        arm_joint_names=arm_names,
-        gripper_joint_name=gripper_joint_name,
-        gripper_open_rad=args.gripper_open_rad,
-        gripper_closed_rad=args.gripper_closed_rad,
-    )
+    if args.mjcf is not None:
+        if MuJoCoRobotMasker is None:
+            raise SystemExit("mujoco is not installed. `pip install mujoco`.")
+        masker = MuJoCoRobotMasker(
+            mjcf_path=args.mjcf, arm_dof=args.arm_dof,
+            downsample=args.downsample, dilate_px=args.dilate_px,
+        )
+        # MJCF backends use the real-controller joint convention; no need
+        # for the URDF base-link / base flip, no per-joint signs/offsets,
+        # no joint-limit clamping (MuJoCo respects URDF-style limits but
+        # the Menagerie MJCF uses ±2π for all UR joints).
+        using_mjcf = True
+    else:
+        if args.urdf is None:
+            raise SystemExit("Pass --urdf <path> (or --mjcf <path>).")
+        masker = URDFRobotMasker(
+            urdf_path=args.urdf, mesh_dir=args.mesh_dir,
+            downsample=args.downsample, dilate_px=args.dilate_px,
+            arm_joint_names=arm_names,
+            gripper_joint_name=gripper_joint_name,
+            gripper_open_rad=args.gripper_open_rad,
+            gripper_closed_rad=args.gripper_closed_rad,
+        )
+        using_mjcf = False
 
     ds_oxe = args.oxe_root / args.dataset
     ds_seg = args.mask_root / args.dataset
@@ -206,7 +234,12 @@ def main():
         # This is a LEFT-multiplication; a right-multiplication would
         # rotate the camera's local axes instead of changing the frame
         # the verts live in.
-        T_cam2base_for_render = np.linalg.inv(T_root_in_base) @ T_cam2base
+        # MJCF backend uses the dataset's base frame directly — no flip
+        # needed. URDF backend requires the root-vs-base correction.
+        if using_mjcf:
+            T_cam2base_for_render = T_cam2base
+        else:
+            T_cam2base_for_render = np.linalg.inv(T_root_in_base) @ T_cam2base
         K = pnp["K"]
         traj = np.load(ds_oxe / ep / "trajectory.npz")
         state = traj["state"]
@@ -232,30 +265,25 @@ def main():
             if idx >= len(state):
                 continue
             q_arm = np.asarray(state[idx, arm_lo:arm_hi], dtype=float)
-            # Many community URDFs limit revolute joints to [-π, π], but
-            # OXE datasets routinely log angles outside that range (e.g.
-            # Berkeley UR5 shoulder_pan goes to -3.30, wrist_3 to +3.51).
-            # yourdfpy silently clamps to URDF limits, which gives a
-            # visually wrong pose. Joint angles modulo 2π are kinematically
-            # equivalent for revolute joints, so wrap into [-π, π].
-            if args.wrap_revolute:
-                q_arm = ((q_arm + np.pi) % (2 * np.pi)) - np.pi
-            # Per-joint sign flip + additive offset. UR datasets often
-            # publish joints in a convention that disagrees with the URDF
-            # by a sign on shoulder_lift/elbow/wrist_1 and/or a π/2 offset
-            # on shoulder_lift. Apply those here:
-            #   q_urdf[i] = signs[i] * q_dataset[i] + offsets[i]
-            if args.joint_signs is not None:
-                signs = np.asarray(args.joint_signs, dtype=float)
-                if len(signs) >= len(q_arm):
-                    q_arm = signs[:len(q_arm)] * q_arm
-            if args.joint_offsets_rad is not None:
-                offs = np.asarray(args.joint_offsets_rad, dtype=float)
-                if len(offs) >= len(q_arm):
-                    q_arm = q_arm + offs[:len(q_arm)]
-            # Re-wrap after sign/offset since they can push outside [-π,π].
-            if args.wrap_revolute:
-                q_arm = ((q_arm + np.pi) % (2 * np.pi)) - np.pi
+            # MJCF path: feed dataset joints straight through. The
+            # Menagerie MJCF allows ±2π and uses the real-controller
+            # joint convention, so no wrap / sign / offset hacks needed.
+            if not using_mjcf:
+                # URDF path: many community URDFs limit revolute joints
+                # to [-π, π] and use a different convention than the
+                # real UR controller, so wrap + apply sign/offset.
+                if args.wrap_revolute:
+                    q_arm = ((q_arm + np.pi) % (2 * np.pi)) - np.pi
+                if args.joint_signs is not None:
+                    signs = np.asarray(args.joint_signs, dtype=float)
+                    if len(signs) >= len(q_arm):
+                        q_arm = signs[:len(q_arm)] * q_arm
+                if args.joint_offsets_rad is not None:
+                    offs = np.asarray(args.joint_offsets_rad, dtype=float)
+                    if len(offs) >= len(q_arm):
+                        q_arm = q_arm + offs[:len(q_arm)]
+                if args.wrap_revolute:
+                    q_arm = ((q_arm + np.pi) % (2 * np.pi)) - np.pi
             if grip_idx is None:
                 grip = 0.0
             else:

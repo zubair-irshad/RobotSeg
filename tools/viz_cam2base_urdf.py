@@ -29,10 +29,40 @@ sys.path.insert(0, str(THIS_DIR))
 from urdf_robot_masker import URDFRobotMasker  # noqa: E402
 
 
-# Per-dataset slice into trajectory["state"] for arm joints + gripper.
-# Set to None where no joints exist in state.
+# Per-dataset: how to dig joint angles + a normalized gripper position
+# (0 = open, 1 = closed) out of trajectory["state"].
+#
+# gripper_kind:
+#   "width_m"        : state[idx] is finger_width in meters (Franka).
+#                      Mapped to 0..1 via [gripper_open_rad, gripper_closed_rad].
+#   "binary_closed"  : state[idx] in {0,1}, 1 == closed.
 JOINT_DIMS = {
-    "taco_play": {"arm": (7, 14), "gripper_idx": 6},  # gripper_width
+    "taco_play": {"arm": (7, 14), "gripper_idx": 6,
+                  "gripper_kind": "width_m"},
+    "berkeley_autolab_ur5": {"arm": (0, 6), "gripper_idx": 6,
+                              "gripper_kind": "binary_closed"},
+}
+
+# Default URDF joint names per embodiment, in the same order the dataset
+# stores joint angles. Override at the CLI with --arm_joint_names if your
+# URDF uses different names.
+ARM_JOINT_NAMES = {
+    "taco_play": [
+        "panda_joint1", "panda_joint2", "panda_joint3", "panda_joint4",
+        "panda_joint5", "panda_joint6", "panda_joint7",
+    ],
+    "berkeley_autolab_ur5": [
+        "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
+        "wrist_1_joint", "wrist_2_joint", "wrist_3_joint",
+    ],
+}
+
+# Default URDF gripper joint name per embodiment. Robotiq 2F-85 (used on
+# Berkeley AutoLab UR5) drives the whole gripper from 'finger_joint' or
+# 'robotiq_85_left_knuckle_joint' depending on the URDF source.
+GRIPPER_JOINT_NAMES = {
+    "taco_play": "finger_joint",
+    "berkeley_autolab_ur5": "finger_joint",
 }
 
 
@@ -66,22 +96,31 @@ def main():
     p.add_argument("--gripper_open_rad", type=float, default=0.0)
     p.add_argument("--gripper_closed_rad", type=float, default=0.7)
     p.add_argument("--arm_joint_names", default=None,
-                   help="Comma-separated URDF joint names; default = panda arm.")
+                   help="Comma-separated URDF joint names; default per dataset "
+                        "(see ARM_JOINT_NAMES).")
+    p.add_argument("--gripper_joint_name", default=None,
+                   help="URDF joint that drives the gripper open/close. Default "
+                        "per dataset (see GRIPPER_JOINT_NAMES).")
     args = p.parse_args()
 
     if args.dataset not in JOINT_DIMS:
         raise SystemExit(
             f"{args.dataset}: no joint-dim slice known. Add to JOINT_DIMS.")
-    arm_lo, arm_hi = JOINT_DIMS[args.dataset]["arm"]
-    grip_idx = JOINT_DIMS[args.dataset].get("gripper_idx")
+    spec = JOINT_DIMS[args.dataset]
+    arm_lo, arm_hi = spec["arm"]
+    grip_idx = spec.get("gripper_idx")
+    grip_kind = spec.get("gripper_kind", "width_m")
 
-    arm_names = (args.arm_joint_names.split(",")
-                 if args.arm_joint_names else None)
+    arm_names = (args.arm_joint_names.split(",") if args.arm_joint_names
+                 else ARM_JOINT_NAMES.get(args.dataset))
+    gripper_joint_name = (args.gripper_joint_name or
+                          GRIPPER_JOINT_NAMES.get(args.dataset, "finger_joint"))
 
     masker = URDFRobotMasker(
         urdf_path=args.urdf, mesh_dir=args.mesh_dir,
         downsample=args.downsample, dilate_px=args.dilate_px,
         arm_joint_names=arm_names,
+        gripper_joint_name=gripper_joint_name,
         gripper_open_rad=args.gripper_open_rad,
         gripper_closed_rad=args.gripper_closed_rad,
     )
@@ -128,7 +167,18 @@ def main():
             if idx >= len(state):
                 continue
             q_arm = np.asarray(state[idx, arm_lo:arm_hi], dtype=float)
-            grip = float(state[idx, grip_idx]) if grip_idx is not None else 0.0
+            if grip_idx is None:
+                grip = 0.0
+            else:
+                raw = float(state[idx, grip_idx])
+                if grip_kind == "binary_closed":
+                    grip = 1.0 if raw >= 0.5 else 0.0
+                elif grip_kind == "width_m":
+                    # Map measured width (m) into 0=open .. 1=closed using
+                    # the per-call open/closed radian span as proxy bounds.
+                    grip = float(np.clip(1.0 - raw / 0.085, 0.0, 1.0))
+                else:
+                    grip = float(np.clip(raw, 0.0, 1.0))
             mask = masker.render(
                 K=K, T_cam2base=T_cam2base,
                 joint_positions=q_arm, gripper_position=grip,

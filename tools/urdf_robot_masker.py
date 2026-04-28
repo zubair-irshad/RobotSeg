@@ -12,6 +12,7 @@ the arm. Override _URDF_ARM_JOINT_NAMES if you use a different robot.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import cv2
@@ -74,7 +75,29 @@ class URDFRobotMasker:
                       build_collision_scene_graph=False,
                       load_collision_meshes=False)
         if mesh_dir is not None:
-            kwargs["mesh_dir"] = str(mesh_dir)
+            mesh_dir = str(mesh_dir)
+            kwargs["mesh_dir"] = mesh_dir
+            # Resolve `package://<pkg>/...` URIs to <mesh_dir>/... so we
+            # don't need a working ROS install to load community URDFs
+            # (e.g. ros-industrial's universal_robot, automaticaddison's
+            # ur_robotiq).
+            def _filename_handler(fname: str) -> str:
+                if fname.startswith("package://"):
+                    rest = fname[len("package://"):]
+                    parts = rest.split("/", 1)
+                    if len(parts) == 2:
+                        # Try a few resolution strategies in order:
+                        candidates = [
+                            os.path.join(mesh_dir, parts[1]),               # mesh_dir/<after-pkg>
+                            os.path.join(mesh_dir, rest),                   # mesh_dir/<pkg>/<...>
+                            os.path.join(os.path.dirname(mesh_dir), rest),  # parent/<pkg>/<...>
+                        ]
+                        for c in candidates:
+                            if os.path.exists(c):
+                                return c
+                        return candidates[0]
+                return fname
+            kwargs["filename_handler"] = _filename_handler
         self.robot = yourdfpy.URDF.load(str(urdf_path), **kwargs)
         self.downsample = max(1, int(downsample))
         self.dilate_px = int(dilate_px)

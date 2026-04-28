@@ -108,6 +108,19 @@ def main():
                         "ur5e_2f85_joint_limited_robot.urdf).")
     p.add_argument("--no_wrap_revolute", dest="wrap_revolute",
                    action="store_false")
+    # URDF-root vs dataset-base frame offset. For UR URDFs (incl. CogRob
+    # ur5e_2f85), the URDF root 'base_link' is 180° around Z relative to
+    # the real-robot 'base' frame the dataset publishes EE pose in.
+    p.add_argument("--base_offset_rpy_deg", nargs=3, type=float,
+                   default=[0.0, 0.0, 180.0],
+                   metavar=("R", "P", "Y"),
+                   help="Roll/pitch/yaw (deg) of URDF root expressed in the "
+                        "dataset's base frame. Default 0 0 180 for UR URDFs. "
+                        "Use 0 0 0 for Franka URDFs (rerun-io/franka_description).")
+    p.add_argument("--base_offset_xyz", nargs=3, type=float,
+                   default=[0.0, 0.0, 0.0],
+                   metavar=("X", "Y", "Z"),
+                   help="Translation (m) of URDF root in dataset base frame.")
     args = p.parse_args()
 
     if args.dataset not in JOINT_DIMS:
@@ -146,9 +159,29 @@ def main():
         targets = [r["episode"] for r in summary["results"]
                    if r.get("status") == "ok"]
 
+    # If the URDF root differs from the dataset's base frame by a fixed
+    # rigid offset (very common for UR URDFs, where 'base_link' is rotated
+    # 180° around Z relative to the real-robot 'base'), pre-multiply that
+    # correction onto T_cam2base. The user passes the rotation in degrees.
+    rx, ry, rz = (np.deg2rad(a) for a in args.base_offset_rpy_deg)
+    cx, sx = np.cos(rx), np.sin(rx)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cz, sz = np.cos(rz), np.sin(rz)
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    R_off = Rz @ Ry @ Rx
+    T_root_in_base = np.eye(4)
+    T_root_in_base[:3, :3] = R_off
+    T_root_in_base[:3, 3] = args.base_offset_xyz
+
     for ep in targets:
         pnp = json.loads((ds_seg / ep / "pnp.json").read_text())
         T_cam2base = np.asarray(pnp["T_cam2base"], dtype=np.float64)
+        # Move T_cam2base into the URDF root frame so render() projects
+        # verts that live in 'base_link' / 'world' correctly:
+        #   T_cam2root = T_cam2base @ T_base2root = T_cam2base @ inv(T_root2base)
+        T_cam2base_for_render = T_cam2base @ np.linalg.inv(T_root_in_base)
         K = pnp["K"]
         traj = np.load(ds_oxe / ep / "trajectory.npz")
         state = traj["state"]
@@ -195,7 +228,7 @@ def main():
                 else:
                     grip = float(np.clip(raw, 0.0, 1.0))
             mask = masker.render(
-                K=K, T_cam2base=T_cam2base,
+                K=K, T_cam2base=T_cam2base_for_render,
                 joint_positions=q_arm, gripper_position=grip,
                 image_hw=(img.shape[0], img.shape[1]),
             )

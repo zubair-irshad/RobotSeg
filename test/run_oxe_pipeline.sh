@@ -12,6 +12,11 @@ set -euo pipefail
 IMAGE_ROOT="${IMAGE_ROOT:-$HOME/RobotSeg/data/oxe_subset}"
 SAVE_ROOT="${SAVE_ROOT:-$HOME/RobotSeg/data/oxe_subset_seg}"
 CATEGORIES="${CATEGORIES:-arm,gripper}"
+# Better fragmentation behaviour for long episode runs.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# Cap inference resolution (longest image side, px). 0 = native. 384 is a
+# good default for DROID / 480p datasets if you OOM.
+INFER_MAX_SIDE="${INFER_MAX_SIDE:-0}"
 
 cd "$(dirname "$0")"
 
@@ -35,7 +40,8 @@ if [[ "${PIPELINE_SKIP_SEG:-0}" != "1" ]]; then
       --image_root "$src" \
       --save_root  "$dst" \
       --categories "$CATEGORIES" \
-      --save_overlay --save_prob
+      --save_overlay --save_prob \
+      --infer_max_side "$INFER_MAX_SIDE"
   done
 fi
 

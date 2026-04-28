@@ -126,46 +126,94 @@ def _mask_stats(mask_u8, prob_u8=None):
     }
 
 
-def _run_category(predictor, torch, seq_path, category, start_idx=0):
+def _maybe_make_lowres_view(orig_seq_path, frame_files, args):
+    """If --infer_max_side is set and frames exceed it, write a resized
+    copy of the frames to a side dir and return (low_res_path, scale).
+    Otherwise return (orig_seq_path, 1.0)."""
+    if args.infer_max_side <= 0:
+        return orig_seq_path, 1.0
+    sample = cv2.imread(os.path.join(orig_seq_path, frame_files[0]))
+    if sample is None:
+        return orig_seq_path, 1.0
+    H, W = sample.shape[:2]
+    longest = max(H, W)
+    if longest <= args.infer_max_side:
+        return orig_seq_path, 1.0
+    scale = args.infer_max_side / float(longest)
+    new_w = int(round(W * scale))
+    new_h = int(round(H * scale))
+    lowres_dir = orig_seq_path.rstrip("/") + f"__lowres{args.infer_max_side}"
+    os.makedirs(lowres_dir, exist_ok=True)
+    for f in frame_files:
+        dst = os.path.join(lowres_dir, f)
+        if os.path.exists(dst):
+            continue
+        img = cv2.imread(os.path.join(orig_seq_path, f))
+        if img is None:
+            continue
+        cv2.imwrite(dst, cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA))
+    return lowres_dir, scale
+
+
+def _run_category(predictor, torch, seq_path, category, args, start_idx=0):
     """Run inference for a single category over the whole sequence.
 
     Returns (frame_indices_sorted, masks_u8 [N,H,W], probs_u8 [N,H,W])
     where probs_u8 is sigmoid(logits) quantized to uint8 (per-pixel
-    confidence)."""
-    state = predictor.init_state(
-        video_path=seq_path,
-        async_loading_frames=False,
-        offload_video_to_cpu=False,
-        offload_state_to_cpu=False,
-    )
-    _, object_ids, masks_logits = predictor.add_new_robot(
-        inference_state=state,
-        frame_idx=start_idx,
-        obj_id=0,
-        robot=category,
-    )
+    confidence). Cleans up the predictor state + clears the CUDA cache
+    on exit so long episode runs don't leak GPU memory across episodes."""
+    import gc
 
-    gpu_logits = [masks_logits[0][0]]  # logits for object 0
-    frame_indices = [start_idx]
+    state = None
+    gpu_logits = None
+    masks_logits = None
+    try:
+        state = predictor.init_state(
+            video_path=seq_path,
+            async_loading_frames=False,
+            offload_video_to_cpu=args.offload_to_cpu,
+            offload_state_to_cpu=args.offload_to_cpu,
+        )
+        _, object_ids, masks_logits = predictor.add_new_robot(
+            inference_state=state,
+            frame_idx=start_idx,
+            obj_id=0,
+            robot=category,
+        )
 
-    for out_idx, out_obj_ids, out_logits in predictor.propagate_in_video(
-        inference_state=state, robot=category
-    ):
-        if out_idx == start_idx:
-            continue
-        gpu_logits.append(out_logits[0][0])
-        frame_indices.append(out_idx)
+        # Move per-frame logits to CPU as we go so they don't pile up on GPU
+        # for long trajectories.
+        cpu_logits = [masks_logits[0][0].detach().cpu()]
+        frame_indices = [start_idx]
 
-    logits = torch.stack(gpu_logits, 0)
-    probs = torch.sigmoid(logits)
-    masks_u8 = ((probs > 0.5).cpu().numpy() * 255).astype(np.uint8)
-    probs_u8 = (probs.float().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+        for out_idx, out_obj_ids, out_logits in predictor.propagate_in_video(
+            inference_state=state, robot=category
+        ):
+            if out_idx == start_idx:
+                continue
+            cpu_logits.append(out_logits[0][0].detach().cpu())
+            frame_indices.append(out_idx)
 
-    order = np.argsort(frame_indices)
-    frame_indices = [frame_indices[i] for i in order]
-    masks_u8 = masks_u8[order]
-    probs_u8 = probs_u8[order]
-    return frame_indices, masks_u8, probs_u8
+        logits = torch.stack(cpu_logits, 0)
+        probs = torch.sigmoid(logits)
+        masks_u8 = ((probs > 0.5).numpy() * 255).astype(np.uint8)
+        probs_u8 = (probs.float().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+
+        order = np.argsort(frame_indices)
+        frame_indices = [frame_indices[i] for i in order]
+        masks_u8 = masks_u8[order]
+        probs_u8 = probs_u8[order]
+        return frame_indices, masks_u8, probs_u8
+    finally:
+        # Hard cleanup so the next episode starts with a fresh allocator.
+        try:
+            del state, masks_logits, gpu_logits
+        except NameError:
+            pass
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
 
 
 def process_sequences(args, gpu_id, seq_list):
@@ -184,13 +232,24 @@ def process_sequences(args, gpu_id, seq_list):
     save_pool = ThreadPoolExecutor(max_workers=8)
 
     for seq_name in tqdm(seq_list, desc=f"GPU {gpu_id}"):
-        seq_path = os.path.join(args.image_root, seq_name)
+        orig_seq_path = os.path.join(args.image_root, seq_name)
         frame_files = natsorted([
-            f for f in os.listdir(seq_path) if f.lower().endswith((".jpg", ".png"))
+            f for f in os.listdir(orig_seq_path) if f.lower().endswith((".jpg", ".png"))
         ])
         if not frame_files:
             continue
         frame_stems = [os.path.splitext(f)[0] for f in frame_files]
+
+        # Optional half/quarter-res inference: write a downscaled view of the
+        # frames into a temp dir, run the predictor on those, then upsample
+        # masks back to the original size. Trades a bit of segmentation
+        # quality for ~scale^2 GPU-memory savings.
+        seq_path, downscale = _maybe_make_lowres_view(
+            orig_seq_path, frame_files, args
+        )
+        # Read the original frame size once for upsampling masks back later.
+        first_full = cv2.imread(os.path.join(orig_seq_path, frame_files[0]))
+        orig_h, orig_w = first_full.shape[:2] if first_full is not None else (None, None)
 
         # Decide which categories still need running
         cats_to_run = []
@@ -245,7 +304,25 @@ def process_sequences(args, gpu_id, seq_list):
                 instance_id = CATEGORY2ID[cat]
                 out_dir = per_cat_outdirs[cat]
                 color = CATEGORY_COLOR[cat]
-                frame_indices, stacked, probs = _run_category(predictor, torch, seq_path, cat)
+                frame_indices, stacked, probs = _run_category(
+                    predictor, torch, seq_path, cat, args
+                )
+                # If we ran on a downscaled view, upsample masks/probs back
+                # to the original resolution before saving anything.
+                if downscale != 1.0 and orig_h is not None:
+                    stacked_up = np.empty((len(stacked), orig_h, orig_w), dtype=np.uint8)
+                    probs_up = np.empty_like(stacked_up)
+                    for k in range(len(stacked)):
+                        stacked_up[k] = cv2.resize(
+                            stacked[k], (orig_w, orig_h),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                        probs_up[k] = cv2.resize(
+                            probs[k], (orig_w, orig_h),
+                            interpolation=cv2.INTER_LINEAR,
+                        )
+                    stacked = stacked_up
+                    probs = probs_up
 
                 stats_by_stem = {}
                 cat_masks = {}
@@ -265,7 +342,7 @@ def process_sequences(args, gpu_id, seq_list):
                     centroid = stats_by_stem[stem]["centroid"]
 
                     if (args.save_overlay or args.save_centroid_viz) and need_images:
-                        img_path = os.path.join(seq_path, frame_files[idx])
+                        img_path = os.path.join(orig_seq_path, frame_files[idx])
                         img = cv2.imread(img_path)
                         if img is not None:
                             if args.save_overlay:
@@ -301,8 +378,22 @@ def process_sequences(args, gpu_id, seq_list):
             for stem, gmask in list(grip_masks.items()):
                 amask = arm_masks.get(stem)
                 if amask is None:
-                    new_stats[stem] = _mask_stats(gmask, grip_probs.get(stem))
+                    s = _mask_stats(gmask, grip_probs.get(stem))
+                    s["arm_overlap_frac"] = 0.0
+                    s["pre_subtract_area_frac"] = s["area_frac"]
+                    s["observed"] = bool(s["centroid"] is not None
+                                         and s["area_frac"] > 0
+                                         and s["conf_max"] >= 0.7)
+                    new_stats[stem] = s
                     continue
+                # How much of the original gripper mask was actually arm?
+                # arm_overlap_frac ≈ 1 means the gripper category was
+                # almost entirely bleed-over onto the arm — strong signal
+                # that the gripper itself was not visible.
+                gpix_total = int((gmask > 127).sum())
+                gpix_overlap = int(((gmask > 127) & (amask > 127)).sum())
+                arm_overlap = (gpix_overlap / gpix_total) if gpix_total > 0 else 1.0
+
                 disjoint = np.where(amask > 127, 0, gmask).astype(np.uint8)
                 grip_masks[stem] = disjoint
                 save_pool.submit(
@@ -315,7 +406,24 @@ def process_sequences(args, gpu_id, seq_list):
                         _save_png,
                         os.path.join(grip_dir, f"{stem}_prob.png"), new_prob,
                     )
-                new_stats[stem] = _mask_stats(disjoint, grip_probs.get(stem))
+                # All stats here are computed on the POST-subtraction mask
+                # (the actual gripper) — that's what PnP will use.
+                s = _mask_stats(disjoint, grip_probs.get(stem))
+                s["arm_overlap_frac"] = float(arm_overlap)  # informational only
+                s["pre_subtract_area_frac"] = float(
+                    gpix_total / float(gmask.shape[0] * gmask.shape[1])
+                )
+                # "Gripper observed" verdict, judged purely on what survived
+                # the subtraction: non-empty, single component, peak confidence
+                # high enough, and area at least a small floor.
+                disjoint_area = int((disjoint > 127).sum())
+                s["observed"] = bool(
+                    s["centroid"] is not None
+                    and disjoint_area >= 16  # absolute pixel floor
+                    and s["conf_max"] >= 0.7
+                    and s["n_components"] == 1
+                )
+                new_stats[stem] = s
             centroids_by_cat["gripper"] = new_stats
             with open(os.path.join(grip_dir, "centroids.json"), "w") as f:
                 json.dump(new_stats, f, indent=2)
@@ -331,7 +439,7 @@ def process_sequences(args, gpu_id, seq_list):
                 }
                 if all(m is None for m in per_cat_mask.values()):
                     continue
-                img_path = os.path.join(seq_path, frame_files[idx])
+                img_path = os.path.join(orig_seq_path, frame_files[idx])
                 img = cv2.imread(img_path)
                 if img is None:
                     continue
@@ -343,6 +451,14 @@ def process_sequences(args, gpu_id, seq_list):
                     os.path.join(combined_dir, f"{stem}.jpg"),
                     img, per_cat_mask, ee,
                 )
+
+        # Clean up the temporary low-res view (if any) for this episode.
+        if downscale != 1.0 and seq_path != orig_seq_path:
+            try:
+                import shutil
+                shutil.rmtree(seq_path, ignore_errors=True)
+            except Exception:
+                pass
 
     save_pool.shutdown(wait=True)
 
@@ -363,6 +479,15 @@ def main():
                    help="Save per-frame image with mask centroid marker drawn.")
     p.add_argument("--save_prob", action="store_true",
                    help="Save per-frame sigmoid probability map as <stem>_prob.png.")
+    p.add_argument("--offload_to_cpu", action="store_true", default=True,
+                   help="Pass offload_video_to_cpu=True / offload_state_to_cpu=True "
+                        "to predictor.init_state. Big memory win for long episodes; "
+                        "small speed hit.")
+    p.add_argument("--no_offload_to_cpu", dest="offload_to_cpu", action="store_false")
+    p.add_argument("--infer_max_side", type=int, default=0,
+                   help="If >0, downscale frames so the longest side <= N before "
+                        "running the predictor. Masks are upsampled back to the "
+                        "original resolution. Try 256 or 384 if you OOM.")
     p.add_argument("--subtract_arm_from_gripper", action="store_true", default=True,
                    help="Set gripper_mask = gripper_mask AND NOT arm_mask before "
                         "computing centroids. Arm prediction is more reliable, so "

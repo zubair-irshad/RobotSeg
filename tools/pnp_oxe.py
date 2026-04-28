@@ -73,18 +73,26 @@ EE_XYZ_DIMS: dict[str, tuple[int, int]] = {
 
 
 def _entry_to_record(entry):
-    """Parse a centroids.json value into (centroid, conf_mean, area_frac, n_components)."""
+    """Parse a centroids.json value into a dict with the fields the filter
+    uses. Handles both the new dict format and the legacy [cx,cy] list."""
     if entry is None:
-        return None, 0.0, 0.0, 0
+        return {"centroid": None, "conf_mean": 0.0, "conf_max": 0.0,
+                "area_frac": 0.0, "n_components": 0,
+                "arm_overlap_frac": 1.0, "observed": False}
     if isinstance(entry, dict):
-        return (
-            entry.get("centroid"),
-            float(entry.get("conf_mean", 1.0)),
-            float(entry.get("area_frac", 0.0)),
-            int(entry.get("n_components", 1)),
-        )
-    # legacy: list [cx, cy]
-    return entry, 1.0, 0.0, 1
+        return {
+            "centroid": entry.get("centroid"),
+            "conf_mean": float(entry.get("conf_mean", 1.0)),
+            "conf_max":  float(entry.get("conf_max", 1.0)),
+            "area_frac": float(entry.get("area_frac", 0.0)),
+            "n_components": int(entry.get("n_components", 1)),
+            "arm_overlap_frac": float(entry.get("arm_overlap_frac", 0.0)),
+            "observed": entry.get("observed", None),
+        }
+    # Legacy list form (no quality info; assume good).
+    return {"centroid": entry, "conf_mean": 1.0, "conf_max": 1.0,
+            "area_frac": 0.0, "n_components": 1,
+            "arm_overlap_frac": 0.0, "observed": True}
 
 
 def _K_from_camera_json(cam_json: dict, W: int, H: int) -> dict | None:
@@ -164,21 +172,33 @@ def _filter_frames(centroids_json, ee_xyz_seq, W, H, args):
             rej.append((stem, "nan-state"))
             continue
 
-        c, conf, area, ncomp = _entry_to_record(entry)
+        rec = _entry_to_record(entry)
+        c = rec["centroid"]
         if c is None:
             rej.append((stem, "no-centroid"))
             continue
-        if conf < args.min_conf:
-            rej.append((stem, f"low-conf({conf:.2f})"))
+        # Hard gate: if the seg pipeline already flagged the gripper as
+        # unobserved (e.g. 16th frame in your bridge episode), drop it.
+        if args.use_observed_flag and rec["observed"] is False:
+            rej.append((stem, "not-observed"))
             continue
-        if area < min_area_eff:
-            rej.append((stem, f"area-small({area:.4f})"))
+        if rec["conf_mean"] < args.min_conf:
+            rej.append((stem, f"low-conf({rec['conf_mean']:.2f})"))
             continue
-        if area > args.max_area:
-            rej.append((stem, f"area-large({area:.4f})"))
+        if rec["conf_max"] < args.min_conf_max:
+            rej.append((stem, f"low-conf-max({rec['conf_max']:.2f})"))
             continue
-        if ncomp > 1 and args.reject_fragmented:
-            rej.append((stem, f"fragmented({ncomp})"))
+        if rec["area_frac"] < min_area_eff:
+            rej.append((stem, f"area-small({rec['area_frac']:.4f})"))
+            continue
+        if rec["area_frac"] > args.max_area:
+            rej.append((stem, f"area-large({rec['area_frac']:.4f})"))
+            continue
+        if rec["arm_overlap_frac"] > args.max_arm_overlap:
+            rej.append((stem, f"arm-overlap({rec['arm_overlap_frac']:.2f})"))
+            continue
+        if rec["n_components"] > 1 and args.reject_fragmented:
+            rej.append((stem, f"fragmented({rec['n_components']})"))
             continue
         cx, cy = c
         if (cx < args.edge_margin or cy < args.edge_margin or
@@ -234,14 +254,30 @@ def _solve_pnp_with_K_estimation(pts3d, pts2d, W, H, args):
         proj, _ = cv2.projectPoints(p3, rvec, tvec, K, np.zeros(5))
         return (proj.reshape(-1, 2) - p2).flatten()
 
-    x0 = np.concatenate([[fx0], rvec0, tvec0])
+    # Normalize the rvec seed to canonical [-pi, pi] magnitude so it doesn't
+    # blow past the bounds (cv2's RANSAC can produce angles > 2π).
+    ang = float(np.linalg.norm(rvec0))
+    if ang > 1e-9:
+        ang_wrapped = ((ang + np.pi) % (2 * np.pi)) - np.pi
+        rvec0 = rvec0 * (ang_wrapped / ang)
+
     # Soft bounds keep fx in a sane range so we don't drift into degeneracy.
     fx_lo = 0.5 * W / math.tan(0.5 * math.radians(120.0))
     fx_hi = 0.5 * W / math.tan(0.5 * math.radians(15.0))
-    bounds = (
-        np.array([fx_lo,  -np.pi*2, -np.pi*2, -np.pi*2,  -100, -100, -0.01]),
-        np.array([fx_hi,   np.pi*2,  np.pi*2,  np.pi*2,   100,  100,  100]),
-    )
+    # Allow large translation ranges for datasets in non-meter units (e.g.
+    # ucsd_pick_and_place is in scaled units; tvec can be O(10²)).
+    t_abs = float(np.abs(tvec0).max())
+    t_bound = max(100.0, 5.0 * t_abs)
+    lo = np.array([fx_lo,  -np.pi, -np.pi, -np.pi,  -t_bound, -t_bound, -t_bound])
+    hi = np.array([fx_hi,   np.pi,  np.pi,  np.pi,   t_bound,  t_bound,  t_bound])
+
+    x0 = np.concatenate([[fx0], rvec0, tvec0])
+    # Final safety clip — avoids "Initial guess is outside of provided bounds"
+    # from any remaining numerical drift in fx0 / rvec0 / tvec0.
+    eps = 1e-6
+    x0 = np.minimum(np.maximum(x0, lo + eps), hi - eps)
+    bounds = (lo, hi)
+
     sol = least_squares(residuals, x0, bounds=bounds, method="trf",
                         loss="huber", f_scale=2.0, max_nfev=200)
     fx_est = float(sol.x[0])
@@ -531,7 +567,22 @@ def main():
     p.add_argument("--hfov_deg", type=float, default=60.0)
 
     # filtering
-    p.add_argument("--min_conf", type=float, default=0.5)
+    p.add_argument("--use_observed_flag", action="store_true", default=True,
+                   help="Honor centroids.json[*].observed (set by inference) as a "
+                        "hard reject. Disable with --no_use_observed_flag.")
+    p.add_argument("--no_use_observed_flag", dest="use_observed_flag",
+                   action="store_false")
+    p.add_argument("--min_conf", type=float, default=0.5,
+                   help="Reject if mean sigmoid prob inside the gripper mask < this.")
+    p.add_argument("--min_conf_max", type=float, default=0.5,
+                   help="Reject if peak sigmoid prob inside the mask < this. Catches "
+                        "frames where the model never strongly believed any pixel "
+                        "was the gripper.")
+    p.add_argument("--max_arm_overlap", type=float, default=1.0,
+                   help="Reject if PRE-subtraction the gripper mask overlapped the "
+                        "arm mask by more than this fraction. Off by default (=1.0) "
+                        "since the real gate is the post-subtract mask quality "
+                        "encoded in `observed`. Set to e.g. 0.6 if you want it.")
     p.add_argument("--min_area", type=float, default=0.0002,
                    help="Minimum mask area as fraction of image (~0.02%%). "
                         "Floored at --min_area_px regardless.")

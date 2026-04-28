@@ -220,7 +220,8 @@ def process_sequences(args, gpu_id, seq_list):
 
         # Run each category that needs running.
         masks_by_cat = {}     # cat -> dict[stem] = mask_u8
-        centroids_by_cat = {} # cat -> dict[stem] = [cx,cy] or None
+        probs_by_cat = {}     # cat -> dict[stem] = prob_u8
+        centroids_by_cat = {} # cat -> dict[stem] = stats dict
 
         # Also pull existing masks for cats already on disk so combined can use them.
         for cat in args.categories:
@@ -248,11 +249,13 @@ def process_sequences(args, gpu_id, seq_list):
 
                 stats_by_stem = {}
                 cat_masks = {}
+                cat_probs = {}
                 for k, idx in enumerate(frame_indices):
                     stem = frame_stems[idx]
                     mask = stacked[k]
                     prob = probs[k]
                     cat_masks[stem] = mask
+                    cat_probs[stem] = prob
                     save_pool.submit(_save_png, os.path.join(out_dir, f"{stem}.png"), mask)
                     if args.save_prob:
                         save_pool.submit(
@@ -279,9 +282,43 @@ def process_sequences(args, gpu_id, seq_list):
                                 )
 
                 masks_by_cat[cat] = cat_masks
+                probs_by_cat[cat] = cat_probs
                 centroids_by_cat[cat] = stats_by_stem
                 with open(os.path.join(out_dir, "centroids.json"), "w") as f:
                     json.dump(stats_by_stem, f, indent=2)
+
+        # Optional: subtract arm mask out of gripper mask, since the arm
+        # prediction is reliable and the gripper one sometimes leaks onto
+        # the arm shoulder/body. Recompute gripper centroid + stats from
+        # the disjoint mask and overwrite 001/<stem>.png + centroids.json.
+        if (args.subtract_arm_from_gripper
+                and "arm" in masks_by_cat and "gripper" in masks_by_cat):
+            grip_dir = per_cat_outdirs["gripper"]
+            arm_masks = masks_by_cat["arm"]
+            grip_masks = masks_by_cat["gripper"]
+            grip_probs = probs_by_cat.get("gripper", {})
+            new_stats = {}
+            for stem, gmask in list(grip_masks.items()):
+                amask = arm_masks.get(stem)
+                if amask is None:
+                    new_stats[stem] = _mask_stats(gmask, grip_probs.get(stem))
+                    continue
+                disjoint = np.where(amask > 127, 0, gmask).astype(np.uint8)
+                grip_masks[stem] = disjoint
+                save_pool.submit(
+                    _save_png, os.path.join(grip_dir, f"{stem}.png"), disjoint
+                )
+                if args.save_prob and stem in grip_probs:
+                    new_prob = np.where(amask > 127, 0, grip_probs[stem]).astype(np.uint8)
+                    grip_probs[stem] = new_prob
+                    save_pool.submit(
+                        _save_png,
+                        os.path.join(grip_dir, f"{stem}_prob.png"), new_prob,
+                    )
+                new_stats[stem] = _mask_stats(disjoint, grip_probs.get(stem))
+            centroids_by_cat["gripper"] = new_stats
+            with open(os.path.join(grip_dir, "centroids.json"), "w") as f:
+                json.dump(new_stats, f, indent=2)
 
         # Combined overlay (one image per frame, all categories together,
         # with EE = gripper centroid annotated when available).
@@ -326,6 +363,12 @@ def main():
                    help="Save per-frame image with mask centroid marker drawn.")
     p.add_argument("--save_prob", action="store_true",
                    help="Save per-frame sigmoid probability map as <stem>_prob.png.")
+    p.add_argument("--subtract_arm_from_gripper", action="store_true", default=True,
+                   help="Set gripper_mask = gripper_mask AND NOT arm_mask before "
+                        "computing centroids. Arm prediction is more reliable, so "
+                        "subtracting it out cleans up gripper-mask bleed-over.")
+    p.add_argument("--no_subtract_arm_from_gripper", dest="subtract_arm_from_gripper",
+                   action="store_false")
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()
 

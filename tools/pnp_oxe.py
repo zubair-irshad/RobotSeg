@@ -299,6 +299,20 @@ def _solve_pnp(pts3d, pts2d, K_mat, args):
         criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-8),
     )
 
+    # Second-pass outlier rejection: reproject ALL points with the
+    # refined extrinsic and keep only those within reproj_thresh again.
+    # This catches outliers that slipped past the looser EPNP-init solve.
+    proj_all, _ = cv2.projectPoints(pts3d, rvec, tvec, K_mat, dist)
+    err_all = np.linalg.norm(proj_all.reshape(-1, 2) - pts2d, axis=1)
+    refined_inliers = np.where(err_all <= float(args.reproj_thresh))[0]
+    if len(refined_inliers) >= args.min_inliers:
+        inlier_idx = refined_inliers
+        # Re-refine on the cleaner inlier set.
+        rvec, tvec = cv2.solvePnPRefineLM(
+            pts3d[inlier_idx], pts2d[inlier_idx], K_mat, dist, rvec, tvec,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-8),
+        )
+
     R, _ = cv2.Rodrigues(rvec)
     # cv2 PnP returns the transform mapping points-in-world -> points-in-camera.
     # Here "world" = robot base. So [R|t] maps base -> cam, i.e. T_base2cam.

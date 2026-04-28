@@ -101,6 +101,13 @@ def main():
     p.add_argument("--gripper_joint_name", default=None,
                    help="URDF joint that drives the gripper open/close. Default "
                         "per dataset (see GRIPPER_JOINT_NAMES).")
+    p.add_argument("--wrap_revolute", action="store_true", default=True,
+                   help="Wrap arm joint angles into [-pi, pi] before applying "
+                        "to the URDF. Necessary for URDFs whose joints are "
+                        "limited to that range (e.g. CogRob's "
+                        "ur5e_2f85_joint_limited_robot.urdf).")
+    p.add_argument("--no_wrap_revolute", dest="wrap_revolute",
+                   action="store_false")
     args = p.parse_args()
 
     if args.dataset not in JOINT_DIMS:
@@ -167,6 +174,14 @@ def main():
             if idx >= len(state):
                 continue
             q_arm = np.asarray(state[idx, arm_lo:arm_hi], dtype=float)
+            # Many community URDFs limit revolute joints to [-π, π], but
+            # OXE datasets routinely log angles outside that range (e.g.
+            # Berkeley UR5 shoulder_pan goes to -3.30, wrist_3 to +3.51).
+            # yourdfpy silently clamps to URDF limits, which gives a
+            # visually wrong pose. Joint angles modulo 2π are kinematically
+            # equivalent for revolute joints, so wrap into [-π, π].
+            if args.wrap_revolute:
+                q_arm = ((q_arm + np.pi) % (2 * np.pi)) - np.pi
             if grip_idx is None:
                 grip = 0.0
             else:

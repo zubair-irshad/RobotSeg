@@ -195,6 +195,85 @@ def _filter_frames(centroids_json, ee_xyz_seq, W, H, args):
             kept, rej)
 
 
+def _solve_pnp_with_K_estimation(pts3d, pts2d, W, H, args):
+    """Jointly estimate fx (=fy), rvec, tvec for a fixed-camera trajectory.
+
+    Principal point fixed at image center; only the focal length is free
+    alongside the 6-DoF extrinsic. Initialised from a HFOV-guess PnP. RANSAC
+    is run at the initial focal first to reject 2D outliers, then SciPy LM
+    optimises (fx, rvec, tvec) on the inlier set. Returns the same dict as
+    _solve_pnp plus the estimated K."""
+    try:
+        from scipy.optimize import least_squares
+    except ImportError:
+        return None  # caller will fall back to fixed K
+
+    if len(pts3d) < max(5, args.min_inliers):
+        return None
+    cx, cy = 0.5 * W, 0.5 * H
+    fx0 = 0.5 * W / math.tan(0.5 * math.radians(args.hfov_deg))
+
+    K0 = np.array([[fx0, 0, cx], [0, fx0, cy], [0, 0, 1.0]], dtype=np.float64)
+    seed = _solve_pnp(pts3d, pts2d, K0, args)
+    if seed is None:
+        return None
+    inlier_idx = np.array(seed["inlier_idx"], dtype=int)
+    if len(inlier_idx) < max(5, args.min_inliers):
+        return None
+    rvec0 = np.asarray(seed["rvec"], dtype=np.float64).reshape(3)
+    tvec0 = np.asarray(seed["tvec"], dtype=np.float64).reshape(3)
+
+    p3 = pts3d[inlier_idx].astype(np.float64)
+    p2 = pts2d[inlier_idx].astype(np.float64)
+
+    def residuals(params):
+        fx = params[0]
+        rvec = params[1:4].reshape(3, 1)
+        tvec = params[4:7].reshape(3, 1)
+        K = np.array([[fx, 0, cx], [0, fx, cy], [0, 0, 1.0]], dtype=np.float64)
+        proj, _ = cv2.projectPoints(p3, rvec, tvec, K, np.zeros(5))
+        return (proj.reshape(-1, 2) - p2).flatten()
+
+    x0 = np.concatenate([[fx0], rvec0, tvec0])
+    # Soft bounds keep fx in a sane range so we don't drift into degeneracy.
+    fx_lo = 0.5 * W / math.tan(0.5 * math.radians(120.0))
+    fx_hi = 0.5 * W / math.tan(0.5 * math.radians(15.0))
+    bounds = (
+        np.array([fx_lo,  -np.pi*2, -np.pi*2, -np.pi*2,  -100, -100, -0.01]),
+        np.array([fx_hi,   np.pi*2,  np.pi*2,  np.pi*2,   100,  100,  100]),
+    )
+    sol = least_squares(residuals, x0, bounds=bounds, method="trf",
+                        loss="huber", f_scale=2.0, max_nfev=200)
+    fx_est = float(sol.x[0])
+    rvec = sol.x[1:4].reshape(3, 1)
+    tvec = sol.x[4:7].reshape(3, 1)
+
+    K_est = {"fx": fx_est, "fy": fx_est, "cx": cx, "cy": cy,
+             "width": W, "height": H, "source": "estimated"}
+    K_mat = _K_to_mat(K_est)
+
+    proj, _ = cv2.projectPoints(p3, rvec, tvec, K_mat, np.zeros(5))
+    err = np.linalg.norm(proj.reshape(-1, 2) - p2, axis=1)
+    rmse = float(np.sqrt((err ** 2).mean()))
+
+    R, _ = cv2.Rodrigues(rvec)
+    T_base2cam = np.eye(4)
+    T_base2cam[:3, :3] = R
+    T_base2cam[:3, 3] = tvec.flatten()
+    T_cam2base = np.linalg.inv(T_base2cam)
+
+    return {
+        "rvec": rvec.flatten().tolist(),
+        "tvec": tvec.flatten().tolist(),
+        "T_cam2base": T_cam2base.tolist(),
+        "T_base2cam": T_base2cam.tolist(),
+        "inlier_idx": inlier_idx.astype(int).tolist(),
+        "rmse_px": rmse,
+        "max_err_px": float(err.max()),
+        "K_estimated": K_est,
+    }
+
+
 def _solve_pnp(pts3d, pts2d, K_mat, args):
     """Returns dict with rvec, tvec, T_cam2base, inlier_idx (into pts3d), rmse."""
     if len(pts3d) < max(4, args.min_inliers):
@@ -291,13 +370,19 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
         return {"status": "skip-missing", "episode": ep_dir_seg.name}
 
     traj = np.load(traj_npz)
-    if "state" not in traj.files:
+    # Prefer the standardized 'eef_xyz' field (written by the new
+    # oxe_extractors path); fall back to the raw 'state' slice for old
+    # trajectory.npz files.
+    if "eef_xyz" in traj.files:
+        ee = np.asarray(traj["eef_xyz"], dtype=np.float64)
+    elif "state" in traj.files:
+        state = np.asarray(traj["state"], dtype=np.float64)
+        a, b = EE_XYZ_DIMS[ds_name]
+        if state.shape[1] < b:
+            return {"status": "skip-state-too-short", "episode": ep_dir_seg.name}
+        ee = state[:, a:b]
+    else:
         return {"status": "skip-no-state", "episode": ep_dir_seg.name}
-    state = np.asarray(traj["state"], dtype=np.float64)
-    a, b = EE_XYZ_DIMS[ds_name]
-    if state.shape[1] < b:
-        return {"status": "skip-state-too-short", "episode": ep_dir_seg.name}
-    ee = state[:, a:b]
 
     centroids = json.loads(centroids_path.read_text())
 
@@ -322,6 +407,7 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
                 K = _K_from_camera_json(cam_json, W, H)
             except Exception:
                 K = None
+    K_known = K is not None
     if K is None:
         K = _default_K(W, H, args.hfov_deg)
         K["source"] = f"hfov={args.hfov_deg}deg"
@@ -336,12 +422,23 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
         "dataset": ds_name,
         "image_size": [W, H],
         "K": K,
+        "K_known": K_known,
         "num_total": len(centroids),
         "num_kept_after_filter": len(kept_stems),
         "rejection_breakdown": _rejection_breakdown(rejected),
     }
 
-    pnp = _solve_pnp(pts3d, pts2d, K_mat, args)
+    # If we don't have known intrinsics and the user asked for joint
+    # estimation, optimise (fx, R, t) on the trajectory. This produces
+    # ONE K per episode (the camera is fixed within an episode).
+    pnp = None
+    if args.estimate_intrinsics and not K_known:
+        pnp = _solve_pnp_with_K_estimation(pts3d, pts2d, W, H, args)
+        if pnp is not None and "K_estimated" in pnp:
+            result["K"] = pnp["K_estimated"]
+            K_mat = _K_to_mat(pnp["K_estimated"])
+    if pnp is None:
+        pnp = _solve_pnp(pts3d, pts2d, K_mat, args)
     if pnp is None:
         result["status"] = "bad-pnp-fail"
         result["num_inliers"] = 0
@@ -439,6 +536,10 @@ def main():
     p.add_argument("--max_rmse", type=float, default=20.0)
     p.add_argument("--min_inlier_frac", type=float, default=0.4)
 
+    p.add_argument("--estimate_intrinsics", action="store_true",
+                   help="When K is not provided (no --K_json and no per-episode "
+                        "camera.json), jointly estimate fx (=fy) alongside the "
+                        "extrinsic. One K per episode. Requires scipy.")
     p.add_argument("--viz", action="store_true",
                    help="Save reprojection overlays per kept frame.")
     args = p.parse_args()

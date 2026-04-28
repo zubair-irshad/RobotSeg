@@ -52,6 +52,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from oxe_registry import OXE_DATASETS, DEFAULT_DATASETS_FOR_PNP
+from oxe_extractors import EXTRACTORS, extract_step_proprio
 
 GCS_ROOT = "gs://gresearch/robotics"
 
@@ -219,8 +220,11 @@ def process_episode(episode, cfg: dict, ep_dir: Path, frame_stride: int) -> dict
 
     state_key = cfg.get("state_key")
     action_key = cfg.get("action_key")
+    ds_name = cfg.get("_name")  # set by process_dataset
+    extractor = EXTRACTORS.get(ds_name)
 
     states, actions, kept_idx = [], [], []
+    eef_xyz, eef_rot, gripper = [], [], []
 
     for i, step in enumerate(steps):
         if i % frame_stride != 0:
@@ -229,13 +233,29 @@ def process_episode(episode, cfg: dict, ep_dir: Path, frame_stride: int) -> dict
         Image.fromarray(img).save(frames_dir / f"{len(kept_idx):05d}.jpg", quality=92)
         kept_idx.append(i)
 
+        # Legacy raw `state` slice (kept for backward compat with older
+        # trajectory.npz consumers).
         if state_key is not None:
             v = _nested_get(step["observation"], state_key)
             if v is not None:
-                states.append(np.asarray(v).ravel())
+                try:
+                    states.append(np.asarray(v).ravel())
+                except Exception:
+                    pass
+
+        # Standardized EEF extraction (xyz + rot + gripper) — the path
+        # downstream PnP / pose code prefers.
+        if extractor is not None:
+            rec = extract_step_proprio(step["observation"], extractor)
+            if rec is not None:
+                eef_xyz.append(rec["xyz"])
+                if "rot" in rec:
+                    eef_rot.append(rec["rot"])
+                if "gripper" in rec:
+                    gripper.append(rec["gripper"])
+
         if action_key is not None and action_key in step:
             a = step[action_key]
-            # action may be a dict (Google robot) or array
             if isinstance(a, dict):
                 states_flat = np.concatenate(
                     [np.asarray(v).ravel() for v in a.values()]
@@ -246,9 +266,26 @@ def process_episode(episode, cfg: dict, ep_dir: Path, frame_stride: int) -> dict
 
     traj = {"frame_indices_in_episode": np.asarray(kept_idx, dtype=np.int32)}
     if states:
-        traj["state"] = np.stack(states, axis=0)
+        # Legacy raw 'state' may have ragged rows for kuka (ZLIB bytes); skip
+        # the stack if lengths disagree.
+        try:
+            traj["state"] = np.stack(states, axis=0)
+        except ValueError:
+            pass
     if actions:
         traj["action"] = np.stack(actions, axis=0)
+
+    if eef_xyz:
+        traj["eef_xyz"] = np.stack(eef_xyz, axis=0).astype(np.float32)
+    if eef_rot:
+        traj["eef_rot"] = np.stack(eef_rot, axis=0).astype(np.float32)
+        if extractor is not None and extractor.rot_format is not None:
+            traj["eef_rot_format"] = np.array(extractor.rot_format)
+    if gripper:
+        traj["gripper"] = np.stack(gripper, axis=0).astype(np.float32)
+    if extractor is not None:
+        traj["units_note"] = np.array(extractor.units_note)
+
     np.savez(ep_dir / "trajectory.npz", **traj)
 
     (ep_dir / "schema.txt").write_text(
@@ -274,6 +311,8 @@ def process_dataset(name: str, cfg: dict, out_dir: Path,
                     num_episodes: int, frame_stride: int) -> dict:
     tfds = _lazy_import_tfds()
 
+    cfg = dict(cfg)
+    cfg["_name"] = name  # so process_episode can pick the right extractor
     builder_dir = f"{GCS_ROOT}/{name}/{cfg['version']}"
     print(f"\n=== {name}  ({cfg['embodiment']})  <- {builder_dir}")
 

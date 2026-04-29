@@ -332,20 +332,66 @@ def main():
                     cv2.putText(viz, "BASE", (base_uv[0]+8, base_uv[1]-8),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
 
-                # 🟢 EE position from eef_xyz (this we trust since you said
-                # it lands at the actual gripper). For UR5, that's
-                # state[7:10]. We use the rotated version because we're
-                # rendering in the URDF root frame.
+                # 🟢 EE position from eef_xyz (we trust this since it lands
+                # at the actual gripper via T_cam2base directly). For URDF
+                # mode the renderer's T is rotated, so we pre-rotate the
+                # 3D point too; for MJCF mode the renderer's T is unchanged
+                # so we project eef_xyz directly through T_base2cam_real.
                 if state.shape[1] >= 10:
                     ee_in_base = np.asarray(state[idx, 7:10], dtype=float)
-                    ee_in_root = (np.linalg.inv(T_root_in_base)
-                                  @ np.array([*ee_in_base, 1.0]))[:3]
-                    ee_uv = _proj(ee_in_root)
+                    if using_mjcf:
+                        T_base2cam_real = np.linalg.inv(T_cam2base)
+                        p_cam = T_base2cam_real @ np.array([*ee_in_base, 1.0])
+                        if p_cam[2] > 0.05:
+                            u = K_mat[0, 0] * p_cam[0] / p_cam[2] + K_mat[0, 2]
+                            v = K_mat[1, 1] * p_cam[1] / p_cam[2] + K_mat[1, 2]
+                            ee_uv = (int(round(u)), int(round(v)))
+                        else:
+                            ee_uv = None
+                    else:
+                        ee_in_root = (np.linalg.inv(T_root_in_base)
+                                      @ np.array([*ee_in_base, 1.0]))[:3]
+                        ee_uv = _proj(ee_in_root)
                     if ee_uv is not None:
                         cv2.drawMarker(viz, ee_uv, (0, 255, 0),
                                        cv2.MARKER_TILTED_CROSS, 32, 3)
                         cv2.putText(viz, "EE", (ee_uv[0]+8, ee_uv[1]-8),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+                # 🟣 (MJCF only) Project the MJCF's computed wrist EE
+                # position. If this lands at the same pixel as the green
+                # EE marker, then MJCF FK is consistent with the dataset.
+                # If it lands somewhere else, it's a joint-convention or
+                # frame mismatch between dataset and MJCF.
+                if using_mjcf:
+                    try:
+                        import mujoco as _mj
+                        link_name = "wrist_3_link"
+                        bid = _mj.mj_name2id(masker.model,
+                                             _mj.mjtObj.mjOBJ_BODY, link_name)
+                        if bid >= 0:
+                            ee_mjcf = np.asarray(masker.data.xpos[bid], dtype=float)
+                            T_base2cam_real = np.linalg.inv(T_cam2base)
+                            p = T_base2cam_real @ np.array([*ee_mjcf, 1.0])
+                            if p[2] > 0.05:
+                                u = K_mat[0, 0] * p[0] / p[2] + K_mat[0, 2]
+                                v = K_mat[1, 1] * p[1] / p[2] + K_mat[1, 2]
+                                uv = (int(round(u)), int(round(v)))
+                                cv2.drawMarker(viz, uv, (255, 0, 255),
+                                               cv2.MARKER_DIAMOND, 32, 3)
+                                cv2.putText(viz, "MJCF_EE",
+                                            (uv[0]+8, uv[1]-8),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                            (255, 0, 255), 2)
+                                # Also print the per-frame 3D delta:
+                                if idx == int(stems[0]):
+                                    delta = ee_mjcf - ee_in_base
+                                    print(f"[mjcf_check] wrist_3 - eef_xyz = "
+                                          f"[{delta[0]:+.3f}, {delta[1]:+.3f}, "
+                                          f"{delta[2]:+.3f}] m  (should be small "
+                                          f"if conventions match)")
+                    except Exception as e:
+                        print(f"[mjcf_check] skipped: {e}")
             cv2.imwrite(str(out_dir / f"{stem}.jpg"), viz)
 
         print(f"[ok] {ep}: wrote {out_dir}")

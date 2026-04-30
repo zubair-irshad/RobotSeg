@@ -156,12 +156,39 @@ def _read_image_size(seq_frames_dir: Path) -> tuple[int, int] | None:
     return None
 
 
-def _filter_frames(centroids_json, ee_xyz_seq, W, H, args):
-    """Return (pts3d Nx3, pts2d Nx2, kept_stems, rejected) post-filter."""
+def _eef_rot_to_R(rot, fmt):
+    """Convert OXE eef_rot of any common format to (T,3,3) R_wrist->base matrices."""
+    rot = np.asarray(rot, dtype=np.float64)
+    fmt = (fmt or "").lower().strip()
+    from scipy.spatial.transform import Rotation
+    if fmt in ("quat_xyzw", "xyzw", "quaternion_xyzw"):
+        return Rotation.from_quat(rot).as_matrix()
+    if fmt in ("quat_wxyz", "wxyz", "quaternion_wxyz"):
+        # scipy expects (x,y,z,w); roll w to last.
+        return Rotation.from_quat(np.concatenate([rot[..., 1:], rot[..., :1]], -1)).as_matrix()
+    if fmt in ("rotvec", "axis_angle", "axisangle", "axangle"):
+        return Rotation.from_rotvec(rot).as_matrix()
+    if fmt in ("matrix", "rotmat", "matrix_3x3"):
+        return rot.reshape(-1, 3, 3)
+    if fmt.startswith("euler"):
+        seq = fmt.split("_", 1)[1] if "_" in fmt else "xyz"
+        return Rotation.from_euler(seq, rot).as_matrix()
+    if fmt in ("6d", "rot6d"):
+        a1, a2 = rot[..., :3], rot[..., 3:]
+        b1 = a1 / np.linalg.norm(a1, axis=-1, keepdims=True)
+        b2 = a2 - (b1 * a2).sum(-1, keepdims=True) * b1
+        b2 /= np.linalg.norm(b2, axis=-1, keepdims=True)
+        b3 = np.cross(b1, b2)
+        return np.stack([b1, b2, b3], axis=-1)
+    raise ValueError(f"Unknown eef_rot_format: {fmt!r}")
+
+
+def _filter_frames(centroids_json, ee_xyz_seq, W, H, args, ee_R_seq=None):
+    """Return (pts3d Nx3, pts2d Nx2, kept_stems, rejected[, R_wrist Nx3x3]) post-filter."""
     img_area = float(W * H)
     min_area_eff = max(args.min_area, args.min_area_px / img_area)
 
-    pts3d, pts2d, kept, rej = [], [], [], []
+    pts3d, pts2d, kept, rej, Rs = [], [], [], [], []
     for stem, entry in centroids_json.items():
         idx = int(stem)
         if idx >= len(ee_xyz_seq):
@@ -170,6 +197,10 @@ def _filter_frames(centroids_json, ee_xyz_seq, W, H, args):
         xyz = ee_xyz_seq[idx]
         if not np.all(np.isfinite(xyz)):
             rej.append((stem, "nan-state"))
+            continue
+        Rw = ee_R_seq[idx] if ee_R_seq is not None else None
+        if Rw is not None and not np.all(np.isfinite(Rw)):
+            rej.append((stem, "nan-rot"))
             continue
 
         rec = _entry_to_record(entry)
@@ -209,10 +240,13 @@ def _filter_frames(centroids_json, ee_xyz_seq, W, H, args):
         pts3d.append(xyz)
         pts2d.append([cx, cy])
         kept.append(stem)
+        if Rw is not None:
+            Rs.append(Rw)
 
-    return (np.asarray(pts3d, dtype=np.float64),
-            np.asarray(pts2d, dtype=np.float64),
-            kept, rej)
+    pts3d = np.asarray(pts3d, dtype=np.float64)
+    pts2d = np.asarray(pts2d, dtype=np.float64)
+    R_arr = np.asarray(Rs, dtype=np.float64) if Rs else None
+    return pts3d, pts2d, kept, rej, R_arr
 
 
 def _solve_pnp_with_K_estimation(pts3d, pts2d, W, H, args):
@@ -307,6 +341,109 @@ def _solve_pnp_with_K_estimation(pts3d, pts2d, W, H, args):
         "rmse_px": rmse,
         "max_err_px": float(err.max()),
         "K_estimated": K_est,
+    }
+
+
+def _solve_pnp_with_tool_offset(pts3d, R_wrist, pts2d, K_mat, args):
+    """Jointly fit (rvec, tvec, offset_tool[3]) so that the tip in base frame is
+       tip_base(t) = pts3d[t] + R_wrist[t] @ offset_tool
+    This compensates for the case where pts3d is the WRIST and the observed
+    centroid is the gripper TIP — a constant 3-vector in the tool frame whose
+    image-space projection rotates with the gripper. Same K throughout.
+    """
+    try:
+        from scipy.optimize import least_squares
+    except ImportError:
+        return None
+    if pts3d.shape[0] < max(6, args.min_inliers):
+        return None
+    if R_wrist is None or R_wrist.shape[0] != pts3d.shape[0]:
+        return None
+
+    # Seed extrinsic from a regular wrist-only PnP (offset = 0).
+    seed = _solve_pnp(pts3d, pts2d, K_mat, args)
+    if seed is None:
+        return None
+    rvec0 = np.asarray(seed["rvec"], dtype=np.float64).reshape(3)
+    tvec0 = np.asarray(seed["tvec"], dtype=np.float64).reshape(3)
+
+    # Wrap rvec into [-pi, pi] so it doesn't blow past bounds during LM.
+    ang = float(np.linalg.norm(rvec0))
+    if ang > 1e-9:
+        rvec0 = rvec0 * ((((ang + np.pi) % (2 * np.pi)) - np.pi) / ang)
+
+    inliers = np.array(seed["inlier_idx"], dtype=int)
+    p3 = pts3d[inliers].astype(np.float64)
+    Rw = R_wrist[inliers].astype(np.float64)
+    p2 = pts2d[inliers].astype(np.float64)
+
+    K = K_mat.astype(np.float64)
+    dist = np.zeros(5)
+
+    def residuals(params):
+        rvec = params[0:3].reshape(3, 1)
+        tvec = params[3:6].reshape(3, 1)
+        offset = params[6:9]
+        # tip_base = wrist_base + R_wrist @ offset
+        tip = p3 + (Rw @ offset)
+        proj, _ = cv2.projectPoints(tip, rvec, tvec, K, dist)
+        return (proj.reshape(-1, 2) - p2).flatten()
+
+    t_abs = float(np.abs(tvec0).max())
+    t_bound = max(100.0, 5.0 * t_abs)
+    off_bound = float(args.tool_offset_bound)
+    lo = np.array([-np.pi]*3 + [-t_bound]*3 + [-off_bound]*3)
+    hi = np.array([ np.pi]*3 + [ t_bound]*3 + [ off_bound]*3)
+    x0 = np.concatenate([rvec0, tvec0, np.zeros(3)])
+    eps = 1e-6
+    x0 = np.minimum(np.maximum(x0, lo + eps), hi - eps)
+
+    sol = least_squares(residuals, x0, bounds=(lo, hi), method="trf",
+                        loss="huber", f_scale=2.0, max_nfev=300)
+    rvec = sol.x[0:3].reshape(3, 1)
+    tvec = sol.x[3:6].reshape(3, 1)
+    offset_tool = sol.x[6:9].astype(np.float64)
+
+    # Re-evaluate inliers on FULL kept set under the optimised model.
+    tip_all = pts3d + (R_wrist @ offset_tool)
+    proj_all, _ = cv2.projectPoints(tip_all.astype(np.float64),
+                                    rvec, tvec, K, dist)
+    err_all = np.linalg.norm(proj_all.reshape(-1, 2) - pts2d, axis=1)
+    refined_inliers = np.where(err_all <= float(args.reproj_thresh))[0]
+    if len(refined_inliers) < args.min_inliers:
+        refined_inliers = inliers  # keep seed inliers
+
+    # Final LM refine on the cleaner inlier set.
+    p3 = pts3d[refined_inliers]
+    Rw = R_wrist[refined_inliers]
+    p2 = pts2d[refined_inliers]
+    sol2 = least_squares(residuals, sol.x, bounds=(lo, hi), method="trf",
+                         loss="huber", f_scale=2.0, max_nfev=200)
+    rvec = sol2.x[0:3].reshape(3, 1)
+    tvec = sol2.x[3:6].reshape(3, 1)
+    offset_tool = sol2.x[6:9].astype(np.float64)
+
+    tip_in = pts3d[refined_inliers] + (R_wrist[refined_inliers] @ offset_tool)
+    proj, _ = cv2.projectPoints(tip_in.astype(np.float64), rvec, tvec, K, dist)
+    err = np.linalg.norm(proj.reshape(-1, 2) - pts2d[refined_inliers], axis=1)
+    rmse = float(np.sqrt((err ** 2).mean()))
+
+    R, _ = cv2.Rodrigues(rvec)
+    T_base2cam = np.eye(4)
+    T_base2cam[:3, :3] = R
+    T_base2cam[:3, 3] = tvec.flatten()
+    T_cam2base = np.linalg.inv(T_base2cam)
+
+    return {
+        "rvec": rvec.flatten().tolist(),
+        "tvec": tvec.flatten().tolist(),
+        "T_cam2base": T_cam2base.tolist(),
+        "T_base2cam": T_base2cam.tolist(),
+        "inlier_idx": refined_inliers.astype(int).tolist(),
+        "rmse_px": rmse,
+        "max_err_px": float(err.max()) if err.size else 0.0,
+        "tool_offset": offset_tool.tolist(),
+        "tool_offset_norm": float(np.linalg.norm(offset_tool)),
     }
 
 
@@ -434,6 +571,18 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
     else:
         return {"status": "skip-no-state", "episode": ep_dir_seg.name}
 
+    # Per-frame R_wrist->base (only needed for --solve_tool_offset).
+    ee_R = None
+    if args.solve_tool_offset and "eef_rot" in traj.files:
+        try:
+            fmt = (str(traj["eef_rot_format"])
+                   if "eef_rot_format" in traj.files else "quat_xyzw")
+            ee_R = _eef_rot_to_R(traj["eef_rot"], fmt)
+        except Exception as e:
+            print(f"  [warn] {ep_dir_seg.name}: eef_rot decode failed ({e}); "
+                  f"disabling tool-offset solve")
+            ee_R = None
+
     centroids = json.loads(centroids_path.read_text())
 
     img_size = _read_image_size(frames_dir)
@@ -490,8 +639,8 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
         K["source"] = f"hfov={args.hfov_deg}deg"
     K_mat = _K_to_mat(K)
 
-    pts3d, pts2d, kept_stems, rejected = _filter_frames(
-        centroids, ee, W, H, args
+    pts3d, pts2d, kept_stems, rejected, R_kept = _filter_frames(
+        centroids, ee, W, H, args, ee_R_seq=ee_R
     )
 
     result = {
@@ -515,6 +664,8 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
         if pnp is not None and "K_estimated" in pnp:
             result["K"] = pnp["K_estimated"]
             K_mat = _K_to_mat(pnp["K_estimated"])
+    if pnp is None and args.solve_tool_offset and R_kept is not None and len(R_kept):
+        pnp = _solve_pnp_with_tool_offset(pts3d, R_kept, pts2d, K_mat, args)
     if pnp is None:
         pnp = _solve_pnp(pts3d, pts2d, K_mat, args)
     if pnp is None:
@@ -540,6 +691,9 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
         "tvec": pnp["tvec"],
         "inlier_stems": [kept_stems[i] for i in pnp["inlier_idx"]],
     })
+    if "tool_offset" in pnp:
+        result["tool_offset"] = pnp["tool_offset"]
+        result["tool_offset_norm_m"] = pnp["tool_offset_norm"]
 
     out_path = ep_dir_seg / "pnp.json"
     out_path.write_text(json.dumps(result, indent=2))
@@ -551,14 +705,20 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
         tvec = np.asarray(pnp["tvec"], dtype=np.float64).reshape(3, 1)
         inlier_set = set(int(i) for i in pnp["inlier_idx"])
 
-        # one combined-plot showing all kept points on the first inlier frame
-        proj_all = _project_pts(pts3d, rvec, tvec, K_mat)
+        # If we solved a tool offset, project the TIP (= wrist + R_wrist@offset)
+        # so the green/red circles in the viz match the actual gripper jaws.
+        if "tool_offset" in pnp and R_kept is not None:
+            offset = np.asarray(pnp["tool_offset"], dtype=np.float64)
+            pts3d_for_viz = pts3d + (R_kept @ offset)
+        else:
+            pts3d_for_viz = pts3d
+        proj_all = _project_pts(pts3d_for_viz, rvec, tvec, K_mat)
         first_stem = kept_stems[pnp["inlier_idx"][0]] if pnp["inlier_idx"] else kept_stems[0]
         first_img = cv2.imread(str(frames_dir / f"{first_stem}.jpg"))
         if first_img is not None:
             cv2.imwrite(
                 str(viz_dir / "_traj_overview.jpg"),
-                _viz_reproj(first_img, pts2d, pts3d, inlier_set, None,
+                _viz_reproj(first_img, pts2d, pts3d_for_viz, inlier_set, None,
                             K_mat, rvec, tvec),
             )
 
@@ -643,6 +803,16 @@ def main():
                    help="Ignore cached <ep>/moge_K.json and re-run MoGe-2.")
     p.add_argument("--moge_verbose", action="store_true")
 
+    p.add_argument("--solve_tool_offset", action="store_true",
+                   help="Jointly estimate (R, t, offset_tool) where offset_tool "
+                        "is a constant 3-vector in the gripper/tool frame. Uses "
+                        "trajectory.npz['eef_rot'] (+ eef_rot_format). Fixes the "
+                        "common case where the proprioceptive EE is the wrist "
+                        "but the seg-mask centroid is the fingertip.")
+    p.add_argument("--tool_offset_bound", type=float, default=0.30,
+                   help="Bound (in trajectory units, usually meters) for each "
+                        "component of the solved tool offset.")
+
     p.add_argument("--estimate_intrinsics", action="store_true",
                    help="When K is not provided (no --K_json and no per-episode "
                         "camera.json), jointly estimate fx (=fy) alongside the "
@@ -692,8 +862,15 @@ def main():
             tag = r.get("status", "?")
             extra = ""
             if "rmse_px" in r:
+                off_s = ""
+                if "tool_offset" in r:
+                    off_s = (f"  tool_off=[{r['tool_offset'][0]:+.3f},"
+                             f"{r['tool_offset'][1]:+.3f},"
+                             f"{r['tool_offset'][2]:+.3f}]m"
+                             f"({r['tool_offset_norm_m']*100:.1f}cm)")
                 extra = (f"  rmse={r['rmse_px']:.2f}px  "
-                         f"inliers={r['num_inliers']}/{r['num_kept_after_filter']}")
+                         f"inliers={r['num_inliers']}/{r['num_kept_after_filter']}"
+                         f"{off_s}")
             elif "rejection_breakdown" in r:
                 extra = (f"  kept={r['num_kept_after_filter']}/{r['num_total']}"
                          f"  reasons={r['rejection_breakdown']}")

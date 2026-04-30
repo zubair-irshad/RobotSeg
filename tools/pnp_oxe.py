@@ -441,8 +441,11 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
         return {"status": "skip-no-image", "episode": ep_dir_seg.name}
     W, H = img_size
 
-    # Resolution order for K: --K_json override > per-episode camera.json
-    # (saved by download_oxe_subset.py from the RLDS spec) > HFOV guess.
+    # Resolution order for K:
+    #   --K_json override
+    # > per-episode camera.json (saved by download_oxe_subset.py from RLDS)
+    # > MoGe-2 robust-median estimate over N sampled frames (--moge_intrinsics)
+    # > HFOV guess (default).
     K = None
     if K_override is not None:
         K = dict(K_override)
@@ -458,6 +461,30 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
             except Exception:
                 K = None
     K_known = K is not None
+
+    K_moge = None
+    if K is None and args.moge_intrinsics:
+        moge_cache = ep_dir_seg / "moge_K.json"
+        if moge_cache.exists() and not args.moge_recompute:
+            try:
+                K_moge = json.loads(moge_cache.read_text())
+            except Exception:
+                K_moge = None
+        if K_moge is None:
+            from moge_intrinsics import estimate_K_for_frames
+            K_moge = estimate_K_for_frames(
+                frames_dir,
+                num_samples=args.moge_num_samples,
+                device=args.moge_device,
+                repo_id=args.moge_repo_id,
+                verbose=args.moge_verbose,
+            )
+            if K_moge is not None:
+                moge_cache.write_text(json.dumps(K_moge, indent=2))
+        if K_moge is not None:
+            K = {k: K_moge[k] for k in ("fx", "fy", "cx", "cy", "width", "height")}
+            K["source"] = K_moge.get("source", "moge-2")
+
     if K is None:
         K = _default_K(W, H, args.hfov_deg)
         K["source"] = f"hfov={args.hfov_deg}deg"
@@ -481,8 +508,9 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
     # If we don't have known intrinsics and the user asked for joint
     # estimation, optimise (fx, R, t) on the trajectory. This produces
     # ONE K per episode (the camera is fixed within an episode).
+    # MoGe-2 already gave us a per-episode K, so don't re-estimate over it.
     pnp = None
-    if args.estimate_intrinsics and not K_known:
+    if args.estimate_intrinsics and not K_known and K_moge is None:
         pnp = _solve_pnp_with_K_estimation(pts3d, pts2d, W, H, args)
         if pnp is not None and "K_estimated" in pnp:
             result["K"] = pnp["K_estimated"]
@@ -600,6 +628,20 @@ def main():
                    help="EPNP needs >=4; we require a few more for stability.")
     p.add_argument("--max_rmse", type=float, default=20.0)
     p.add_argument("--min_inlier_frac", type=float, default=0.4)
+
+    p.add_argument("--moge_intrinsics", action="store_true",
+                   help="When K is not provided, sample N equally-spaced frames "
+                        "per episode and run MoGe-2 to estimate fx, fy. The "
+                        "robust-median K is then used in PnP. Cached as "
+                        "<episode_seg>/moge_K.json.")
+    p.add_argument("--moge_num_samples", type=int, default=20,
+                   help="Frames per episode to run MoGe-2 on.")
+    p.add_argument("--moge_device", default=None,
+                   help="cuda / cpu (default: auto-detect).")
+    p.add_argument("--moge_repo_id", default="Ruicheng/moge-2-vitl-normal")
+    p.add_argument("--moge_recompute", action="store_true",
+                   help="Ignore cached <ep>/moge_K.json and re-run MoGe-2.")
+    p.add_argument("--moge_verbose", action="store_true")
 
     p.add_argument("--estimate_intrinsics", action="store_true",
                    help="When K is not provided (no --K_json and no per-episode "

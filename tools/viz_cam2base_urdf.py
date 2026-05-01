@@ -139,6 +139,13 @@ def main():
                         "silhouette mismatch is from T_cam2base or from "
                         "joint angles / URDF internals.")
     p.add_argument("--no_debug_markers", dest="debug_markers", action="store_false")
+    p.add_argument("--base_only", action="store_true",
+                   help="Render ONLY the URDF base link (joint-angle-independent "
+                        "cam2base sanity check). Implies --zero_pose. URDF backend "
+                        "only — for MJCF, use --zero_pose plus --debug_markers.")
+    p.add_argument("--base_link_names", default=None,
+                   help="Comma-separated link-name substrings to keep when "
+                        "--base_only is set. Default: the URDF's declared base_link.")
     p.add_argument("--zero_pose", action="store_true",
                    help="Render the URDF at q=0 ignoring the dataset's joint "
                         "angles. Useful to see whether T_cam2base alone places "
@@ -296,14 +303,23 @@ def main():
                     grip = float(np.clip(1.0 - raw / 0.085, 0.0, 1.0))
                 else:
                     grip = float(np.clip(raw, 0.0, 1.0))
-            if args.zero_pose:
+            if args.zero_pose or args.base_only:
                 q_arm = np.zeros_like(q_arm)
                 grip = 0.0
-            mask = masker.render(
+            link_filter = None
+            if args.base_only and not using_mjcf:
+                if args.base_link_names:
+                    link_filter = [s.strip() for s in args.base_link_names.split(",")]
+                else:
+                    link_filter = [masker.robot.base_link]
+            render_kwargs = dict(
                 K=K, T_cam2base=T_cam2base_for_render,
                 joint_positions=q_arm, gripper_position=grip,
                 image_hw=(img.shape[0], img.shape[1]),
             )
+            if link_filter is not None:
+                render_kwargs["link_filter"] = link_filter
+            mask = masker.render(**render_kwargs)
             viz = _overlay(img, mask)
 
             # Debug overlays: project the URDF root origin (where the

@@ -127,7 +127,11 @@ class URDFRobotMasker:
     def render(self, K: dict, T_cam2base: np.ndarray,
                joint_positions: np.ndarray,
                gripper_position: float = 0.0,
-               image_hw: tuple[int, int] | None = None) -> np.ndarray:
+               image_hw: tuple[int, int] | None = None,
+               link_filter: list[str] | None = None) -> np.ndarray:
+        """If `link_filter` is set, only rasterize geometries whose scene
+        node name contains any of the listed link names. Useful for a
+        joint-angle-independent cam2base sanity check (e.g. ['base_link'])."""
         H = int(image_hw[0] if image_hw is not None else K["height"])
         W = int(image_hw[1] if image_hw is not None else K["width"])
         s = self.downsample
@@ -138,9 +142,33 @@ class URDFRobotMasker:
         q_arm = np.asarray(joint_positions, dtype=float).flatten()
         self._apply_cfg(q_arm, gripper_position)
 
-        combined = self.robot.scene.dump(concatenate=True)
-        verts = np.asarray(combined.vertices, dtype=float)
-        faces = np.asarray(combined.faces, dtype=np.int32)
+        if link_filter is None:
+            combined = self.robot.scene.dump(concatenate=True)
+            verts = np.asarray(combined.vertices, dtype=float)
+            faces = np.asarray(combined.faces, dtype=np.int32)
+        else:
+            scene = self.robot.scene
+            v_list, f_list = [], []
+            voff = 0
+            for geom_name, mesh in scene.geometry.items():
+                if not any(L in geom_name for L in link_filter):
+                    continue
+                try:
+                    T_world_geom = scene.graph.get(geom_name)[0]
+                except Exception:
+                    continue
+                v = np.asarray(mesh.vertices, dtype=float)
+                if len(v) == 0:
+                    continue
+                vh = np.hstack([v, np.ones((len(v), 1))])
+                v_world = (T_world_geom @ vh.T).T[:, :3]
+                v_list.append(v_world)
+                f_list.append(np.asarray(mesh.faces, dtype=np.int32) + voff)
+                voff += len(v)
+            if not v_list:
+                return np.zeros((H, W), dtype=bool)
+            verts = np.vstack(v_list)
+            faces = np.vstack(f_list).astype(np.int32)
         if len(verts) == 0 or len(faces) == 0:
             return np.zeros((H, W), dtype=bool)
 

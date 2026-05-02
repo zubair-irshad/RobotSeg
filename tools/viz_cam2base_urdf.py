@@ -157,6 +157,25 @@ def main():
     p.add_argument("--ik_pos_tol", type=float, default=2e-3)
     p.add_argument("--ik_rot_tol", type=float, default=2e-2)
     p.add_argument("--ik_max_iter", type=int, default=80)
+    p.add_argument("--ik_ee_pos_offset_xyz", nargs=3, type=float,
+                   default=[0.0, 0.0, 0.0], metavar=("X", "Y", "Z"),
+                   help="Constant 3-vector in the proprio-EE frame added to "
+                        "the IK target position. Use to compensate for the "
+                        "(MJCF EE body) ↔ (proprio eef_xyz reference point) "
+                        "offset. E.g. WidowX MJCF's ee_gripper_link is often "
+                        "~+5cm along tool z from the jaw tip.")
+    p.add_argument("--ik_ee_R_offset_rpy_deg", nargs=3, type=float,
+                   default=[0.0, 0.0, 0.0], metavar=("R", "P", "Y"),
+                   help="Constant rotation (deg, RPY in proprio-EE frame) "
+                        "applied to the IK target orientation. Use when the "
+                        "MJCF EE body's axes differ from proprio eef_rot's.")
+    p.add_argument("--ik_use_tool_offset", action="store_true", default=True,
+                   help="Add the per-episode tool_offset from pnp.json to the "
+                        "IK target so the MJCF gripper body lands where "
+                        "cam2base was actually fitted (the visible tip), not "
+                        "where eef_xyz alone would put the wrist. On by default.")
+    p.add_argument("--no_ik_use_tool_offset", dest="ik_use_tool_offset",
+                   action="store_false")
 
     p.add_argument("--base_only", action="store_true",
                    help="Render ONLY the URDF base link (joint-angle-independent "
@@ -277,6 +296,16 @@ def main():
                     f"{[_mj.mj_id2name(masker.model, _mj.mjtObj.mjOBJ_BODY, i) for i in range(masker.model.nbody)]}"
                 )
         print(f"[ik] target body: {ik_body!r}")
+        # Pre-compute the constant rotation offset in matrix form.
+        rx_, ry_, rz_ = (np.deg2rad(a) for a in args.ik_ee_R_offset_rpy_deg)
+        cx_, sx_ = np.cos(rx_), np.sin(rx_)
+        cy_, sy_ = np.cos(ry_), np.sin(ry_)
+        cz_, sz_ = np.cos(rz_), np.sin(rz_)
+        Rx_ = np.array([[1, 0, 0], [0, cx_, -sx_], [0, sx_, cx_]])
+        Ry_ = np.array([[cy_, 0, sy_], [0, 1, 0], [-sy_, 0, cy_]])
+        Rz_ = np.array([[cz_, -sz_, 0], [sz_, cz_, 0], [0, 0, 1]])
+        R_ee_offset = Rz_ @ Ry_ @ Rx_
+        pos_ee_offset = np.asarray(args.ik_ee_pos_offset_xyz, dtype=np.float64)
 
     def _eef_rot_to_R(rot, fmt):
         rot = np.asarray(rot, dtype=np.float64)
@@ -321,11 +350,17 @@ def main():
 
         # Pre-decode eef_xyz / eef_rot for IK mode.
         ee_xyz_seq = ee_R_seq = None
+        ep_tool_offset = np.zeros(3)
         if args.ik_from_eef_pose:
             ee_xyz_seq = np.asarray(traj["eef_xyz"], dtype=np.float64)
             fmt = (str(traj["eef_rot_format"])
                    if "eef_rot_format" in traj.files else "rotvec")
             ee_R_seq = _eef_rot_to_R(traj["eef_rot"], fmt)
+            if args.ik_use_tool_offset and "tool_offset" in pnp:
+                ep_tool_offset = np.asarray(pnp["tool_offset"], dtype=np.float64)
+                print(f"  [ik] using episode tool_offset = "
+                      f"[{ep_tool_offset[0]:+.3f},{ep_tool_offset[1]:+.3f},"
+                      f"{ep_tool_offset[2]:+.3f}]m")
         q_prev = None  # warm-start IK from previous frame's solution
 
         frames_dir = ds_oxe / ep / "frames"
@@ -382,9 +417,18 @@ def main():
                 grip = 0.0
             if args.ik_from_eef_pose and ee_xyz_seq is not None:
                 if idx < len(ee_xyz_seq):
+                    R_eef = ee_R_seq[idx]
+                    # IK target position: where the MJCF EE body must land so
+                    # that the rendered arm matches what cam2base was fitted
+                    # to. Compose:
+                    #   tip_in_base   = eef_xyz + R_eef · tool_offset_episode
+                    #   target_in_base = tip_in_base + R_eef · pos_ee_offset
+                    target_pos = (ee_xyz_seq[idx]
+                                  + R_eef @ (ep_tool_offset + pos_ee_offset))
+                    target_R = R_eef @ R_ee_offset
                     q_arm, ik_info = masker.solve_ik(
-                        target_pos=ee_xyz_seq[idx],
-                        target_R=ee_R_seq[idx],
+                        target_pos=target_pos,
+                        target_R=target_R,
                         ee_body_name=ik_body,
                         q_init=q_prev,
                         gripper_position=grip,

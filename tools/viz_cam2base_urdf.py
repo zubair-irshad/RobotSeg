@@ -145,6 +145,19 @@ def main():
                         "silhouette mismatch is from T_cam2base or from "
                         "joint angles / URDF internals.")
     p.add_argument("--no_debug_markers", dest="debug_markers", action="store_false")
+    p.add_argument("--ik_from_eef_pose", action="store_true",
+                   help="When the dataset has EE pose but no joint angles "
+                        "(Bridge), solve IK each frame from "
+                        "trajectory.npz['eef_xyz'] + ['eef_rot'] to get joints, "
+                        "then render. MJCF backend only.")
+    p.add_argument("--ik_ee_body", default=None,
+                   help="MJCF body name to drive in IK (e.g. 'ee_gripper_link', "
+                        "'gripper_link', 'wx250s/ee_gripper_link'). If unset, "
+                        "the first body whose name contains 'ee_' is used.")
+    p.add_argument("--ik_pos_tol", type=float, default=2e-3)
+    p.add_argument("--ik_rot_tol", type=float, default=2e-2)
+    p.add_argument("--ik_max_iter", type=int, default=80)
+
     p.add_argument("--base_only", action="store_true",
                    help="Render ONLY the URDF base link (joint-angle-independent "
                         "cam2base sanity check). Implies --zero_pose. URDF backend "
@@ -175,13 +188,13 @@ def main():
     arm_lo, arm_hi = spec["arm"]
     grip_idx = spec.get("gripper_idx")
     grip_kind = spec.get("gripper_kind", "width_m")
-    if spec.get("no_joint_angles") and not (args.zero_pose or args.base_only):
+    if (spec.get("no_joint_angles") and
+            not (args.zero_pose or args.base_only or args.ik_from_eef_pose)):
         raise SystemExit(
             f"{args.dataset}: trajectory.npz has no joint angles "
-            f"(state[:6] is EE POSE, not joints). Re-run with "
-            f"--zero_pose (full URDF at q=0) or --base_only "
-            f"(base silhouette only). EE/BASE markers from "
-            f"--debug_markers are still meaningful.")
+            f"(state[:6] is EE POSE, not joints). Re-run with one of: "
+            f"--zero_pose, --base_only, or --ik_from_eef_pose (solves IK "
+            f"each frame from eef_xyz+eef_rot; MJCF backend only).")
 
     arm_names = (args.arm_joint_names.split(",") if args.arm_joint_names
                  else ARM_JOINT_NAMES.get(args.dataset))
@@ -243,6 +256,45 @@ def main():
     T_root_in_base[:3, :3] = R_off
     T_root_in_base[:3, 3] = args.base_offset_xyz
 
+    # Resolve IK target body once if we're in IK mode.
+    ik_body = None
+    if args.ik_from_eef_pose:
+        if not using_mjcf:
+            raise SystemExit("--ik_from_eef_pose requires the MJCF backend (--mjcf).")
+        if args.ik_ee_body:
+            ik_body = args.ik_ee_body
+        else:
+            import mujoco as _mj
+            for i in range(masker.model.nbody):
+                name = _mj.mj_id2name(masker.model, _mj.mjtObj.mjOBJ_BODY, i) or ""
+                if "ee_" in name or name.endswith("gripper_link"):
+                    ik_body = name
+                    break
+            if ik_body is None:
+                raise SystemExit(
+                    "Couldn't auto-detect IK EE body. Pass --ik_ee_body explicitly. "
+                    f"Available bodies: "
+                    f"{[_mj.mj_id2name(masker.model, _mj.mjtObj.mjOBJ_BODY, i) for i in range(masker.model.nbody)]}"
+                )
+        print(f"[ik] target body: {ik_body!r}")
+
+    def _eef_rot_to_R(rot, fmt):
+        rot = np.asarray(rot, dtype=np.float64)
+        fmt = (fmt or "").lower().strip()
+        from scipy.spatial.transform import Rotation
+        if fmt in ("quat_xyzw", "xyzw"):
+            return Rotation.from_quat(rot).as_matrix()
+        if fmt in ("quat_wxyz", "wxyz"):
+            return Rotation.from_quat(np.concatenate([rot[..., 1:], rot[..., :1]], -1)).as_matrix()
+        if fmt in ("rotvec", "axis_angle", "axisangle"):
+            return Rotation.from_rotvec(rot).as_matrix()
+        if fmt in ("matrix", "rotmat"):
+            return rot.reshape(-1, 3, 3)
+        if fmt.startswith("euler"):
+            seq = fmt.split("_", 1)[1] if "_" in fmt else "xyz"
+            return Rotation.from_euler(seq, rot).as_matrix()
+        raise ValueError(f"Unknown eef_rot_format: {fmt!r}")
+
     for ep in targets:
         pnp = json.loads((ds_seg / ep / "pnp.json").read_text())
         T_cam2base = np.asarray(pnp["T_cam2base"], dtype=np.float64)
@@ -266,6 +318,15 @@ def main():
         if state.shape[1] < arm_hi:
             print(f"[skip] {ep}: state too short for arm dims")
             continue
+
+        # Pre-decode eef_xyz / eef_rot for IK mode.
+        ee_xyz_seq = ee_R_seq = None
+        if args.ik_from_eef_pose:
+            ee_xyz_seq = np.asarray(traj["eef_xyz"], dtype=np.float64)
+            fmt = (str(traj["eef_rot_format"])
+                   if "eef_rot_format" in traj.files else "rotvec")
+            ee_R_seq = _eef_rot_to_R(traj["eef_rot"], fmt)
+        q_prev = None  # warm-start IK from previous frame's solution
 
         frames_dir = ds_oxe / ep / "frames"
         out_dir = ds_seg / ep / "cam2base_viz"
@@ -319,6 +380,23 @@ def main():
             if args.zero_pose or args.base_only:
                 q_arm = np.zeros_like(q_arm)
                 grip = 0.0
+            if args.ik_from_eef_pose and ee_xyz_seq is not None:
+                if idx < len(ee_xyz_seq):
+                    q_arm, ik_info = masker.solve_ik(
+                        target_pos=ee_xyz_seq[idx],
+                        target_R=ee_R_seq[idx],
+                        ee_body_name=ik_body,
+                        q_init=q_prev,
+                        gripper_position=grip,
+                        max_iter=args.ik_max_iter,
+                        tol_pos=args.ik_pos_tol,
+                        tol_rot=args.ik_rot_tol,
+                    )
+                    q_prev = q_arm.copy()
+                    if ik_info["pos_err"] > 5 * args.ik_pos_tol:
+                        print(f"  [ik] {stem}: pos_err={ik_info['pos_err']:.4f}m "
+                              f"rot_err={ik_info['rot_err']:.3f} "
+                              f"iters={ik_info['iters']}")
             link_filter = None
             if args.base_only and not using_mjcf:
                 if args.base_link_names:

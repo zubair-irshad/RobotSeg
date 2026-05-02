@@ -106,6 +106,78 @@ class MuJoCoRobotMasker:
             pass
         self._mj.mj_forward(self.model, self.data)
 
+    def solve_ik(self, target_pos: np.ndarray, target_R: np.ndarray,
+                 ee_body_name: str, q_init: np.ndarray | None = None,
+                 gripper_position: float = 0.0,
+                 max_iter: int = 80, tol_pos: float = 1e-3,
+                 tol_rot: float = 1e-2, damping: float = 0.05,
+                 step: float = 1.0) -> tuple[np.ndarray, dict]:
+        """Damped-least-squares IK: find qpos[:arm_dof] s.t. body
+        `ee_body_name` reaches (target_pos, target_R) in the MJCF world frame.
+
+        Returns (q_arm, info_dict). `info_dict` has 'pos_err', 'rot_err', 'iters'.
+        Use this when the dataset only ships EE pose (e.g. Bridge) so we can
+        pose the URDF for visualisation.
+        """
+        mj = self._mj
+        bid = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_BODY, ee_body_name)
+        if bid < 0:
+            available = [
+                mj.mj_id2name(self.model, mj.mjtObj.mjOBJ_BODY, i)
+                for i in range(self.model.nbody)
+            ]
+            raise ValueError(
+                f"body '{ee_body_name}' not in MJCF. Available bodies: "
+                f"{[a for a in available if a]}"
+            )
+        n = self.arm_dof
+        if q_init is not None and len(q_init) >= n:
+            self.data.qpos[:n] = np.asarray(q_init, dtype=float)[:n]
+        else:
+            # Slight bend so we're not at a singular q=0 wrist alignment.
+            self.data.qpos[:n] = 0.0
+            if n >= 2:
+                self.data.qpos[1] = -0.3
+
+        # Set gripper actuator (mimics will resolve via mj_forward).
+        try:
+            aid = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_ACTUATOR,
+                                "fingers_actuator")
+            if aid >= 0:
+                self.data.ctrl[aid] = float(np.clip(gripper_position, 0, 1))
+        except Exception:
+            pass
+
+        jacp = np.zeros((3, self.model.nv))
+        jacr = np.zeros((3, self.model.nv))
+        target_pos = np.asarray(target_pos, dtype=float).reshape(3)
+        target_R = np.asarray(target_R, dtype=float).reshape(3, 3)
+
+        for it in range(max_iter):
+            mj.mj_forward(self.model, self.data)
+            cur_pos = self.data.xpos[bid].copy()
+            cur_R = self.data.xmat[bid].reshape(3, 3).copy()
+            err_pos = target_pos - cur_pos
+            R_err = target_R @ cur_R.T
+            rvec, _ = cv2.Rodrigues(R_err)
+            err_rot = rvec.flatten()
+            if (np.linalg.norm(err_pos) < tol_pos and
+                    np.linalg.norm(err_rot) < tol_rot):
+                break
+            mj.mj_jacBody(self.model, self.data, jacp, jacr, bid)
+            J = np.vstack([jacp[:, :n], jacr[:, :n]])  # 6 x n
+            err = np.concatenate([err_pos, err_rot])
+            JJt = J @ J.T + (damping ** 2) * np.eye(6)
+            dq = J.T @ np.linalg.solve(JJt, err)
+            self.data.qpos[:n] += step * dq
+
+        info = {
+            "pos_err": float(np.linalg.norm(err_pos)),
+            "rot_err": float(np.linalg.norm(err_rot)),
+            "iters": int(it + 1),
+        }
+        return self.data.qpos[:n].copy(), info
+
     def render(self, K: dict, T_cam2base: np.ndarray,
                joint_positions: np.ndarray,
                gripper_position: float = 0.0,

@@ -81,21 +81,36 @@ class URDFRobotMasker:
             # don't need a working ROS install to load community URDFs
             # (e.g. ros-industrial's universal_robot, automaticaddison's
             # ur_robotiq).
+            # Cache walk results so we don't re-scan the tree per-mesh.
+            _pkg_dir_cache: dict[str, str | None] = {}
+
+            def _find_pkg_dir(pkg: str) -> str | None:
+                if pkg in _pkg_dir_cache:
+                    return _pkg_dir_cache[pkg]
+                hit = None
+                for root, dirs, _ in os.walk(mesh_dir):
+                    if pkg in dirs:
+                        hit = os.path.join(root, pkg)
+                        break
+                _pkg_dir_cache[pkg] = hit
+                return hit
+
             def _filename_handler(fname: str) -> str:
                 if fname.startswith("package://"):
                     rest = fname[len("package://"):]
-                    parts = rest.split("/", 1)
-                    if len(parts) == 2:
-                        # Try a few resolution strategies in order:
-                        candidates = [
-                            os.path.join(mesh_dir, parts[1]),               # mesh_dir/<after-pkg>
-                            os.path.join(mesh_dir, rest),                   # mesh_dir/<pkg>/<...>
-                            os.path.join(os.path.dirname(mesh_dir), rest),  # parent/<pkg>/<...>
-                        ]
-                        for c in candidates:
-                            if os.path.exists(c):
-                                return c
-                        return candidates[0]
+                    pkg, _, sub = rest.partition("/")
+                    candidates = [
+                        os.path.join(mesh_dir, sub),                    # mesh_dir/<after-pkg>
+                        os.path.join(mesh_dir, rest),                   # mesh_dir/<pkg>/<...>
+                        os.path.join(os.path.dirname(mesh_dir), rest),  # parent/<pkg>/<...>
+                    ]
+                    pkg_dir = _find_pkg_dir(pkg)
+                    if pkg_dir is not None:
+                        candidates.append(os.path.join(pkg_dir, sub))   # walk-found <pkg>/<sub>
+                    for c in candidates:
+                        if os.path.exists(c):
+                            return c
+                    return candidates[0]
                 return fname
             kwargs["filename_handler"] = _filename_handler
         self.robot = yourdfpy.URDF.load(str(urdf_path), **kwargs)

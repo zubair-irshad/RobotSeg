@@ -45,6 +45,12 @@ JOINT_DIMS = {
                   "gripper_kind": "width_m"},
     "berkeley_autolab_ur5": {"arm": (0, 6), "gripper_idx": 6,
                               "gripper_kind": "binary_closed"},
+    # Bridge state[:, :6] is (x, y, z, roll, pitch, yaw) — 6-DoF EE POSE,
+    # NOT joint angles. Only meaningful with --zero_pose / --base_only.
+    # state[6] is the gripper position (~0..1).
+    "bridge": {"arm": (0, 6), "gripper_idx": 6,
+               "gripper_kind": "binary_closed",
+               "no_joint_angles": True},
 }
 
 # Default URDF joint names per embodiment, in the same order the dataset
@@ -169,6 +175,13 @@ def main():
     arm_lo, arm_hi = spec["arm"]
     grip_idx = spec.get("gripper_idx")
     grip_kind = spec.get("gripper_kind", "width_m")
+    if spec.get("no_joint_angles") and not (args.zero_pose or args.base_only):
+        raise SystemExit(
+            f"{args.dataset}: trajectory.npz has no joint angles "
+            f"(state[:6] is EE POSE, not joints). Re-run with "
+            f"--zero_pose (full URDF at q=0) or --base_only "
+            f"(base silhouette only). EE/BASE markers from "
+            f"--debug_markers are still meaningful.")
 
     arm_names = (args.arm_joint_names.split(",") if args.arm_joint_names
                  else ARM_JOINT_NAMES.get(args.dataset))
@@ -311,7 +324,15 @@ def main():
                 if args.base_link_names:
                     link_filter = [s.strip() for s in args.base_link_names.split(",")]
                 else:
-                    link_filter = [masker.robot.base_link]
+                    bl = masker.robot.base_link
+                    # Many community URDFs use 'world' or 'base_footprint' as
+                    # the URDF root with no visuals attached. Fall back to
+                    # 'base_link'/'base' substrings, which are nearly
+                    # universal for the first link that actually has meshes.
+                    if bl in ("world", "base_footprint", "map"):
+                        link_filter = ["base_link", "base"]
+                    else:
+                        link_filter = [bl]
             render_kwargs = dict(
                 K=K, T_cam2base=T_cam2base_for_render,
                 joint_positions=q_arm, gripper_position=grip,

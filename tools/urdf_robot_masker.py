@@ -398,8 +398,9 @@ class URDFRobotMasker:
         T_cam2base: np.ndarray,
         joint_positions: np.ndarray,
         gripper_position: float = 0.0,
-        color_bgr: tuple[int, int, int] = (255, 180, 0),
-        outline_bgr: tuple[int, int, int] = (0, 255, 255),
+        color_bgr: tuple[int, int, int] = (255, 210, 80),
+        outline_bgr: tuple[int, int, int] = (255, 230, 120),
+        outline_px: int = 0,
         alpha: float = 0.45,
     ) -> tuple[np.ndarray, np.ndarray]:
         mask = self.render(
@@ -416,10 +417,14 @@ class URDFRobotMasker:
             out_f = out.astype(np.float32)
             out_f[sel] = (1.0 - alpha) * out_f[sel] + alpha * color
             out = np.clip(out_f, 0, 255).astype(np.uint8)
-            contours, _ = cv2.findContours(
-                mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-            cv2.drawContours(out, contours, -1, outline_bgr, 2, lineType=cv2.LINE_AA)
+            if outline_px > 0:
+                contours, _ = cv2.findContours(
+                    mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+                cv2.drawContours(
+                    out, contours, -1, outline_bgr, int(outline_px),
+                    lineType=cv2.LINE_AA,
+                )
         return out, mask
 
 

@@ -57,6 +57,13 @@ def _load_K(ep_seg: Path, pnp: dict, image_bgr: np.ndarray) -> dict[str, float]:
     return {k: float(v) if k in {"fx", "fy", "cx", "cy"} else v for k, v in K.items()}
 
 
+def _parse_bgr(text: str) -> tuple[int, int, int]:
+    vals = tuple(int(x.strip()) for x in text.split(","))
+    if len(vals) != 3 or any(v < 0 or v > 255 for v in vals):
+        raise argparse.ArgumentTypeError("expected B,G,R values in 0..255, e.g. 255,210,80")
+    return vals
+
+
 def _load_joint_array(traj: np.lib.npyio.NpzFile, key: str | None) -> np.ndarray:
     candidates = []
     if key:
@@ -206,8 +213,8 @@ def process_episode(
         return {"episode": ep_name, "status": "skip-first-image-unreadable"}
     K = _load_K(ep_seg, pnp, first_img)
 
-    color = tuple(int(x) for x in args.color_bgr.split(","))
-    outline = tuple(int(x) for x in args.outline_bgr.split(","))
+    color = _parse_bgr(args.color_bgr)
+    outline = _parse_bgr(args.outline_bgr)
     for ordinal, img_path in enumerate(frames):
         if img_path not in selected:
             continue
@@ -227,6 +234,7 @@ def process_episode(
             gripper_position=float(gripper[idx]),
             color_bgr=color,
             outline_bgr=outline,
+            outline_px=int(args.outline_px),
             alpha=float(args.alpha),
         )
         if args.draw_status:
@@ -251,6 +259,9 @@ def process_episode(
         "episode": ep_name,
         "status": "ok" if rendered else "bad-no-rendered-frames",
         "pnp_status": pnp.get("status"),
+        "K_source": K.get("source", "unknown"),
+        "rmse_px": pnp.get("rmse_px"),
+        "num_inliers": pnp.get("num_inliers"),
         "rendered": rendered,
         "skipped": skipped,
         "out_dir": str(out_dir),
@@ -275,8 +286,22 @@ def main() -> None:
     parser.add_argument("--downsample", type=int, default=2)
     parser.add_argument("--dilate_px", type=int, default=2)
     parser.add_argument("--alpha", type=float, default=0.45)
-    parser.add_argument("--color_bgr", default="255,180,0")
-    parser.add_argument("--outline_bgr", default="0,255,255")
+    parser.add_argument(
+        "--color_bgr",
+        default="255,210,80",
+        help="Translucent overlay color as OpenCV B,G,R. Default is light blue.",
+    )
+    parser.add_argument(
+        "--outline_bgr",
+        default="255,230,120",
+        help="Optional outline color as OpenCV B,G,R. Used only when --outline_px > 0.",
+    )
+    parser.add_argument(
+        "--outline_px",
+        type=int,
+        default=0,
+        help="Contour thickness in pixels. Default 0 disables edges.",
+    )
     parser.add_argument("--gripper_open_rad", type=float, default=0.0)
     parser.add_argument("--gripper_closed_rad", type=float, default=0.7)
     parser.add_argument("--skip_bad_pnp", action="store_true")
@@ -309,9 +334,14 @@ def main() -> None:
     for ep in episodes:
         result = process_episode(args.dataset, ep, args, masker)
         results.append(result)
+        rmse = result.get("rmse_px")
+        rmse_s = f"{rmse:.2f}px" if isinstance(rmse, (int, float)) else "?"
         print(
             f"[{args.dataset}/{ep}] {result['status']} "
-            f"rendered={result.get('rendered', 0)} out={result.get('out_dir', '')}"
+            f"rendered={result.get('rendered', 0)} "
+            f"K={result.get('K_source', '?')} rmse={rmse_s} "
+            f"inliers={result.get('num_inliers', '?')} "
+            f"out={result.get('out_dir', '')}"
         )
 
     summary_path = ds_seg / "urdf_viz_summary.json"

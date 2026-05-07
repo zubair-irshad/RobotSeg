@@ -198,6 +198,17 @@ def process_episode(
         gripper = _load_gripper_array(traj, len(joints), args.gripper_key)
 
     frames = _image_paths(ep_oxe, ep_seg, args.image_source)
+    if len(joints) != len(frames) and not args.allow_partial_trajectory:
+        return {
+            "episode": ep_name,
+            "status": "bad-frame-trajectory-count-mismatch",
+            "num_frames": len(frames),
+            "num_joint_positions": int(len(joints)),
+            "hint": (
+                "Regenerate data/oxe_subset with the same frame_stride used "
+                "for segmentation/PnP, or pass --allow_partial_trajectory for debugging."
+            ),
+        }
     selected = _select_frames(frames, args.frame_stride, args.max_frames)
     if not selected:
         return {"episode": ep_name, "status": "skip-no-selected-frames"}
@@ -286,6 +297,12 @@ def main() -> None:
     parser.add_argument("--image_source", choices=["auto", "raw", "combined"], default="auto")
     parser.add_argument("--joint_key", default=None)
     parser.add_argument("--gripper_key", default=None)
+    parser.add_argument(
+        "--allow_partial_trajectory",
+        action="store_true",
+        help="Render frames whose numeric stem can be matched to a joint row "
+             "even when frame and trajectory counts differ. Debug only.",
+    )
     parser.add_argument("--frame_stride", type=int, default=1)
     parser.add_argument("--max_frames", type=int, default=0)
     parser.add_argument("--downsample", type=int, default=2)
@@ -344,6 +361,8 @@ def main() -> None:
         print(
             f"[{args.dataset}/{ep}] {result['status']} "
             f"rendered={result.get('rendered', 0)} "
+            f"frames={result.get('num_frames', '?')} "
+            f"joints={result.get('num_joint_positions', '?')} "
             f"K={result.get('K_source', '?')} rmse={rmse_s} "
             f"inliers={result.get('num_inliers', '?')} "
             f"out={result.get('out_dir', '')}"

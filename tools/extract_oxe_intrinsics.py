@@ -60,10 +60,11 @@ def main():
             ep_dir = ds_root / f"episode_{i:04d}"
             if not ep_dir.exists():
                 continue
-            steps = list(episode["steps"].as_numpy_iterator())
-            if not steps:
+            try:
+                first_step = next(iter(episode["steps"].as_numpy_iterator()))
+            except StopIteration:
                 continue
-            cam_meta = extract_intrinsics(episode, steps[0])
+            cam_meta = extract_intrinsics(episode, first_step)
             if cam_meta is None:
                 continue
             (ep_dir / "camera.json").write_text(json.dumps(cam_meta, indent=2))

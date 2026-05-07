@@ -398,10 +398,10 @@ class URDFRobotMasker:
         T_cam2base: np.ndarray,
         joint_positions: np.ndarray,
         gripper_position: float = 0.0,
-        color_bgr: tuple[int, int, int] = (255, 195, 52),
-        outline_bgr: tuple[int, int, int] = (255, 215, 92),
+        color_bgr: tuple[int, int, int] = (229, 132, 11),
+        outline_bgr: tuple[int, int, int] = (245, 165, 35),
         outline_px: int = 0,
-        alpha: float = 0.55,
+        alpha: float = 0.60,
     ) -> tuple[np.ndarray, np.ndarray]:
         mask = self.render(
             K,

@@ -309,15 +309,15 @@ def main() -> None:
     parser.add_argument("--max_frames", type=int, default=0)
     parser.add_argument("--downsample", type=int, default=2)
     parser.add_argument("--dilate_px", type=int, default=2)
-    parser.add_argument("--alpha", type=float, default=0.55)
+    parser.add_argument("--alpha", type=float, default=0.60)
     parser.add_argument(
         "--color_bgr",
-        default="255,195,52",
-        help="Translucent overlay color as OpenCV B,G,R. Default is #34C3FF.",
+        default="229,132,11",
+        help="Translucent overlay color as OpenCV B,G,R. Default is #0B84E5.",
     )
     parser.add_argument(
         "--outline_bgr",
-        default="255,215,92",
+        default="245,165,35",
         help="Optional outline color as OpenCV B,G,R. Used only when --outline_px > 0.",
     )
     parser.add_argument(

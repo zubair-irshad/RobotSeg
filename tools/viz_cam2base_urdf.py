@@ -273,6 +273,8 @@ def process_episode(
         "K_source": K.get("source", "unknown"),
         "rmse_px": pnp.get("rmse_px"),
         "num_inliers": pnp.get("num_inliers"),
+        "num_frames": len(frames),
+        "num_joint_positions": int(len(joints)),
         "rendered": rendered,
         "skipped": skipped,
         "out_dir": str(out_dir),

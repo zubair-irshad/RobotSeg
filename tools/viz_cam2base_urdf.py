@@ -181,7 +181,7 @@ def process_episode(
 ) -> dict:
     ep_oxe = args.oxe_root / dataset / ep_name
     ep_seg = args.mask_root / dataset / ep_name
-    pnp_path = ep_seg / "pnp.json"
+    pnp_path = ep_seg / args.pnp_json_name
     traj_path = ep_oxe / "trajectory.npz"
     if not pnp_path.exists():
         return {"episode": ep_name, "status": "skip-missing-pnp"}
@@ -277,6 +277,11 @@ def main() -> None:
     parser.add_argument("--episodes", nargs="+", default=None)
     parser.add_argument("--urdf_path", type=Path, default=DEFAULT_URDF)
     parser.add_argument("--mesh_dir", type=Path, default=None)
+    parser.add_argument(
+        "--pnp_json_name",
+        default="pnp.json",
+        help="Per-episode PnP JSON filename, e.g. pnp.json or pnp_rlds.json.",
+    )
     parser.add_argument("--out_dir_name", default="urdf_viz")
     parser.add_argument("--image_source", choices=["auto", "raw", "combined"], default="auto")
     parser.add_argument("--joint_key", default=None)
@@ -285,15 +290,15 @@ def main() -> None:
     parser.add_argument("--max_frames", type=int, default=0)
     parser.add_argument("--downsample", type=int, default=2)
     parser.add_argument("--dilate_px", type=int, default=2)
-    parser.add_argument("--alpha", type=float, default=0.45)
+    parser.add_argument("--alpha", type=float, default=0.55)
     parser.add_argument(
         "--color_bgr",
-        default="255,210,80",
-        help="Translucent overlay color as OpenCV B,G,R. Default is light blue.",
+        default="255,195,52",
+        help="Translucent overlay color as OpenCV B,G,R. Default is #34C3FF.",
     )
     parser.add_argument(
         "--outline_bgr",
-        default="255,230,120",
+        default="255,215,92",
         help="Optional outline color as OpenCV B,G,R. Used only when --outline_px > 0.",
     )
     parser.add_argument(

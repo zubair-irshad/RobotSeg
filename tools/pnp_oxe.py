@@ -610,6 +610,14 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
             except Exception:
                 K = None
     K_known = K is not None
+    if args.require_known_intrinsics and not K_known:
+        return {
+            "status": "skip-no-known-intrinsics",
+            "episode": ep_dir_seg.name,
+            "dataset": ds_name,
+            "image_size": [W, H],
+            "camera_json_exists": (ep_dir_oxe / "camera.json").exists(),
+        }
 
     K_moge = None
     if K is None and args.moge_intrinsics:
@@ -695,11 +703,11 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
         result["tool_offset"] = pnp["tool_offset"]
         result["tool_offset_norm_m"] = pnp["tool_offset_norm"]
 
-    out_path = ep_dir_seg / "pnp.json"
+    out_path = ep_dir_seg / args.pnp_json_name
     out_path.write_text(json.dumps(result, indent=2))
 
     if args.viz:
-        viz_dir = ep_dir_seg / "pnp_viz"
+        viz_dir = ep_dir_seg / args.viz_dir_name
         viz_dir.mkdir(exist_ok=True)
         rvec = np.asarray(pnp["rvec"], dtype=np.float64).reshape(3, 1)
         tvec = np.asarray(pnp["tvec"], dtype=np.float64).reshape(3, 1)
@@ -802,6 +810,10 @@ def main():
     p.add_argument("--moge_recompute", action="store_true",
                    help="Ignore cached <ep>/moge_K.json and re-run MoGe-2.")
     p.add_argument("--moge_verbose", action="store_true")
+    p.add_argument("--require_known_intrinsics", action="store_true",
+                   help="Use only --K_json or per-episode camera.json intrinsics. "
+                        "If neither is usable, skip the episode instead of "
+                        "falling back to MoGe/HFOV/estimated intrinsics.")
 
     p.add_argument("--solve_tool_offset", action="store_true",
                    help="Jointly estimate (R, t, offset_tool) where offset_tool "
@@ -819,6 +831,11 @@ def main():
                         "extrinsic. One K per episode. Requires scipy.")
     p.add_argument("--viz", action="store_true",
                    help="Save reprojection overlays per kept frame.")
+    p.add_argument("--pnp_json_name", default="pnp.json",
+                   help="Per-episode output filename. Use pnp_rlds.json to "
+                        "compare against an existing pnp.json non-destructively.")
+    p.add_argument("--viz_dir_name", default="pnp_viz",
+                   help="Per-episode visualization directory.")
     args = p.parse_args()
 
     K_overrides = {}

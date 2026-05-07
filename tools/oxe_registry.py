@@ -100,6 +100,7 @@ OXE_DATASETS = {
             "wrist_image_left",
         ],
         "state_key": "cartesian_position",
+        "joint_key": "joint_position",
         "action_key": "action",
         "state_schema": (
             "cartesian_position[6]: xyz(0:3), euler(3:6). "

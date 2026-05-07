@@ -219,11 +219,13 @@ def process_episode(episode, cfg: dict, ep_dir: Path, frame_stride: int) -> dict
         )
 
     state_key = cfg.get("state_key")
+    joint_key = cfg.get("joint_key")
     action_key = cfg.get("action_key")
     ds_name = cfg.get("_name")  # set by process_dataset
     extractor = EXTRACTORS.get(ds_name)
 
     states, actions, kept_idx = [], [], []
+    joint_positions = []
     eef_xyz, eef_rot, gripper = [], [], []
 
     for i, step in enumerate(steps):
@@ -240,6 +242,17 @@ def process_episode(episode, cfg: dict, ep_dir: Path, frame_stride: int) -> dict
             if v is not None:
                 try:
                     states.append(np.asarray(v).ravel())
+                except Exception:
+                    pass
+
+        # DROID exposes the Franka arm joints directly. Keep them alongside
+        # the Cartesian pose so downstream URDF visualization can render the
+        # actual articulated robot, not just the gripper PnP point.
+        if joint_key is not None:
+            v = _nested_get(step["observation"], joint_key)
+            if v is not None:
+                try:
+                    joint_positions.append(np.asarray(v).ravel())
                 except Exception:
                     pass
 
@@ -274,6 +287,8 @@ def process_episode(episode, cfg: dict, ep_dir: Path, frame_stride: int) -> dict
             pass
     if actions:
         traj["action"] = np.stack(actions, axis=0)
+    if joint_positions:
+        traj["joint_position"] = np.stack(joint_positions, axis=0).astype(np.float32)
 
     if eef_xyz:
         traj["eef_xyz"] = np.stack(eef_xyz, axis=0).astype(np.float32)
@@ -292,6 +307,7 @@ def process_episode(episode, cfg: dict, ep_dir: Path, frame_stride: int) -> dict
         f"embodiment: {cfg['embodiment']}\n"
         f"rgb_key_used: {rgb_key}\n"
         f"state_key: {state_key}\n"
+        f"joint_key: {joint_key}\n"
         f"action_key: {action_key}\n"
         f"frame_stride: {frame_stride}\n"
         f"native_fps: {cfg.get('fps_note', 'unknown')}\n"
@@ -303,6 +319,7 @@ def process_episode(episode, cfg: dict, ep_dir: Path, frame_stride: int) -> dict
         "num_steps_total": len(steps),
         "rgb_key_used": rgb_key,
         "state_dim": int(states[0].shape[0]) if states else 0,
+        "joint_dim": int(joint_positions[0].shape[0]) if joint_positions else 0,
         "action_dim": int(actions[0].shape[0]) if actions else 0,
     }
 

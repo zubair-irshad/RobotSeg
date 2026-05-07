@@ -191,6 +191,9 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# Local data/checkouts produced by the OXE visualization tools.
+data/urdfs/python-example-droid-dataset/
+
 # PyPI configuration file
 .pypirc
 

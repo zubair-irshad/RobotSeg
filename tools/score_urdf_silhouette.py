@@ -142,7 +142,7 @@ def _mask_metrics(target: np.ndarray, render: np.ndarray,
             "target_coverage": 0.0,
             "render_precision": 0.0,
             "target_to_render_px": float("inf"),
-            "render_to_target_px": float("inf"),
+            "render_to_target_px_trim75": float("inf"),
             "target_area": float(target_area),
             "render_area": float(render_area),
         }

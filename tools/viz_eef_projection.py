@@ -197,6 +197,105 @@ def _draw_legend(img: np.ndarray, items: list[tuple[str, tuple[int, int, int]]],
         )
 
 
+_CANDIDATE_HELP = {
+    "eef_xyz": "DROID cartesian_position[:3] / proprio EEF point",
+    "panda_link7": "Franka link7 origin before fixed flange",
+    "panda_link8": "Franka flange frame after 0.107 m offset",
+    "robotiq_85_base_link": "Robotiq gripper base frame",
+    "left_outer_finger": "left outer finger link origin",
+    "right_outer_finger": "right outer finger link origin",
+    "left_inner_finger": "left inner finger link origin",
+    "right_inner_finger": "right inner finger link origin",
+    "finger_midpoint": "midpoint of left/right outer finger origins",
+    "inner_finger_midpoint": "midpoint of left/right inner finger origins",
+    "all_finger_midpoint": "mean of all available finger link origins",
+}
+
+
+def _candidate_help(name: str) -> str:
+    return _CANDIDATE_HELP.get(name, "URDF link origin")
+
+
+def _put_small_text(img: np.ndarray, text: str, xy: tuple[int, int],
+                    color: tuple[int, int, int], scale: float) -> None:
+    x, y = xy
+    cv2.putText(
+        img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale,
+        (255, 255, 255), 2, cv2.LINE_AA,
+    )
+    cv2.putText(
+        img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale,
+        color, 1, cv2.LINE_AA,
+    )
+
+
+def _draw_centroid(img: np.ndarray, c: np.ndarray, args: argparse.Namespace) -> None:
+    cv2.drawMarker(
+        img, tuple(np.rint(c).astype(int)), (0, 255, 255),
+        cv2.MARKER_CROSS, int(args.marker_size) + 4,
+        int(args.marker_thickness), cv2.LINE_AA,
+    )
+
+
+def _draw_candidate_panel(
+    image: np.ndarray,
+    c: np.ndarray,
+    name: str,
+    uv: np.ndarray,
+    color: tuple[int, int, int],
+    marker: int,
+    args: argparse.Namespace,
+) -> np.ndarray:
+    panel = image.copy()
+    _draw_centroid(panel, c, args)
+    dist_text = "not visible"
+    if np.all(np.isfinite(uv)):
+        err = float(np.linalg.norm(uv - c))
+        dist_text = f"{err:.1f}px from seg centroid"
+        _draw_point(panel, uv, color, "", marker, args)
+        pt0 = tuple(np.rint(c).astype(int))
+        pt1 = tuple(np.rint(uv).astype(int))
+        cv2.line(panel, pt0, pt1, color, 1, cv2.LINE_AA)
+    _put_small_text(panel, name, (7, 14), color, float(args.panel_label_scale))
+    if args.panel_descriptions:
+        _put_small_text(
+            panel, _candidate_help(name), (7, 29), color,
+            float(args.panel_label_scale) * 0.82,
+        )
+    _put_small_text(
+        panel, dist_text, (7, panel.shape[0] - 8), color,
+        float(args.panel_label_scale) * 0.9,
+    )
+    return panel
+
+
+def _make_candidate_panels(
+    image: np.ndarray,
+    c: np.ndarray,
+    draw_uvs: dict[str, np.ndarray],
+    palette: dict[str, tuple[tuple[int, int, int], int]],
+    args: argparse.Namespace,
+) -> np.ndarray:
+    panels = []
+    base = image.copy()
+    _draw_centroid(base, c, args)
+    _put_small_text(base, "segmentation centroid", (7, 14), (0, 255, 255),
+                    float(args.panel_label_scale))
+    panels.append(base)
+    for name, uv in draw_uvs.items():
+        color, marker = palette.get(name, ((255, 255, 255), cv2.MARKER_CROSS))
+        panels.append(_draw_candidate_panel(image, c, name, uv, color, marker, args))
+
+    cols = max(1, int(args.panel_cols))
+    h, w = image.shape[:2]
+    rows = int(np.ceil(len(panels) / cols))
+    canvas = np.zeros((rows * h, cols * w, 3), dtype=np.uint8)
+    for i, panel in enumerate(panels):
+        r, col = divmod(i, cols)
+        canvas[r * h:(r + 1) * h, col * w:(col + 1) * w] = panel
+    return canvas
+
+
 def process_episode(args: argparse.Namespace, ep_name: str,
                     masker: URDFRobotMasker | None) -> dict[str, Any]:
     ep_oxe = args.oxe_root / args.dataset / ep_name
@@ -280,11 +379,6 @@ def process_episode(args: argparse.Namespace, ep_name: str,
             if np.all(np.isfinite(uv)):
                 candidates.setdefault(name, []).append(float(np.linalg.norm(uv - c)))
 
-        cv2.drawMarker(
-            image, tuple(np.rint(c).astype(int)), (0, 255, 255),
-            cv2.MARKER_CROSS, int(args.marker_size) + 4,
-            int(args.marker_thickness), cv2.LINE_AA,
-        )
         palette = {
             "eef_xyz": ((0, 0, 255), cv2.MARKER_DIAMOND),
             "panda_link7": ((255, 0, 0), cv2.MARKER_TILTED_CROSS),
@@ -308,16 +402,31 @@ def process_episode(args: argparse.Namespace, ep_name: str,
             if valid:
                 best = min(valid, key=valid.get)
                 draw_uvs = {best: draw_uvs[best]}
-        legend_items = [("seg centroid", (0, 255, 255))]
-        for name, uv in draw_uvs.items():
-            color, marker = palette.get(name, ((255, 255, 255), cv2.MARKER_CROSS))
-            label = name if args.label_mode == "all" else ""
-            if args.label_mode == "best" and args.draw_best_only:
-                label = name
-            _draw_point(image, uv, color, label, marker, args)
-            legend_items.append((name, color))
-        _draw_legend(image, legend_items, args)
-        cv2.imwrite(str(out_dir / f"{img_path.stem}.jpg"), image)
+        if args.candidate_layout == "panels":
+            viz = _make_candidate_panels(image, c, draw_uvs, palette, args)
+            cv2.imwrite(str(out_dir / f"{img_path.stem}.jpg"), viz)
+        elif args.candidate_layout == "files":
+            stem_dir = out_dir / img_path.stem
+            stem_dir.mkdir(parents=True, exist_ok=True)
+            base = image.copy()
+            _draw_centroid(base, c, args)
+            cv2.imwrite(str(stem_dir / "seg_centroid.jpg"), base)
+            for name, uv in draw_uvs.items():
+                color, marker = palette.get(name, ((255, 255, 255), cv2.MARKER_CROSS))
+                viz = _draw_candidate_panel(image, c, name, uv, color, marker, args)
+                cv2.imwrite(str(stem_dir / f"{name}.jpg"), viz)
+        else:
+            _draw_centroid(image, c, args)
+            legend_items = [("seg centroid", (0, 255, 255))]
+            for name, uv in draw_uvs.items():
+                color, marker = palette.get(name, ((255, 255, 255), cv2.MARKER_CROSS))
+                label = name if args.label_mode == "all" else ""
+                if args.label_mode == "best" and args.draw_best_only:
+                    label = name
+                _draw_point(image, uv, color, label, marker, args)
+                legend_items.append((name, color))
+            _draw_legend(image, legend_items, args)
+            cv2.imwrite(str(out_dir / f"{img_path.stem}.jpg"), image)
         saved += 1
 
     stats = {name: _stats(errs) for name, errs in candidates.items()}
@@ -354,6 +463,20 @@ def main() -> None:
     parser.add_argument("--label_mode", choices=["none", "best", "all"], default="none")
     parser.add_argument("--legend", action="store_true")
     parser.add_argument("--draw_best_only", action="store_true")
+    parser.add_argument(
+        "--candidate_layout",
+        choices=["overlay", "panels", "files"],
+        default="overlay",
+        help="overlay draws all candidates on one frame; panels/files draw one candidate per view.",
+    )
+    parser.add_argument("--panel_cols", type=int, default=3)
+    parser.add_argument("--panel_label_scale", type=float, default=0.34)
+    parser.add_argument("--panel_descriptions", action="store_true", default=True)
+    parser.add_argument(
+        "--no_panel_descriptions",
+        dest="panel_descriptions",
+        action="store_false",
+    )
     parser.add_argument(
         "--draw_candidates",
         nargs="+",

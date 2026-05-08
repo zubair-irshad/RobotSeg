@@ -29,6 +29,7 @@ FRAME_STRIDE="${FRAME_STRIDE:-1}"
 MAX_FRAMES_PER_SEQ="${MAX_FRAMES_PER_SEQ:-32}"
 DOWNLOAD_RAW="${DOWNLOAD_RAW:-0}"
 GPU_ONLY="${GPU_ONLY:-1}"
+STEREO_CROP="${STEREO_CROP:-auto}"
 
 DOWNLOAD_ARGS=()
 if [[ "$DOWNLOAD_RAW" == "1" ]]; then
@@ -50,6 +51,7 @@ echo "==> extract matching raw-MP4 frames"
   --camera "$CAMERA" \
   --frame_stride "$FRAME_STRIDE" \
   --max_frames_per_seq "$MAX_FRAMES_PER_SEQ" \
+  --stereo_crop "$STEREO_CROP" \
   "${DOWNLOAD_ARGS[@]}"
 
 RAW_SUMMARY="$RAW_FRAME_ROOT/$DATASET/raw_mp4_extract_summary.json"

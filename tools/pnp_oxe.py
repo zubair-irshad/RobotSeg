@@ -1135,6 +1135,8 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
         "num_total": len(centroids),
         "num_kept_after_filter": len(kept_stems),
         "rejection_breakdown": _rejection_breakdown(rejected),
+        "kept_stems": kept_stems,
+        "rejected_stems": [{"stem": s, "reason": r} for s, r in rejected],
     }
 
     # If we don't have known intrinsics and the user asked for joint
@@ -1154,6 +1156,8 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
     if pnp is None:
         result["status"] = "bad-pnp-fail"
         result["num_inliers"] = 0
+        out_path = ep_dir_seg / args.pnp_json_name
+        out_path.write_text(json.dumps(result, indent=2))
         return result
 
     inlier_frac = len(pnp["inlier_idx"]) / max(1, len(kept_stems))
@@ -1172,9 +1176,7 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
         "T_base2cam": pnp["T_base2cam"],
         "rvec": pnp["rvec"],
         "tvec": pnp["tvec"],
-        "kept_stems": kept_stems,
         "inlier_stems": [kept_stems[i] for i in pnp["inlier_idx"]],
-        "rejected_stems": [{"stem": s, "reason": r} for s, r in rejected],
     })
     if "tool_offset" in pnp:
         result["tool_offset"] = pnp["tool_offset"]

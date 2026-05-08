@@ -24,7 +24,10 @@ from typing import Any
 
 import cv2
 import numpy as np
-from natsort import natsorted
+try:
+    from natsort import natsorted
+except ImportError:
+    natsorted = sorted
 
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
@@ -121,6 +124,31 @@ def _gsutil_ls(pattern: str) -> list[str]:
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
 
+def _is_stereo_mp4(path_like: str | Path) -> bool:
+    return "stereo" in Path(str(path_like)).name.lower()
+
+
+def _rank_mp4(path_like: str | Path, serial: str | None, prefer_stereo: bool) -> tuple[int, int, str]:
+    path_s = str(path_like)
+    name = Path(path_s).name
+    stem = Path(name).stem
+    is_stereo = _is_stereo_mp4(name)
+    exact_serial = bool(serial) and stem == str(serial)
+    stereo_rank = 0 if (is_stereo == prefer_stereo) else 1
+    exact_rank = 0 if exact_serial else 1
+    return stereo_rank, exact_rank, path_s
+
+
+def _choose_mp4(hits: list[str], serial: str | None, prefer_stereo: bool) -> str | None:
+    if not hits:
+        return None
+    if serial:
+        serial_hits = [h for h in hits if serial in Path(h).name or serial in h]
+        if serial_hits:
+            return sorted(serial_hits, key=lambda h: _rank_mp4(h, serial, prefer_stereo))[0]
+    return sorted(hits, key=lambda h: _rank_mp4(h, serial, prefer_stereo))[0]
+
+
 def _find_gcs_mp4(args, episode_id: str, episode_id_to_path: dict[str, Any],
                   serial: str | None) -> str | None:
     raw_value = episode_id_to_path.get(episode_id)
@@ -139,16 +167,15 @@ def _find_gcs_mp4(args, episode_id: str, episode_id_to_path: dict[str, Any],
                 hits = _gsutil_ls(f"{base.rstrip('/')}/*/*.mp4")
             if not hits:
                 hits = _gsutil_ls(f"{base.rstrip('/')}/*/*/*.mp4")
-            if serial:
-                serial_hits = [h for h in hits if serial in Path(h).name or serial in h]
-                if serial_hits:
-                    return sorted(serial_hits)[0]
             if hits:
-                return sorted(hits)[0]
+                selected = _choose_mp4(hits, serial, args.prefer_stereo_mp4)
+                if selected:
+                    return selected
     return None
 
 
-def _local_mp4_path(raw_root: Path, episode_id: str, serial: str | None) -> Path | None:
+def _local_mp4_path(raw_root: Path, episode_id: str, serial: str | None,
+                    prefer_stereo: bool = False) -> Path | None:
     ep_dir = raw_root / episode_id
     if not ep_dir.exists():
         return None
@@ -156,8 +183,8 @@ def _local_mp4_path(raw_root: Path, episode_id: str, serial: str | None) -> Path
     if serial:
         serial_hits = [p for p in hits if serial in p.name or serial in str(p)]
         if serial_hits:
-            return serial_hits[0]
-    return hits[0] if hits else None
+            return sorted(serial_hits, key=lambda p: _rank_mp4(p, serial, prefer_stereo))[0]
+    return sorted(hits, key=lambda p: _rank_mp4(p, serial, prefer_stereo))[0] if hits else None
 
 
 def _download_mp4(args, episode_id: str, gcs_uri: str, serial: str | None) -> Path:
@@ -176,6 +203,59 @@ def _extract_frame(cap: cv2.VideoCapture, frame_idx: int) -> np.ndarray | None:
     cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
     ok, frame = cap.read()
     return frame if ok else None
+
+
+def _resolve_stereo_crop(mode: str, camera: str) -> str:
+    if mode != "auto":
+        return mode
+    if camera.endswith("_left"):
+        return "left"
+    if camera.endswith("_right"):
+        return "right"
+    return "none"
+
+
+def _maybe_crop_stereo_frame(
+    frame: np.ndarray,
+    crop_mode: str,
+    camera: str,
+    mp4_path: Path,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Crop side-by-side stereo MP4 frames to the requested mono view.
+
+    DROID raw MP4s are inconsistent in this subset: some are normal 1280x720
+    mono frames, while others are 2560x720 side-by-side stereo. The local OXE
+    camera key exterior_image_1_left expects the left image, so feeding the
+    stitched frame into RobotSeg corrupts both segmentation and PnP.
+    """
+    h, w = frame.shape[:2]
+    resolved = _resolve_stereo_crop(crop_mode, camera)
+    meta = {
+        "input_width": int(w),
+        "input_height": int(h),
+        "stereo_crop": crop_mode,
+        "resolved_stereo_crop": resolved,
+        "source_mp4_is_stereo": _is_stereo_mp4(mp4_path),
+        "cropped": False,
+        "output_width": int(w),
+        "output_height": int(h),
+    }
+    is_side_by_side = w >= 2 * h and (w / max(1, h)) > 2.5
+    if resolved == "none" or not is_side_by_side:
+        return frame, meta
+    mid = w // 2
+    if resolved == "left":
+        cropped = frame[:, :mid]
+    elif resolved == "right":
+        cropped = frame[:, mid:]
+    else:
+        raise ValueError(f"unsupported stereo crop mode: {crop_mode}")
+    meta.update({
+        "cropped": True,
+        "output_width": int(cropped.shape[1]),
+        "output_height": int(cropped.shape[0]),
+    })
+    return cropped, meta
 
 
 def _safe_link_or_copy(src: Path, dst: Path) -> None:
@@ -214,7 +294,7 @@ def process_episode(args, ep: str, maps: dict[str, Any]) -> dict[str, Any]:
         args.camera_index,
     )
 
-    mp4 = _local_mp4_path(args.raw_root, episode_id, serial)
+    mp4 = _local_mp4_path(args.raw_root, episode_id, serial, args.prefer_stereo_mp4)
     gcs_uri = None
     if mp4 is None:
         gcs_uri = _find_gcs_mp4(args, episode_id, maps["episode_id_to_path"], serial)
@@ -262,6 +342,7 @@ def process_episode(args, ep: str, maps: dict[str, Any]) -> dict[str, Any]:
 
     saved = 0
     missing = []
+    crop_meta: dict[str, Any] | None = None
     for stem in stems:
         row_idx = int(stem)
         raw_idx = int(raw_indices[row_idx]) if row_idx < len(raw_indices) else row_idx
@@ -269,6 +350,9 @@ def process_episode(args, ep: str, maps: dict[str, Any]) -> dict[str, Any]:
         if frame is None:
             missing.append({"stem": stem, "raw_idx": raw_idx})
             continue
+        frame, this_crop_meta = _maybe_crop_stereo_frame(frame, args.stereo_crop, args.camera, mp4)
+        if crop_meta is None:
+            crop_meta = this_crop_meta
         cv2.imwrite(str(out_frames / f"{stem}.jpg"), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         saved += 1
     cap.release()
@@ -286,6 +370,8 @@ def process_episode(args, ep: str, maps: dict[str, Any]) -> dict[str, Any]:
         "num_saved": saved,
         "missing": missing[:20],
     }
+    if crop_meta is not None:
+        meta.update(crop_meta)
     (out_ep / "raw_mp4_extract.json").write_text(json.dumps(meta, indent=2))
     return meta
 
@@ -305,6 +391,12 @@ def main() -> None:
     p.add_argument("--episode_id_json", type=Path, default=None)
     p.add_argument("--frame_stride", type=int, default=1)
     p.add_argument("--max_frames_per_seq", type=int, default=32)
+    p.add_argument("--stereo_crop", choices=["auto", "left", "right", "none"], default="auto",
+                   help="Crop side-by-side stereo raw MP4 frames before saving. "
+                        "auto uses left/right from the camera name and leaves mono frames untouched.")
+    p.add_argument("--prefer_stereo_mp4", action="store_true",
+                   help="Prefer *stereo*.mp4 over the mono serial MP4 when both are present. "
+                        "Default is to prefer mono files such as 20521388.mp4.")
     p.add_argument("--download", action="store_true")
     args = p.parse_args()
 
@@ -335,7 +427,10 @@ def main() -> None:
         print(
             f"[{args.dataset}/{r['episode']}] {r['status']} "
             f"saved={r.get('num_saved', 0)}/{r.get('num_requested', 0)} "
-            f"serial={r.get('serial')} mp4={r.get('mp4') or r.get('gcs_uri', '')}"
+            f"serial={r.get('serial')} "
+            f"size={r.get('input_width')}x{r.get('input_height')}->{r.get('output_width')}x{r.get('output_height')} "
+            f"crop={r.get('resolved_stereo_crop')} cropped={r.get('cropped')} "
+            f"mp4={r.get('mp4') or r.get('gcs_uri', '')}"
         )
     print(f"Wrote {out_summary}")
 

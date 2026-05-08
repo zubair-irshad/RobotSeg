@@ -88,9 +88,25 @@ def main() -> None:
     for ep in episodes:
         pnp_path = ds_seg / ep / args.pnp_json_name
         pnp = _load_pnp(pnp_path)
-        if pnp is None or "T_cam2base" not in pnp:
+        if pnp is None:
             print(f"{ep:<12} {'missing-pnp':<13}")
             rows.append({"episode": ep, "status": "missing-pnp"})
+            continue
+        if "T_cam2base" not in pnp:
+            status = str(pnp.get("status", "pnp-no-transform"))
+            print(
+                f"{ep:<12} {status:<13} "
+                f"kept={pnp.get('num_kept_after_filter')} "
+                f"inliers={pnp.get('num_inliers')} "
+                f"reasons={pnp.get('rejection_breakdown')}"
+            )
+            rows.append({
+                "episode": ep,
+                "status": status,
+                "num_kept_after_filter": pnp.get("num_kept_after_filter"),
+                "num_inliers": pnp.get("num_inliers"),
+                "rejection_breakdown": pnp.get("rejection_breakdown"),
+            })
             continue
 
         keys = episode_lookup_keys(args.oxe_root, args.dataset, ep)

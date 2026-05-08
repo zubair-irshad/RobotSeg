@@ -102,19 +102,80 @@ def _episode_id_from_metadata(meta: dict, path_to_id: dict[str, str]) -> str | N
     return None
 
 
+def _load_episode_id_overrides(path: Path | None, dataset: str) -> dict[str, str]:
+    """Load local episode name -> raw DROID episode ID overrides.
+
+    Accepted forms:
+      {"episode_0000": "AUTOLab+..."}
+      {"droid/episode_0000": "AUTOLab+..."}
+      {"droid": {"episode_0000": "AUTOLab+..."}}
+      {"droid": {"episode_0000": {"episode_id": "AUTOLab+..."}}}
+    """
+    if path is None:
+        return {}
+    data = _load_json(path)
+    if isinstance(data, dict) and isinstance(data.get(dataset), dict):
+        data = data[dataset]
+    if not isinstance(data, dict):
+        raise ValueError(f"episode id map must be a JSON object: {path}")
+
+    out: dict[str, str] = {}
+    for key, val in data.items():
+        if isinstance(val, str):
+            out[str(key)] = val
+            continue
+        if isinstance(val, dict):
+            for field in ("episode_id", "droid_episode_id", "raw_episode_id", "id", "key"):
+                raw_id = val.get(field)
+                if isinstance(raw_id, str) and raw_id:
+                    out[str(key)] = raw_id
+                    break
+    return out
+
+
+def _resolve_episode_id(ep: str, ep_dir: Path, dataset: str,
+                        overrides: dict[str, str],
+                        path_to_id: dict[str, str],
+                        intrinsics: dict[str, Any]) -> tuple[str | None, str]:
+    for key in (f"{dataset}/{ep}", ep, str(ep_dir)):
+        if key in overrides:
+            return overrides[key], "episode_id_json"
+
+    # If the local folder is already named by the raw DROID key, use it.
+    if ep in intrinsics:
+        return ep, "episode_dir_name"
+
+    for name in ("episode_id.txt", "droid_episode_id.txt", "raw_episode_id.txt"):
+        path = ep_dir / name
+        if path.exists():
+            raw_id = path.read_text().strip().splitlines()[0]
+            if raw_id:
+                return raw_id, name
+
+    meta = _load_episode_metadata(ep_dir)
+    if meta is not None:
+        episode_id = _episode_id_from_metadata(meta, path_to_id)
+        if episode_id is not None:
+            return episode_id, "episode_metadata.json"
+
+    return None, "no episode id mapping"
+
+
 def _camera_aliases(camera: str) -> tuple[str, ...]:
     if camera == "exterior_image_1_left":
         return (
             "exterior_image_1_left", "exterior_image_1", "exterior_1",
-            "external_camera_1", "external_1", "camera_1", "cam1", "zed1",
+            "exterior1", "external_camera_1", "external_1", "ext_camera_1",
+            "ext1", "camera_1", "cam1", "zed1",
         )
     if camera == "exterior_image_2_left":
         return (
             "exterior_image_2_left", "exterior_image_2", "exterior_2",
-            "external_camera_2", "external_2", "camera_2", "cam2", "zed2",
+            "exterior2", "external_camera_2", "external_2", "ext_camera_2",
+            "ext2", "camera_2", "cam2", "zed2",
         )
     if camera == "wrist_image_left":
-        return ("wrist_image_left", "wrist", "wrist_camera", "camera_wrist")
+        return ("wrist_image_left", "wrist_image", "wrist", "wrist_camera", "camera_wrist")
     return (camera,)
 
 
@@ -175,10 +236,42 @@ def _choose_source_resolution(fx: float, cx: float, fy: float, cy: float,
     return best[0], best[1], "auto_known_16x9"
 
 
-def _scale_intrinsics(raw: list[float], target_w: int, target_h: int,
+def _extract_camera_matrix(record: Any) -> tuple[list[float], int | None, int | None]:
+    if isinstance(record, dict):
+        mat = (
+            record.get("cameraMatrix")
+            or record.get("camera_matrix")
+            or record.get("K")
+            or record.get("intrinsics")
+        )
+        raw_w = record.get("width")
+        raw_h = record.get("height")
+    else:
+        mat = record
+        raw_w = None
+        raw_h = None
+
+    if not isinstance(mat, list):
+        raise ValueError(f"cameraMatrix must be a list, got {type(mat).__name__}")
+    if len(mat) == 4:
+        vals = [float(x) for x in mat]
+    elif len(mat) == 9:
+        # 3x3 row-major K fallback.
+        vals = [float(mat[0]), float(mat[2]), float(mat[4]), float(mat[5])]
+    elif len(mat) == 3 and all(isinstance(row, list) and len(row) == 3 for row in mat):
+        vals = [float(mat[0][0]), float(mat[0][2]), float(mat[1][1]), float(mat[1][2])]
+    else:
+        raise ValueError(f"unsupported cameraMatrix shape: {mat}")
+    return vals, int(raw_w) if raw_w else None, int(raw_h) if raw_h else None
+
+
+def _scale_intrinsics(record: Any, target_w: int, target_h: int,
                       raw_w: int | None, raw_h: int | None) -> dict:
-    # KarlP/droid README specifies [fx, cx, fy, cy].
-    fx, cx, fy, cy = [float(x) for x in raw]
+    # KarlP/droid stores [fx, cx, fy, cy] under cameraMatrix.
+    raw, rec_w, rec_h = _extract_camera_matrix(record)
+    fx, cx, fy, cy = raw
+    raw_w = raw_w or rec_w
+    raw_h = raw_h or rec_h
     src_w, src_h, mode = _choose_source_resolution(fx, cx, fy, cy, target_w,
                                                    target_h, raw_w, raw_h)
     sx = target_w / float(src_w)
@@ -219,6 +312,8 @@ def main() -> None:
     parser.add_argument("--raw_width", type=int, default=None)
     parser.add_argument("--raw_height", type=int, default=None)
     parser.add_argument("--episodes", nargs="+", default=None)
+    parser.add_argument("--episode_id_json", type=Path, default=None,
+                        help="Optional JSON mapping local episode names to raw DROID episode IDs.")
     args = parser.parse_args()
 
     paths = {name: _ensure_file(args.cache_dir, name) for name in FILES}
@@ -226,23 +321,24 @@ def main() -> None:
     episode_id_to_path = _load_json(paths["episode_id_to_path.json"])
     path_to_id = {v: k for k, v in episode_id_to_path.items()}
     camera_serials = _load_json(paths["camera_serials.json"])
+    episode_id_overrides = _load_episode_id_overrides(args.episode_id_json,
+                                                      args.dataset)
 
     ds_root = args.oxe_root / args.dataset
     episodes = args.episodes or sorted(
-        p.name for p in ds_root.iterdir() if p.is_dir() and p.name.startswith("episode_")
+        p.name for p in ds_root.iterdir()
+        if p.is_dir() and not p.name.startswith(".") and not p.name.startswith("_")
     )
 
     out = {args.dataset: {}}
     missing = []
     for ep in episodes:
         ep_dir = ds_root / ep
-        meta = _load_episode_metadata(ep_dir)
-        if meta is None:
-            missing.append((ep, "missing episode_metadata.json"))
-            continue
-        episode_id = _episode_id_from_metadata(meta, path_to_id)
+        episode_id, id_source = _resolve_episode_id(ep, ep_dir, args.dataset,
+                                                    episode_id_overrides,
+                                                    path_to_id, intrinsics)
         if episode_id is None:
-            missing.append((ep, "could not map metadata to KarlP episode_id"))
+            missing.append((ep, id_source))
             continue
         intr_entry = intrinsics.get(episode_id)
         if not isinstance(intr_entry, dict):
@@ -254,14 +350,18 @@ def main() -> None:
             missing.append((ep, f"no serial for {args.camera}; episode_id={episode_id}"))
             continue
         W, H = _read_image_size(ep_dir)
-        K = _scale_intrinsics(intr_entry[serial], W, H, args.raw_width, args.raw_height)
+        try:
+            K = _scale_intrinsics(intr_entry[serial], W, H, args.raw_width, args.raw_height)
+        except ValueError as exc:
+            missing.append((ep, f"bad intrinsics for episode_id={episode_id} serial={serial}: {exc}"))
+            continue
         K["source"] = (
             f"KarlP/droid intrinsics.json episode_id={episode_id} "
             f"camera={args.camera} serial={serial}"
         )
         out[args.dataset][ep] = K
         print(
-            f"[{ep}] id={episode_id} serial={serial} "
+            f"[{ep}] id={episode_id} ({id_source}) serial={serial} "
             f"raw={K['raw_width']}x{K['raw_height']} -> {W}x{H} "
             f"fx={K['fx']:.2f} fy={K['fy']:.2f} cx={K['cx']:.2f} cy={K['cy']:.2f}"
         )
@@ -273,6 +373,11 @@ def main() -> None:
         print("\nMissing:")
         for ep, reason in missing:
             print(f"  {ep}: {reason}")
+        print(
+            "\nIf your local folders are named episode_0000, provide "
+            "--episode_id_json mapping those names to raw DROID keys such as "
+            "AUTOLab+5d05c5aa+2023-07-07-10h-29m-59s."
+        )
 
 
 if __name__ == "__main__":

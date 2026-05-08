@@ -559,6 +559,9 @@ def main() -> None:
     for ep in episodes:
         result = process_episode(args, ep, masker)
         results.append(result)
+        if result.get("status", "").startswith("skip"):
+            print(f"\n[{args.dataset}/{ep}] {result['status']} {result.get('pnp_path', '')}")
+            continue
         print(
             f"\n[{args.dataset}/{ep}] {result['status']} "
             f"T={result['T_source']} frames={result.get('frames_from_pnp')}"

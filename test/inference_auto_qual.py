@@ -32,6 +32,8 @@ try:
 except ImportError:
     guided_refine_mask = None
 
+_guided_filter_warning_shown = False
+
 
 CATEGORY2ID = {"arm": "000", "gripper": "001", "robot": "002"}
 # BGR colors per category
@@ -84,6 +86,30 @@ def _save_combined(path, image_bgr, masks_by_cat, ee_centroid, alpha=0.5):
         cv2.putText(viz, "EE", (cx + 10, cy - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
     cv2.imwrite(path, viz)
+
+
+def _apply_guided_refine(mask, image_bgr):
+    """Apply author guided refinement when OpenCV exposes ximgproc.guidedFilter."""
+    global _guided_filter_warning_shown
+    if guided_refine_mask is None:
+        raise RuntimeError(
+            "--guided_filter requested, but test/utils.py guided_refine_mask "
+            "could not be imported"
+        )
+    try:
+        return guided_refine_mask(mask, image_bgr)
+    except AttributeError as e:
+        if "guidedFilter" not in str(e):
+            raise
+        if not _guided_filter_warning_shown:
+            print(
+                "[warn] cv2.ximgproc.guidedFilter is unavailable; "
+                "saving raw masks for --guided_filter frames. Install an "
+                "OpenCV contrib build to reproduce author guided refinement.",
+                flush=True,
+            )
+            _guided_filter_warning_shown = True
+        return mask
 
 
 def _entry_centroid(entry):
@@ -360,15 +386,10 @@ def process_sequences(args, gpu_id, seq_list):
                     prob = probs[k]
                     img = None
                     if args.guided_filter and idx != 0:
-                        if guided_refine_mask is None:
-                            raise RuntimeError(
-                                "--guided_filter requested, but test/utils.py "
-                                "guided_refine_mask could not be imported"
-                            )
                         img_path = os.path.join(orig_seq_path, frame_files[idx])
                         img = cv2.imread(img_path)
                         if img is not None:
-                            mask = guided_refine_mask(mask, img)
+                            mask = _apply_guided_refine(mask, img)
                     cat_masks[stem] = mask
                     cat_probs[stem] = prob
                     save_pool.submit(_save_png, os.path.join(out_dir, f"{stem}.png"), mask)
@@ -591,6 +612,8 @@ def main():
         procs.append(proc)
     for proc in procs:
         proc.join()
+        if proc.exitcode != 0:
+            raise SystemExit(f"Worker process {proc.pid} failed with exit code {proc.exitcode}")
 
 
 if __name__ == "__main__":

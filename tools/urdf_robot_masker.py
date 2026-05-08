@@ -343,6 +343,18 @@ class _YourdfpyURDF:
             return np.zeros((0, 3), dtype=np.float64), np.zeros((0, 3), dtype=np.int32)
         return vertices, faces
 
+    def link_transforms(self, cfg: dict[str, float]) -> dict[str, np.ndarray]:
+        if cfg:
+            self.robot.update_cfg(cfg)
+        out: dict[str, np.ndarray] = {}
+        for link in self.robot.link_map:
+            try:
+                mat = self.robot.get_transform(link)
+            except Exception:
+                continue
+            out[link] = np.asarray(mat, dtype=np.float64)
+        return out
+
 
 class URDFRobotMasker:
     """Render a Franka + Robotiq URDF silhouette into a camera image."""

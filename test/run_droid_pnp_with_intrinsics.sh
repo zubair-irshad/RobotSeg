@@ -17,9 +17,11 @@ OXE_ROOT="${OXE_ROOT:-$HOME/RobotSeg/data/oxe_subset}"
 MASK_ROOT="${MASK_ROOT:-$HOME/RobotSeg/data/oxe_subset_seg_compare/current_pipeline}"
 DATASET="${DATASET:-droid}"
 CAMERA="${CAMERA:-exterior_image_1_left}"
+PNP_POINT_SOURCE="${PNP_POINT_SOURCE:-all_finger_midpoint}"
 K_JSON="${K_JSON:-$HOME/RobotSeg/data/droid_hf_intrinsics_scaled.json}"
 CACHE_DIR="${CACHE_DIR:-$HOME/RobotSeg/data/droid_hf_calib}"
-RUN_URDF_VIZ="${RUN_URDF_VIZ:-1}"
+RUN_URDF_VIZ="${RUN_URDF_VIZ:-0}"
+RUN_PNP_AUDIT="${RUN_PNP_AUDIT:-1}"
 URDF_PATH="${URDF_PATH:-$REPO_ROOT/data/urdfs/python-example-droid-dataset/franka_description/panda.urdf}"
 URDF_IMAGE_SOURCE="${URDF_IMAGE_SOURCE:-combined}"
 URDF_MAX_FRAMES="${URDF_MAX_FRAMES:-32}"
@@ -35,15 +37,30 @@ echo "==> build DROID intrinsics: camera=$CAMERA"
   --out_json "$K_JSON"
 
 echo
-echo "==> pnp with DROID intrinsics only"
+echo "==> pnp with DROID intrinsics only: point_source=$PNP_POINT_SOURCE"
 "$PYTHON" "$REPO_ROOT/tools/pnp_oxe.py" \
   --oxe_root "$OXE_ROOT" \
   --mask_root "$MASK_ROOT" \
   --datasets "$DATASET" \
   --K_json "$K_JSON" \
+  --pnp_point_source "$PNP_POINT_SOURCE" \
+  --urdf_path "$URDF_PATH" \
+  --urdf_backend "$URDF_BACKEND" \
   --require_known_intrinsics \
   --print_intrinsics \
   --viz
+
+if [[ "$RUN_PNP_AUDIT" == "1" ]]; then
+  echo
+  echo "==> exact PnP audit panels"
+  "$PYTHON" "$REPO_ROOT/tools/viz_pnp_audit_panel.py" \
+    --oxe_root "$OXE_ROOT" \
+    --mask_root "$MASK_ROOT" \
+    --dataset "$DATASET" \
+    --urdf_path "$URDF_PATH" \
+    --urdf_backend "$URDF_BACKEND" \
+    --skip_bad_pnp
+fi
 
 if [[ "$RUN_URDF_VIZ" == "1" ]]; then
   echo

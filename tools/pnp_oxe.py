@@ -1146,7 +1146,9 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
         "T_base2cam": pnp["T_base2cam"],
         "rvec": pnp["rvec"],
         "tvec": pnp["tvec"],
+        "kept_stems": kept_stems,
         "inlier_stems": [kept_stems[i] for i in pnp["inlier_idx"]],
+        "rejected_stems": [{"stem": s, "reason": r} for s, r in rejected],
     })
     if "tool_offset" in pnp:
         result["tool_offset"] = pnp["tool_offset"]

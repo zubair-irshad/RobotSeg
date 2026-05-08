@@ -20,6 +20,8 @@ from viz_cam2base_urdf import DEFAULT_URDF  # noqa: E402
 
 
 def _load_pnp(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
     return json.loads(path.read_text())
 
 
@@ -312,6 +314,18 @@ def process_episode(args: argparse.Namespace, ep_name: str,
     ep_oxe = args.oxe_root / args.dataset / ep_name
     ep_seg = args.mask_root / args.dataset / ep_name
     pnp = _load_pnp(ep_seg / args.pnp_json_name)
+    if not pnp:
+        return {
+            "episode": ep_name,
+            "status": "skip-missing-pnp",
+            "pnp_path": str(ep_seg / args.pnp_json_name),
+        }
+    if "K" not in pnp:
+        return {
+            "episode": ep_name,
+            "status": f"skip-pnp-{pnp.get('status', 'missing-K')}",
+            "pnp_path": str(ep_seg / args.pnp_json_name),
+        }
     K = pnp["K"]
     T_cam2base, T_source = _load_T_cam2base(args.dataset, ep_name, args, pnp)
     centroids = json.loads((ep_seg / "001" / "centroids.json").read_text())

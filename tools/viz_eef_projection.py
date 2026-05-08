@@ -327,7 +327,14 @@ def process_episode(args: argparse.Namespace, ep_name: str,
             "pnp_path": str(ep_seg / args.pnp_json_name),
         }
     K = pnp["K"]
-    T_cam2base, T_source = _load_T_cam2base(args.dataset, ep_name, args, pnp)
+    try:
+        T_cam2base, T_source = _load_T_cam2base(args.dataset, ep_name, args, pnp)
+    except KeyError as exc:
+        return {
+            "episode": ep_name,
+            "status": "skip-missing-extrinsics",
+            "reason": str(exc),
+        }
     centroids = json.loads((ep_seg / "001" / "centroids.json").read_text())
     frames = _image_paths(ep_oxe, ep_seg, args.image_source)
     frames = _filter_paths_from_pnp(frames, pnp, args.frames_from_pnp)
@@ -560,7 +567,8 @@ def main() -> None:
         result = process_episode(args, ep, masker)
         results.append(result)
         if result.get("status", "").startswith("skip"):
-            print(f"\n[{args.dataset}/{ep}] {result['status']} {result.get('pnp_path', '')}")
+            detail = result.get("pnp_path") or result.get("reason") or ""
+            print(f"\n[{args.dataset}/{ep}] {result['status']} {detail}")
             continue
         print(
             f"\n[{args.dataset}/{ep}] {result['status']} "

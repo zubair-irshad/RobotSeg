@@ -187,6 +187,9 @@ def _aggregate(rows: list[dict[str, float]]) -> dict[str, float]:
             continue
         out[f"{key}_mean"] = float(vals.mean())
         out[f"{key}_median"] = float(np.median(vals))
+    out["empty_render_frames"] = float(
+        sum(1 for r in rows if float(r.get("render_area", 0.0)) <= 0.0)
+    )
     return out
 
 
@@ -291,7 +294,13 @@ def process_episode(args: argparse.Namespace, masker: URDFRobotMasker,
         rows.append(rec)
 
     agg = _aggregate(rows)
-    status = "ok" if rows else "bad-no-scored-frames"
+    empty_render_frames = int(agg.get("empty_render_frames", 0))
+    if not rows:
+        status = "bad-no-scored-frames"
+    elif empty_render_frames == len(rows):
+        status = "bad-empty-render"
+    else:
+        status = "ok"
     return {
         "episode": ep_name,
         "status": status,
@@ -388,6 +397,7 @@ def main() -> None:
                 f"iou_med={metrics.get('iou_median', 0.0):.3f} "
                 f"coverage_med={metrics.get('target_coverage_median', 0.0):.3f} "
                 f"t2r_med={metrics.get('target_to_render_px_median', 0.0):.2f}px "
+                f"render_area_med={metrics.get('render_area_median', 0.0):.0f} "
                 f"n={int(metrics.get('n', 0))}"
             )
         else:
@@ -397,6 +407,12 @@ def main() -> None:
                     f" candidates={result.get('num_candidate_stems', 0)} "
                     f"sampled={result.get('num_stems_after_sampling', 0)} "
                     f"skips={result.get('skip_counts', {})}"
+                )
+            elif result.get("status") == "bad-empty-render":
+                metrics = result.get("metrics", {})
+                extra = (
+                    f" n={int(metrics.get('n', 0))} "
+                    f"render_area_med={metrics.get('render_area_median', 0.0):.0f}"
                 )
             print(f"[{args.dataset}/{ep}] {result.get('status')}{extra}")
 

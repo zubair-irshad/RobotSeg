@@ -9,6 +9,7 @@
 # Usage:
 #   bash run_droid_seg_quality_compare.sh
 #   IMAGE_ROOT=... SAVE_ROOT_BASE=... bash run_droid_seg_quality_compare.sh
+#   MAX_FRAMES_PER_SEQ=32 bash run_droid_seg_quality_compare.sh
 #   GPU_ONLY=0 bash run_droid_seg_quality_compare.sh   # allow CPU offload fallback
 
 set -euo pipefail
@@ -21,6 +22,8 @@ SAVE_ROOT_BASE="${SAVE_ROOT_BASE:-$HOME/RobotSeg/data/oxe_subset_seg_compare}"
 CATEGORIES="${CATEGORIES:-arm,gripper}"
 DATASET="${DATASET:-droid}"
 GPU_ONLY="${GPU_ONLY:-1}"
+FRAME_STRIDE="${FRAME_STRIDE:-1}"
+MAX_FRAMES_PER_SEQ="${MAX_FRAMES_PER_SEQ:-32}"
 
 src="$IMAGE_ROOT/$DATASET"
 [[ -d "$src" ]] || { echo "Missing DROID image root: $src" >&2; exit 1; }
@@ -31,6 +34,8 @@ echo "Input: $src"
 echo "Output base: $SAVE_ROOT_BASE"
 echo "Categories: $CATEGORIES"
 echo "GPU only: $GPU_ONLY"
+echo "Frame stride: $FRAME_STRIDE"
+echo "Max frames per episode: $MAX_FRAMES_PER_SEQ"
 if [[ "$GPU_ONLY" == "1" ]]; then
   echo "Note: GPU-only mode matches the author scripts but can OOM on long episodes unless the GPU is mostly free."
 fi
@@ -58,6 +63,8 @@ echo "==> native_raw: author API path, native RLDS frames, no guided filter, no 
   --categories "$CATEGORIES" \
   --save_overlay --save_prob \
   --infer_max_side 0 \
+  --frame_stride "$FRAME_STRIDE" \
+  --max_frames_per_seq "$MAX_FRAMES_PER_SEQ" \
   "${OFFLOAD_ARGS[@]}" \
   --no_subtract_arm_from_gripper \
   --overwrite
@@ -71,6 +78,8 @@ if [[ "$HAS_GUIDED_FILTER" == "1" ]]; then
     --save_overlay --save_prob \
     --guided_filter \
     --infer_max_side 0 \
+    --frame_stride "$FRAME_STRIDE" \
+    --max_frames_per_seq "$MAX_FRAMES_PER_SEQ" \
     "${OFFLOAD_ARGS[@]}" \
     --no_subtract_arm_from_gripper \
     --overwrite
@@ -85,6 +94,8 @@ echo "==> current_pipeline: native RLDS frames + current OXE defaults"
   --categories "$CATEGORIES" \
   --save_overlay --save_prob \
   --infer_max_side 0 \
+  --frame_stride "$FRAME_STRIDE" \
+  --max_frames_per_seq "$MAX_FRAMES_PER_SEQ" \
   "${OFFLOAD_ARGS[@]}" \
   --overwrite
 

@@ -179,6 +179,42 @@ def _mask_stats(mask_u8, prob_u8=None):
     }
 
 
+def _select_frame_files(frame_files, args):
+    """Return a deterministic subset while preserving original frame names."""
+    if args.frame_stride > 1:
+        frame_files = frame_files[::args.frame_stride]
+    if args.max_frames_per_seq > 0 and len(frame_files) > args.max_frames_per_seq:
+        idx = np.linspace(
+            0, len(frame_files) - 1, args.max_frames_per_seq, dtype=np.int64
+        )
+        frame_files = [frame_files[int(i)] for i in idx]
+    return frame_files
+
+
+def _maybe_make_subset_view(orig_seq_path, frame_files, all_frame_files, args):
+    """Create a frame-folder view when inference should only see a subset."""
+    if len(frame_files) == len(all_frame_files):
+        return orig_seq_path, False
+    view_dir = os.path.join(
+        args.save_root,
+        "_subset_views",
+        os.path.basename(orig_seq_path)
+        + f"__stride{args.frame_stride}__max{args.max_frames_per_seq}",
+    )
+    os.makedirs(view_dir, exist_ok=True)
+    for f in frame_files:
+        src = os.path.abspath(os.path.join(orig_seq_path, f))
+        dst = os.path.join(view_dir, f)
+        if os.path.lexists(dst):
+            continue
+        try:
+            os.symlink(src, dst)
+        except OSError:
+            import shutil
+            shutil.copy2(src, dst)
+    return view_dir, True
+
+
 def _maybe_make_lowres_view(orig_seq_path, frame_files, args):
     """If --infer_max_side is set and frames exceed it, write a resized
     copy of the frames to a side dir and return (low_res_path, scale).
@@ -286,9 +322,10 @@ def process_sequences(args, gpu_id, seq_list):
 
     for seq_name in tqdm(seq_list, desc=f"GPU {gpu_id}"):
         orig_seq_path = os.path.join(args.image_root, seq_name)
-        frame_files = natsorted([
+        all_frame_files = natsorted([
             f for f in os.listdir(orig_seq_path) if f.lower().endswith((".jpg", ".png"))
         ])
+        frame_files = _select_frame_files(all_frame_files, args)
         if not frame_files:
             continue
         frame_stems = [os.path.splitext(f)[0] for f in frame_files]
@@ -297,8 +334,11 @@ def process_sequences(args, gpu_id, seq_list):
         # frames into a temp dir, run the predictor on those, then upsample
         # masks back to the original size. Trades a bit of segmentation
         # quality for ~scale^2 GPU-memory savings.
+        input_seq_path, made_subset_view = _maybe_make_subset_view(
+            orig_seq_path, frame_files, all_frame_files, args
+        )
         seq_path, downscale = _maybe_make_lowres_view(
-            orig_seq_path, frame_files, args
+            input_seq_path, frame_files, args
         )
         # Read the original frame size once for upsampling masks back later.
         first_full = cv2.imread(os.path.join(orig_seq_path, frame_files[0]))
@@ -513,10 +553,13 @@ def process_sequences(args, gpu_id, seq_list):
                 )
 
         # Clean up the temporary low-res view (if any) for this episode.
-        if downscale != 1.0 and seq_path != orig_seq_path:
+        if (downscale != 1.0 and seq_path != input_seq_path) or made_subset_view:
             try:
                 import shutil
-                shutil.rmtree(seq_path, ignore_errors=True)
+                if downscale != 1.0 and seq_path != input_seq_path:
+                    shutil.rmtree(seq_path, ignore_errors=True)
+                if made_subset_view:
+                    shutil.rmtree(input_seq_path, ignore_errors=True)
             except Exception:
                 pass
 
@@ -550,6 +593,10 @@ def main():
                    help="If >0, downscale frames so the longest side <= N before "
                         "running the predictor. Masks are upsampled back to the "
                         "original resolution. Try 256 or 384 if you OOM.")
+    p.add_argument("--frame_stride", type=int, default=1,
+                   help="Keep one of every N frames per sequence before inference.")
+    p.add_argument("--max_frames_per_seq", type=int, default=0,
+                   help="If >0, uniformly sample at most this many frames per sequence.")
     p.add_argument("--subtract_arm_from_gripper", action="store_true", default=True,
                    help="Set gripper_mask = gripper_mask AND NOT arm_mask before "
                         "computing centroids. Arm prediction is more reliable, so "

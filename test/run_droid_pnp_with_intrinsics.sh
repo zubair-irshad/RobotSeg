@@ -19,6 +19,12 @@ DATASET="${DATASET:-droid}"
 CAMERA="${CAMERA:-exterior_image_1_left}"
 K_JSON="${K_JSON:-$HOME/RobotSeg/data/droid_hf_intrinsics_scaled.json}"
 CACHE_DIR="${CACHE_DIR:-$HOME/RobotSeg/data/droid_hf_calib}"
+RUN_URDF_VIZ="${RUN_URDF_VIZ:-1}"
+URDF_PATH="${URDF_PATH:-$REPO_ROOT/data/urdfs/python-example-droid-dataset/franka_description/panda.urdf}"
+URDF_IMAGE_SOURCE="${URDF_IMAGE_SOURCE:-combined}"
+URDF_MAX_FRAMES="${URDF_MAX_FRAMES:-32}"
+URDF_FRAME_STRIDE="${URDF_FRAME_STRIDE:-1}"
+URDF_BACKEND="${URDF_BACKEND:-simple}"
 
 echo "==> build DROID intrinsics: camera=$CAMERA"
 "$PYTHON" "$REPO_ROOT/tools/droid_hf_intrinsics.py" \
@@ -38,3 +44,20 @@ echo "==> pnp with DROID intrinsics only"
   --require_known_intrinsics \
   --print_intrinsics \
   --viz
+
+if [[ "$RUN_URDF_VIZ" == "1" ]]; then
+  echo
+  echo "==> URDF overlay visualization"
+  "$PYTHON" "$REPO_ROOT/tools/viz_cam2base_urdf.py" \
+    --oxe_root "$OXE_ROOT" \
+    --mask_root "$MASK_ROOT" \
+    --dataset "$DATASET" \
+    --urdf_path "$URDF_PATH" \
+    --urdf_backend "$URDF_BACKEND" \
+    --image_source "$URDF_IMAGE_SOURCE" \
+    --allow_partial_trajectory \
+    --frame_stride "$URDF_FRAME_STRIDE" \
+    --max_frames "$URDF_MAX_FRAMES" \
+    --skip_bad_pnp \
+    --draw_status
+fi

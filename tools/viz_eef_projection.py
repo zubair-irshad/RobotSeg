@@ -152,6 +152,17 @@ def _image_paths(ep_oxe: Path, ep_seg: Path, source: str) -> list[Path]:
     raise FileNotFoundError(f"no images found; checked {roots}")
 
 
+def _filter_paths_from_pnp(paths: list[Path], pnp: dict[str, Any],
+                           mode: str) -> list[Path]:
+    if mode == "all":
+        return paths
+    stems = pnp.get("kept_stems") if mode == "kept" else pnp.get("inlier_stems")
+    if not stems:
+        return []
+    allowed = {str(s) for s in stems}
+    return [p for p in paths if p.stem in allowed]
+
+
 def _stats(errors: list[float]) -> dict[str, float]:
     arr = np.asarray(errors, dtype=np.float64)
     arr = arr[np.isfinite(arr)]
@@ -305,6 +316,7 @@ def process_episode(args: argparse.Namespace, ep_name: str,
     T_cam2base, T_source = _load_T_cam2base(args.dataset, ep_name, args, pnp)
     centroids = json.loads((ep_seg / "001" / "centroids.json").read_text())
     frames = _image_paths(ep_oxe, ep_seg, args.image_source)
+    frames = _filter_paths_from_pnp(frames, pnp, args.frames_from_pnp)
 
     with np.load(ep_oxe / "trajectory.npz", allow_pickle=True) as traj:
         joints = _load_joints(traj)
@@ -430,13 +442,30 @@ def process_episode(args: argparse.Namespace, ep_name: str,
         saved += 1
 
     stats = {name: _stats(errs) for name, errs in candidates.items()}
+    ranking = sorted(
+        (
+            {
+                "candidate": name,
+                "median_px": stat.get("median_px", float("inf")),
+                "mean_px": stat.get("mean_px", float("inf")),
+                "p90_px": stat.get("p90_px", float("inf")),
+                "n": stat.get("n", 0),
+            }
+            for name, stat in stats.items()
+            if stat.get("n", 0) > 0
+        ),
+        key=lambda r: (r["median_px"], r["p90_px"]),
+    )
     return {
         "episode": ep_name,
         "status": "ok" if saved else "bad-no-viz",
         "T_source": T_source,
         "K_source": K.get("source", "unknown"),
+        "frames_from_pnp": args.frames_from_pnp,
         "saved": saved,
         "stats": stats,
+        "candidate_ranking": ranking,
+        "best_candidate": ranking[0]["candidate"] if ranking else None,
         "out_dir": str(out_dir),
     }
 
@@ -455,6 +484,13 @@ def main() -> None:
     parser.add_argument("--urdf_backend", choices=["simple", "yourdfpy", "auto"], default="simple")
     parser.add_argument("--image_source", choices=["auto", "raw", "combined"], default="auto")
     parser.add_argument("--out_dir_name", default="eef_projection_viz")
+    parser.add_argument(
+        "--frames_from_pnp",
+        choices=["all", "kept", "inliers"],
+        default="all",
+        help="Restrict visualization/scoring to all frames, PnP-filter-kept frames, "
+             "or final RANSAC inlier frames from pnp.json.",
+    )
     parser.add_argument("--frame_stride", type=int, default=10)
     parser.add_argument("--max_frames", type=int, default=40)
     parser.add_argument("--marker_size", type=int, default=13)
@@ -509,7 +545,10 @@ def main() -> None:
     for ep in episodes:
         result = process_episode(args, ep, masker)
         results.append(result)
-        print(f"\n[{args.dataset}/{ep}] {result['status']} T={result['T_source']}")
+        print(
+            f"\n[{args.dataset}/{ep}] {result['status']} "
+            f"T={result['T_source']} frames={result.get('frames_from_pnp')}"
+        )
         for name, stat in result.get("stats", {}).items():
             print(
                 f"  {name:22s} n={stat.get('n', 0):4d} "
@@ -517,6 +556,8 @@ def main() -> None:
                 f"mean={stat.get('mean_px', float('nan')):7.2f}px "
                 f"p90={stat.get('p90_px', float('nan')):7.2f}px"
             )
+        if result.get("best_candidate"):
+            print(f"  best={result['best_candidate']}")
         print(f"  out={result.get('out_dir')}")
 
     out_path = ds_seg / f"eef_projection_stats_{Path(args.pnp_json_name).stem}.json"

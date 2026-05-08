@@ -1,0 +1,306 @@
+"""Score rendered URDF silhouettes against RobotSeg body/gripper masks.
+
+This is a diagnostic for camera extrinsics: it renders the robot URDF using
+the per-episode PnP K/T and trajectory joint positions, then compares the
+rendered mask to segmentation masks such as 000=arm and 001=gripper.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+import cv2
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from urdf_robot_masker import URDFRobotMasker  # noqa: E402
+from viz_cam2base_urdf import DEFAULT_URDF  # noqa: E402
+
+
+def _load_json(path: Path) -> dict[str, Any] | None:
+    try:
+        with path.open() as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _load_joint_array(traj: np.lib.npyio.NpzFile, key: str | None) -> np.ndarray:
+    candidates = []
+    if key:
+        candidates.append(key)
+    candidates += ["joint_position", "joint_positions", "joints", "q", "arm_joints"]
+    for name in candidates:
+        if name in traj.files:
+            arr = np.asarray(traj[name], dtype=np.float64)
+            if arr.ndim == 2 and arr.shape[1] >= 7:
+                return arr[:, :7]
+    raise ValueError("trajectory.npz does not contain a usable 7-DoF joint array")
+
+
+def _load_gripper_array(traj: np.lib.npyio.NpzFile, n: int, key: str | None) -> np.ndarray:
+    candidates = []
+    if key:
+        candidates.append(key)
+    candidates += ["gripper", "gripper_position", "finger_joint"]
+    for name in candidates:
+        if name in traj.files:
+            arr = np.asarray(traj[name], dtype=np.float64).reshape(-1)
+            if len(arr) >= n:
+                return arr[:n]
+    return np.zeros(n, dtype=np.float64)
+
+
+def _mask_path(root: Path, stem: str) -> Path | None:
+    for ext in (".png", ".jpg", ".jpeg"):
+        path = root / f"{stem}{ext}"
+        if path.exists():
+            return path
+    return None
+
+
+def _read_mask(path: Path, shape_hw: tuple[int, int]) -> np.ndarray | None:
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return None
+    if img.ndim == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    mask = img > 0
+    if mask.shape[:2] != shape_hw:
+        mask = cv2.resize(
+            mask.astype(np.uint8),
+            (shape_hw[1], shape_hw[0]),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
+    return mask
+
+
+def _load_target_mask(ep_seg: Path, stem: str, mask_dirs: list[str],
+                      shape_hw: tuple[int, int]) -> np.ndarray | None:
+    out = np.zeros(shape_hw, dtype=bool)
+    found = False
+    for name in mask_dirs:
+        path = _mask_path(ep_seg / name, stem)
+        if path is None:
+            continue
+        mask = _read_mask(path, shape_hw)
+        if mask is None:
+            continue
+        out |= mask
+        found = True
+    return out if found else None
+
+
+def _available_stems(ep_seg: Path, mask_dirs: list[str]) -> list[str]:
+    stems = set()
+    for name in mask_dirs:
+        root = ep_seg / name
+        if not root.exists():
+            continue
+        for p in root.iterdir():
+            if p.suffix.lower() in {".png", ".jpg", ".jpeg"}:
+                stems.add(p.stem)
+    return sorted(stems)
+
+
+def _mask_metrics(target: np.ndarray, render: np.ndarray,
+                  distance_clip: float) -> dict[str, float]:
+    inter = np.logical_and(target, render).sum()
+    union = np.logical_or(target, render).sum()
+    target_area = int(target.sum())
+    render_area = int(render.sum())
+    if target_area == 0 or render_area == 0:
+        return {
+            "iou": 0.0,
+            "target_coverage": 0.0,
+            "render_precision": 0.0,
+            "target_to_render_px": float("inf"),
+            "render_to_target_px": float("inf"),
+            "target_area": float(target_area),
+            "render_area": float(render_area),
+        }
+
+    inv_render = (~render).astype(np.uint8)
+    inv_target = (~target).astype(np.uint8)
+    dt_render = cv2.distanceTransform(inv_render, cv2.DIST_L2, 3)
+    dt_target = cv2.distanceTransform(inv_target, cv2.DIST_L2, 3)
+    t2r = np.minimum(dt_render[target], distance_clip).mean()
+    # Visible segmentation is often a subset of the unoccluded URDF render.
+    # Trim render->target distances so scene occluders do not dominate.
+    r2t_vals = np.minimum(dt_target[render], distance_clip)
+    keep = max(1, int(0.75 * len(r2t_vals)))
+    r2t = np.partition(r2t_vals, keep - 1)[:keep].mean()
+    return {
+        "iou": float(inter / max(1, union)),
+        "target_coverage": float(inter / max(1, target_area)),
+        "render_precision": float(inter / max(1, render_area)),
+        "target_to_render_px": float(t2r),
+        "render_to_target_px_trim75": float(r2t),
+        "target_area": float(target_area),
+        "render_area": float(render_area),
+    }
+
+
+def _aggregate(rows: list[dict[str, float]]) -> dict[str, float]:
+    out: dict[str, float] = {"n": float(len(rows))}
+    if not rows:
+        return out
+    keys = [
+        "iou",
+        "target_coverage",
+        "render_precision",
+        "target_to_render_px",
+        "render_to_target_px_trim75",
+        "target_area",
+        "render_area",
+    ]
+    for key in keys:
+        vals = np.asarray([r[key] for r in rows if np.isfinite(r[key])], dtype=np.float64)
+        if len(vals) == 0:
+            continue
+        out[f"{key}_mean"] = float(vals.mean())
+        out[f"{key}_median"] = float(np.median(vals))
+    return out
+
+
+def process_episode(args: argparse.Namespace, masker: URDFRobotMasker,
+                    ep_name: str) -> dict[str, Any]:
+    ep_oxe = args.oxe_root / args.dataset / ep_name
+    ep_seg = args.mask_root / args.dataset / ep_name
+    pnp = _load_json(ep_seg / args.pnp_json_name)
+    if pnp is None or "T_cam2base" not in pnp:
+        return {"episode": ep_name, "status": "skip-no-pnp"}
+    traj_path = ep_oxe / "trajectory.npz"
+    if not traj_path.exists():
+        return {"episode": ep_name, "status": "skip-no-trajectory"}
+
+    traj = np.load(traj_path)
+    joints = _load_joint_array(traj, args.joint_key)
+    gripper = _load_gripper_array(traj, len(joints), args.gripper_key)
+    K = pnp["K"]
+    T_cam2base = np.asarray(pnp["T_cam2base"], dtype=np.float64)
+    H = int(K.get("height", pnp.get("image_size", [0, 0])[1]))
+    W = int(K.get("width", pnp.get("image_size", [0, 0])[0]))
+    if H <= 0 or W <= 0:
+        return {"episode": ep_name, "status": "skip-bad-image-size"}
+
+    mask_dirs = args.mask_dirs
+    if args.auto_robot_mask and (ep_seg / "002").exists():
+        mask_dirs = ["002"]
+    stems = _available_stems(ep_seg, mask_dirs)
+    if args.frame_stride > 1:
+        stems = stems[::args.frame_stride]
+    if args.max_frames > 0:
+        stems = stems[:args.max_frames]
+
+    rows = []
+    for stem in stems:
+        try:
+            idx = int(stem)
+        except ValueError:
+            continue
+        if idx >= len(joints):
+            continue
+        target = _load_target_mask(ep_seg, stem, mask_dirs, (H, W))
+        if target is None:
+            continue
+        area_frac = float(target.sum()) / float(H * W)
+        if area_frac < args.min_target_area or area_frac > args.max_target_area:
+            continue
+        render = masker.render(
+            K,
+            T_cam2base,
+            joints[idx],
+            gripper_position=float(gripper[idx]),
+            image_hw=(H, W),
+        )
+        rec = _mask_metrics(target, render, args.distance_clip)
+        rec["stem"] = stem
+        rec["area_frac"] = area_frac
+        rows.append(rec)
+
+    agg = _aggregate(rows)
+    status = "ok" if rows else "bad-no-scored-frames"
+    return {
+        "episode": ep_name,
+        "status": status,
+        "pnp_status": pnp.get("status"),
+        "K_source": K.get("source", "unknown") if isinstance(K, dict) else "unknown",
+        "pnp_rmse_px": pnp.get("rmse_px"),
+        "pnp_inliers": pnp.get("num_inliers"),
+        "mask_dirs": mask_dirs,
+        "metrics": agg,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--oxe_root", type=Path, default=Path("data/oxe_subset"))
+    parser.add_argument("--mask_root", type=Path, default=Path("data/oxe_subset_seg"))
+    parser.add_argument("--dataset", default="droid")
+    parser.add_argument("--episodes", nargs="+", default=None)
+    parser.add_argument("--pnp_json_name", default="pnp.json")
+    parser.add_argument("--urdf_path", type=Path, default=DEFAULT_URDF)
+    parser.add_argument("--mesh_dir", type=Path, default=None)
+    parser.add_argument("--mask_dirs", nargs="+", default=["000", "001"],
+                        help="Segmentation folders to union. Defaults to arm+gripper.")
+    parser.add_argument("--auto_robot_mask", action="store_true",
+                        help="Use folder 002 if present, otherwise --mask_dirs.")
+    parser.add_argument("--joint_key", default=None)
+    parser.add_argument("--gripper_key", default=None)
+    parser.add_argument("--frame_stride", type=int, default=4)
+    parser.add_argument("--max_frames", type=int, default=80)
+    parser.add_argument("--downsample", type=int, default=2)
+    parser.add_argument("--dilate_px", type=int, default=2)
+    parser.add_argument("--distance_clip", type=float, default=30.0)
+    parser.add_argument("--min_target_area", type=float, default=0.002)
+    parser.add_argument("--max_target_area", type=float, default=0.60)
+    parser.add_argument("--out_json", type=Path, default=None)
+    args = parser.parse_args()
+
+    ds_seg = args.mask_root / args.dataset
+    episodes = args.episodes or sorted(
+        p.name for p in ds_seg.iterdir()
+        if p.is_dir() and p.name.startswith("episode_")
+    )
+
+    masker = URDFRobotMasker(
+        args.urdf_path,
+        mesh_dir=args.mesh_dir,
+        downsample=args.downsample,
+        dilate_px=args.dilate_px,
+        verbose=True,
+    )
+
+    results = []
+    for ep in episodes:
+        result = process_episode(args, masker, ep)
+        results.append(result)
+        metrics = result.get("metrics", {})
+        if result.get("status") == "ok":
+            print(
+                f"[{args.dataset}/{ep}] ok "
+                f"pnp_rmse={result.get('pnp_rmse_px')} "
+                f"iou_med={metrics.get('iou_median', 0.0):.3f} "
+                f"coverage_med={metrics.get('target_coverage_median', 0.0):.3f} "
+                f"t2r_med={metrics.get('target_to_render_px_median', 0.0):.2f}px "
+                f"n={int(metrics.get('n', 0))}"
+            )
+        else:
+            print(f"[{args.dataset}/{ep}] {result.get('status')}")
+
+    out_path = args.out_json
+    if out_path is None:
+        stem = Path(args.pnp_json_name).stem
+        out_path = ds_seg / f"urdf_silhouette_scores_{stem}.json"
+    out_path.write_text(json.dumps({"dataset": args.dataset, "results": results}, indent=2))
+    print(f"\nWrote {out_path}")
+
+
+if __name__ == "__main__":
+    main()

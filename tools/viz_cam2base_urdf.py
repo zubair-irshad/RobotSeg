@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -23,6 +24,7 @@ import numpy as np
 
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
+from cam2base_json import episode_lookup_keys, find_T_cam2base, load_json  # noqa: E402
 from urdf_robot_masker import URDFRobotMasker  # noqa: E402
 
 
@@ -37,6 +39,48 @@ DEFAULT_URDF = (
 
 def _load_json(path: Path) -> dict:
     return json.loads(path.read_text())
+
+
+def _serial_from_pnp(pnp: dict) -> str | None:
+    K = pnp.get("K", {})
+    source = K.get("source") if isinstance(K, dict) else None
+    if isinstance(source, str):
+        m = re.search(r"serial=([0-9]+)", source)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _episode_id_from_pnp(pnp: dict) -> str | None:
+    K = pnp.get("K", {})
+    source = K.get("source") if isinstance(K, dict) else None
+    if isinstance(source, str):
+        m = re.search(r"episode_id=([^ ]+)", source)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _load_T_cam2base(dataset: str, ep_name: str, args: argparse.Namespace,
+                     pnp: dict) -> tuple[np.ndarray, str]:
+    if args.extrinsics_json is None:
+        return np.asarray(pnp["T_cam2base"], dtype=np.float64), args.pnp_json_name
+    data = load_json(args.extrinsics_json)
+    keys = episode_lookup_keys(args.oxe_root, dataset, ep_name)
+    raw_id = _episode_id_from_pnp(pnp)
+    if raw_id and raw_id not in keys:
+        keys += [raw_id, f"{dataset}/{raw_id}"]
+    preferred = []
+    serial = args.camera_serial or _serial_from_pnp(pnp)
+    if serial:
+        preferred.append(serial)
+    T, source = find_T_cam2base(data, keys, preferred_fields=preferred)
+    if T is None:
+        raise KeyError(
+            f"Could not find {dataset}/{ep_name} in {args.extrinsics_json}; "
+            f"tried keys={keys}"
+        )
+    return T, f"{args.extrinsics_json}:{source}"
 
 
 def _load_K(ep_seg: Path, pnp: dict, image_bgr: np.ndarray) -> dict[str, float]:
@@ -191,7 +235,10 @@ def process_episode(
     pnp = _load_json(pnp_path)
     if args.skip_bad_pnp and pnp.get("status") != "ok":
         return {"episode": ep_name, "status": f"skip-pnp-{pnp.get('status', 'unknown')}"}
-    T_cam2base = np.asarray(pnp["T_cam2base"], dtype=np.float64)
+    try:
+        T_cam2base, T_source = _load_T_cam2base(dataset, ep_name, args, pnp)
+    except Exception as exc:
+        return {"episode": ep_name, "status": f"skip-bad-extrinsics-json: {exc}"}
 
     with np.load(traj_path, allow_pickle=True) as traj:
         joints = _load_joint_array(traj, args.joint_key)
@@ -270,6 +317,7 @@ def process_episode(
         "episode": ep_name,
         "status": "ok" if rendered else "bad-no-rendered-frames",
         "pnp_status": pnp.get("status"),
+        "T_source": T_source,
         "K_source": K.get("source", "unknown"),
         "rmse_px": pnp.get("rmse_px"),
         "num_inliers": pnp.get("num_inliers"),
@@ -294,6 +342,17 @@ def main() -> None:
         "--pnp_json_name",
         default="pnp.json",
         help="Per-episode PnP JSON filename, e.g. pnp.json or pnp_rlds.json.",
+    )
+    parser.add_argument(
+        "--extrinsics_json",
+        type=Path,
+        default=None,
+        help="Optional JSON to override T_cam2base while keeping K from --pnp_json_name.",
+    )
+    parser.add_argument(
+        "--camera_serial",
+        default=None,
+        help="Optional camera serial key when --extrinsics_json stores per-serial extrinsics.",
     )
     parser.add_argument("--out_dir_name", default="urdf_viz")
     parser.add_argument("--image_source", choices=["auto", "raw", "combined"], default="auto")

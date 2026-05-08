@@ -167,13 +167,34 @@ def _stats(errors: list[float]) -> dict[str, float]:
 
 
 def _draw_point(img: np.ndarray, uv: np.ndarray, color: tuple[int, int, int],
-                label: str, marker: int) -> None:
+                label: str, marker: int, args: argparse.Namespace) -> None:
     if not np.all(np.isfinite(uv)):
         return
     x, y = int(round(float(uv[0]))), int(round(float(uv[1])))
-    cv2.drawMarker(img, (x, y), color, marker, 18, 2, cv2.LINE_AA)
-    cv2.putText(img, label, (x + 6, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                color, 1, cv2.LINE_AA)
+    cv2.drawMarker(
+        img, (x, y), color, marker, int(args.marker_size),
+        int(args.marker_thickness), cv2.LINE_AA,
+    )
+    if label:
+        cv2.putText(
+            img, label, (x + 5, y - 5), cv2.FONT_HERSHEY_SIMPLEX,
+            float(args.label_scale), color, 1, cv2.LINE_AA,
+        )
+
+
+def _draw_legend(img: np.ndarray, items: list[tuple[str, tuple[int, int, int]]],
+                 args: argparse.Namespace) -> None:
+    if not args.legend or not items:
+        return
+    x0, y0 = 8, 16
+    line_h = max(11, int(20 * float(args.label_scale)))
+    for i, (name, color) in enumerate(items):
+        y = y0 + i * line_h
+        cv2.circle(img, (x0, y - 4), 3, color, -1, cv2.LINE_AA)
+        cv2.putText(
+            img, name, (x0 + 9, y), cv2.FONT_HERSHEY_SIMPLEX,
+            float(args.label_scale), color, 1, cv2.LINE_AA,
+        )
 
 
 def process_episode(args: argparse.Namespace, ep_name: str,
@@ -221,16 +242,20 @@ def process_episode(args: argparse.Namespace, ep_name: str,
             for link in args.links:
                 if link in link_T:
                     points[link] = link_T[link][:3, 3]
+        if args.draw_candidates:
+            allowed = set(args.draw_candidates)
+            points = {k: v for k, v in points.items() if k in allowed}
 
         uvs = {name: _project(pt, T_cam2base, K)[0] for name, pt in points.items()}
         for name, uv in uvs.items():
             if np.all(np.isfinite(uv)):
                 candidates.setdefault(name, []).append(float(np.linalg.norm(uv - c)))
 
-        cv2.drawMarker(image, tuple(np.rint(c).astype(int)), (0, 255, 255),
-                       cv2.MARKER_CROSS, 24, 2, cv2.LINE_AA)
-        cv2.putText(image, "seg centroid", tuple(np.rint(c + [8, -8]).astype(int)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.drawMarker(
+            image, tuple(np.rint(c).astype(int)), (0, 255, 255),
+            cv2.MARKER_CROSS, int(args.marker_size) + 4,
+            int(args.marker_thickness), cv2.LINE_AA,
+        )
         palette = {
             "eef_xyz": ((0, 0, 255), cv2.MARKER_DIAMOND),
             "panda_link7": ((255, 0, 0), cv2.MARKER_TILTED_CROSS),
@@ -239,9 +264,25 @@ def process_episode(args: argparse.Namespace, ep_name: str,
             "left_outer_finger": ((0, 255, 0), cv2.MARKER_SQUARE),
             "right_outer_finger": ((255, 255, 0), cv2.MARKER_SQUARE),
         }
-        for name, uv in uvs.items():
+        draw_uvs = dict(uvs)
+        if args.draw_best_only and draw_uvs:
+            valid = {
+                name: float(np.linalg.norm(uv - c))
+                for name, uv in draw_uvs.items()
+                if np.all(np.isfinite(uv))
+            }
+            if valid:
+                best = min(valid, key=valid.get)
+                draw_uvs = {best: draw_uvs[best]}
+        legend_items = [("seg centroid", (0, 255, 255))]
+        for name, uv in draw_uvs.items():
             color, marker = palette.get(name, ((255, 255, 255), cv2.MARKER_CROSS))
-            _draw_point(image, uv, color, name, marker)
+            label = name if args.label_mode == "all" else ""
+            if args.label_mode == "best" and args.draw_best_only:
+                label = name
+            _draw_point(image, uv, color, label, marker, args)
+            legend_items.append((name, color))
+        _draw_legend(image, legend_items, args)
         cv2.imwrite(str(out_dir / f"{img_path.stem}.jpg"), image)
         saved += 1
 
@@ -273,6 +314,18 @@ def main() -> None:
     parser.add_argument("--out_dir_name", default="eef_projection_viz")
     parser.add_argument("--frame_stride", type=int, default=10)
     parser.add_argument("--max_frames", type=int, default=40)
+    parser.add_argument("--marker_size", type=int, default=13)
+    parser.add_argument("--marker_thickness", type=int, default=2)
+    parser.add_argument("--label_scale", type=float, default=0.32)
+    parser.add_argument("--label_mode", choices=["none", "best", "all"], default="none")
+    parser.add_argument("--legend", action="store_true")
+    parser.add_argument("--draw_best_only", action="store_true")
+    parser.add_argument(
+        "--draw_candidates",
+        nargs="+",
+        default=None,
+        help="Optional subset to draw, e.g. eef_xyz left_outer_finger right_outer_finger.",
+    )
     parser.add_argument(
         "--links",
         nargs="+",

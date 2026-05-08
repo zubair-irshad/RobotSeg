@@ -170,6 +170,89 @@ def _mask_metrics(target: np.ndarray, render: np.ndarray,
     }
 
 
+def _overlay_mask(
+    image_bgr: np.ndarray,
+    mask: np.ndarray,
+    color_bgr: tuple[int, int, int],
+    alpha: float = 0.55,
+) -> np.ndarray:
+    out = image_bgr.copy().astype(np.float32)
+    color = np.asarray(color_bgr, dtype=np.float32)
+    sel = mask.astype(bool)
+    out[sel] = (1.0 - alpha) * out[sel] + alpha * color
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _make_score_viz(image_bgr: np.ndarray, target: np.ndarray,
+                    render: np.ndarray, rec: dict[str, float]) -> np.ndarray:
+    target_panel = _overlay_mask(image_bgr, target, (0, 220, 0), alpha=0.55)
+    render_panel = _overlay_mask(image_bgr, render, (229, 132, 11), alpha=0.60)
+
+    diff_panel = image_bgr.copy().astype(np.float32)
+    both = target & render
+    target_only = target & ~render
+    render_only = render & ~target
+    diff_panel[both] = 0.35 * diff_panel[both] + 0.65 * np.array([0, 220, 220], dtype=np.float32)
+    diff_panel[target_only] = 0.30 * diff_panel[target_only] + 0.70 * np.array([0, 220, 0], dtype=np.float32)
+    diff_panel[render_only] = 0.30 * diff_panel[render_only] + 0.70 * np.array([0, 0, 255], dtype=np.float32)
+    diff_panel = np.clip(diff_panel, 0, 255).astype(np.uint8)
+
+    panels = [target_panel, render_panel, diff_panel]
+    labels = [
+        "body mask",
+        "panda render",
+        "diff green=target red=render yellow=overlap",
+    ]
+    for panel, label in zip(panels, labels):
+        cv2.putText(
+            panel,
+            label,
+            (8, 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            panel,
+            label,
+            (8, 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (20, 20, 20),
+            1,
+            cv2.LINE_AA,
+        )
+
+    viz = np.hstack(panels)
+    summary = (
+        f"iou={rec['iou']:.3f} coverage={rec['target_coverage']:.3f} "
+        f"t2r={rec['target_to_render_px']:.2f}px"
+    )
+    cv2.putText(
+        viz,
+        summary,
+        (8, viz.shape[0] - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        viz,
+        summary,
+        (8, viz.shape[0] - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (20, 20, 20),
+        1,
+        cv2.LINE_AA,
+    )
+    return viz
+
+
 def _aggregate(rows: list[dict[str, float]]) -> dict[str, float]:
     out: dict[str, float] = {"n": float(len(rows))}
     if not rows:
@@ -318,6 +401,9 @@ def process_episode(args: argparse.Namespace, masker: URDFRobotMasker,
 
     rows = []
     skip_counts: dict[str, int] = {}
+    viz_dir = ep_seg / args.viz_dir_name if args.viz_dir_name else None
+    if viz_dir is not None:
+        viz_dir.mkdir(parents=True, exist_ok=True)
 
     def skip(reason: str) -> None:
         skip_counts[reason] = skip_counts.get(reason, 0) + 1
@@ -358,6 +444,10 @@ def process_episode(args: argparse.Namespace, masker: URDFRobotMasker,
         rec["stem"] = stem
         rec["area_frac"] = area_frac
         rows.append(rec)
+        if viz_dir is not None:
+            image = cv2.imread(str(ep_oxe / "frames" / f"{stem}.jpg"))
+            if image is not None:
+                cv2.imwrite(str(viz_dir / f"{stem}.jpg"), _make_score_viz(image, target, render, rec))
 
     agg = _aggregate(rows)
     empty_render_frames = int(agg.get("empty_render_frames", 0))
@@ -443,6 +533,11 @@ def main() -> None:
     parser.add_argument("--min_target_area", type=float, default=0.002)
     parser.add_argument("--max_target_area", type=float, default=0.60)
     parser.add_argument("--out_json", type=Path, default=None)
+    parser.add_argument(
+        "--viz_dir_name",
+        default=None,
+        help="Optional per-episode directory name for body-mask/render/diff visualizations.",
+    )
     args = parser.parse_args()
     args.render_include_prefixes = _parse_prefixes(args.render_link_prefixes)
     args.render_exclude_prefixes = _parse_prefixes(args.exclude_render_link_prefixes)

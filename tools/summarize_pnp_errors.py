@@ -47,12 +47,12 @@ def main() -> None:
     )
 
     headers = [
-        "episode", "status", "K", "rmse", "max", "inliers", "frac",
+        "episode", "status", "point", "K", "rmse", "max", "inliers", "frac",
         "fx", "fy", "cx", "cy",
     ]
     if args.include_moge:
         headers += ["moge_fx", "fx_delta"]
-    widths = [12, 13, 18, 7, 7, 12, 7, 8, 8, 8, 8]
+    widths = [12, 13, 16, 18, 7, 7, 12, 7, 8, 8, 8, 8]
     if args.include_moge:
         widths += [8, 9]
 
@@ -63,7 +63,7 @@ def main() -> None:
         path = ds_root / ep / args.pnp_json_name
         data = _load_json(path)
         if data is None:
-            row = [ep, "missing", "-", "-", "-", "-", "-", "-", "-", "-", "-"]
+            row = [ep, "missing", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-"]
             if args.include_moge:
                 row += ["-", "-"]
             print(" ".join(str(v).ljust(w) for v, w in zip(row, widths)))
@@ -79,6 +79,7 @@ def main() -> None:
         row = [
             ep,
             str(data.get("status", "-")),
+            str(data.get("point_source", "eef_xyz"))[:16],
             str(K.get("source", data.get("K_selected_from", "-")))[:18],
             _fmt_float(data.get("rmse_px")),
             _fmt_float(data.get("max_err_px")),

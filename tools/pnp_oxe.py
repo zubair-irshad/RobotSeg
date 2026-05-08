@@ -53,6 +53,16 @@ import numpy as np
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 from oxe_registry import OXE_DATASETS  # noqa: E402
+from urdf_robot_masker import URDFRobotMasker  # noqa: E402
+
+
+DEFAULT_URDF = (
+    Path("data")
+    / "urdfs"
+    / "python-example-droid-dataset"
+    / "franka_description"
+    / "panda.urdf"
+)
 
 
 # Where in trajectory["state"] the EE xyz lives, parsed from the registry schema.
@@ -339,6 +349,96 @@ def _eef_rot_to_R(rot, fmt):
         b3 = np.cross(b1, b2)
         return np.stack([b1, b2, b3], axis=-1)
     raise ValueError(f"Unknown eef_rot_format: {fmt!r}")
+
+
+def _load_joint_array(traj) -> np.ndarray | None:
+    for key in ("joint_position", "joint_positions", "joints", "q", "arm_joints"):
+        if key in getattr(traj, "files", []):
+            arr = np.asarray(traj[key], dtype=np.float64)
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            if arr.ndim == 2 and arr.shape[1] >= 7:
+                return arr[:, :7]
+    return None
+
+
+def _load_gripper_array(traj, n: int) -> np.ndarray:
+    for key in ("gripper", "gripper_position", "finger_joint"):
+        if key in getattr(traj, "files", []):
+            arr = np.asarray(traj[key], dtype=np.float64).reshape(-1)
+            if len(arr) >= n:
+                return arr[:n]
+    return np.zeros(n, dtype=np.float64)
+
+
+def _make_urdf_masker(args) -> URDFRobotMasker:
+    if not args.urdf_path.exists():
+        raise FileNotFoundError(
+            f"missing URDF for --pnp_point_source={args.pnp_point_source}: {args.urdf_path}"
+        )
+    return URDFRobotMasker(
+        args.urdf_path,
+        mesh_dir=args.mesh_dir,
+        backend=args.urdf_backend,
+        downsample=4,
+        dilate_px=0,
+        verbose=False,
+    )
+
+
+def _fk_point_sequence(traj, n: int, args) -> tuple[np.ndarray | None, str]:
+    source = args.pnp_point_source
+    if source == "eef_xyz":
+        return None, "eef_xyz"
+
+    joints = _load_joint_array(traj)
+    if joints is None:
+        return None, "missing-joint_position"
+    n = min(n, len(joints))
+    gripper = _load_gripper_array(traj, n)
+    masker = _make_urdf_masker(args)
+
+    if source == "finger_midpoint":
+        links = ("left_outer_finger", "right_outer_finger")
+    elif source == "inner_finger_midpoint":
+        links = ("left_inner_finger", "right_inner_finger")
+    elif source == "all_finger_midpoint":
+        links = (
+            "left_outer_finger",
+            "right_outer_finger",
+            "left_inner_finger",
+            "right_inner_finger",
+        )
+    elif source.startswith("urdf_midpoint:"):
+        links = tuple(x.strip() for x in source.split(":", 1)[1].split(",") if x.strip())
+        if len(links) != 2:
+            return None, f"bad-point-source({source})"
+    elif source.startswith("urdf_link:"):
+        links = (source.split(":", 1)[1].strip(),)
+    else:
+        aliases = {
+            "panda_link7": ("panda_link7",),
+            "panda_link8": ("panda_link8",),
+            "robotiq_base": ("robotiq_85_base_link",),
+            "left_outer_finger": ("left_outer_finger",),
+            "right_outer_finger": ("right_outer_finger",),
+            "left_inner_finger": ("left_inner_finger",),
+            "right_inner_finger": ("right_inner_finger",),
+        }
+        links = aliases.get(source)
+        if links is None:
+            return None, f"unknown-point-source({source})"
+
+    pts = []
+    for i in range(n):
+        cfg = masker._cfg(joints[i], float(gripper[i]))
+        link_T = masker.robot.link_transforms(cfg)
+        missing = [link for link in links if link not in link_T]
+        if missing:
+            return None, f"missing-urdf-link({','.join(missing)})"
+        origins = np.stack([link_T[link][:3, 3] for link in links], axis=0)
+        pts.append(origins.mean(axis=0))
+    return np.asarray(pts, dtype=np.float64), source
 
 
 def _filter_frames(centroids_json, ee_xyz_seq, W, H, args, ee_R_seq=None):
@@ -729,9 +829,26 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
     else:
         return {"status": "skip-no-state", "episode": ep_dir_seg.name}
 
+    fk_points, point_source_status = _fk_point_sequence(traj, len(ee), args)
+    if fk_points is not None:
+        ee = fk_points
+    elif args.pnp_point_source != "eef_xyz":
+        return {
+            "status": "skip-bad-point-source",
+            "episode": ep_dir_seg.name,
+            "dataset": ds_name,
+            "point_source": args.pnp_point_source,
+            "reason": point_source_status,
+        }
+
     # Per-frame R_wrist->base (only needed for --solve_tool_offset).
     ee_R = None
-    if args.solve_tool_offset and "eef_rot" in traj.files:
+    if args.solve_tool_offset and args.pnp_point_source != "eef_xyz":
+        print(
+            f"  [warn] {ep_dir_seg.name}: --solve_tool_offset is ignored for "
+            f"--pnp_point_source={args.pnp_point_source}"
+        )
+    elif args.solve_tool_offset and "eef_rot" in traj.files:
         try:
             fmt = (str(traj["eef_rot_format"])
                    if "eef_rot_format" in traj.files else "quat_xyzw")
@@ -862,6 +979,7 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
         "K": K,
         "K_known": K_known,
         "K_selected_from": selected_from,
+        "point_source": args.pnp_point_source,
         "trajectory_K_candidates": traj_K_candidates,
         "num_total": len(centroids),
         "num_kept_after_filter": len(kept_stems),
@@ -1002,6 +1120,25 @@ def main():
                    help="EPNP needs >=4; we require a few more for stability.")
     p.add_argument("--max_rmse", type=float, default=20.0)
     p.add_argument("--min_inlier_frac", type=float, default=0.4)
+    p.add_argument(
+        "--pnp_point_source",
+        default="eef_xyz",
+        help=(
+            "3D point paired with the 2D gripper centroid. Options: eef_xyz "
+            "(DROID cartesian_position[:3]), finger_midpoint, inner_finger_midpoint, "
+            "all_finger_midpoint, panda_link7, "
+            "panda_link8, robotiq_base, left_outer_finger, right_outer_finger, "
+            "urdf_link:<link>, urdf_midpoint:<link_a>,<link_b>."
+        ),
+    )
+    p.add_argument("--urdf_path", type=Path, default=DEFAULT_URDF)
+    p.add_argument("--mesh_dir", type=Path, default=None)
+    p.add_argument(
+        "--urdf_backend",
+        choices=["simple", "yourdfpy", "auto"],
+        default="simple",
+        help="URDF backend used for FK point sources.",
+    )
 
     p.add_argument("--moge_intrinsics", action="store_true",
                    help="When K is not provided, sample N equally-spaced frames "
@@ -1105,6 +1242,7 @@ def main():
                 extra = (f"  rmse={r['rmse_px']:.2f}px  "
                          f"inliers={r['num_inliers']}/{r['num_kept_after_filter']}"
                          f"  K={r.get('K', {}).get('source', '?')}"
+                         f"  point={r.get('point_source', 'eef_xyz')}"
                          f"{off_s}")
             elif "rejection_breakdown" in r:
                 extra = (f"  kept={r['num_kept_after_filter']}/{r['num_total']}"

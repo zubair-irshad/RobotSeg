@@ -242,6 +242,35 @@ def process_episode(args: argparse.Namespace, ep_name: str,
             for link in args.links:
                 if link in link_T:
                     points[link] = link_T[link][:3, 3]
+            if (
+                "left_outer_finger" in link_T
+                and "right_outer_finger" in link_T
+            ):
+                points["finger_midpoint"] = 0.5 * (
+                    link_T["left_outer_finger"][:3, 3]
+                    + link_T["right_outer_finger"][:3, 3]
+                )
+            if (
+                "left_inner_finger" in link_T
+                and "right_inner_finger" in link_T
+            ):
+                points["inner_finger_midpoint"] = 0.5 * (
+                    link_T["left_inner_finger"][:3, 3]
+                    + link_T["right_inner_finger"][:3, 3]
+                )
+            finger_links = [
+                name for name in (
+                    "left_outer_finger",
+                    "right_outer_finger",
+                    "left_inner_finger",
+                    "right_inner_finger",
+                )
+                if name in link_T
+            ]
+            if finger_links:
+                points["all_finger_midpoint"] = np.stack(
+                    [link_T[name][:3, 3] for name in finger_links], axis=0
+                ).mean(axis=0)
         if args.draw_candidates:
             allowed = set(args.draw_candidates)
             points = {k: v for k, v in points.items() if k in allowed}
@@ -263,6 +292,11 @@ def process_episode(args: argparse.Namespace, ep_name: str,
             "robotiq_85_base_link": ((255, 0, 255), cv2.MARKER_TRIANGLE_UP),
             "left_outer_finger": ((0, 255, 0), cv2.MARKER_SQUARE),
             "right_outer_finger": ((255, 255, 0), cv2.MARKER_SQUARE),
+            "finger_midpoint": ((0, 140, 255), cv2.MARKER_STAR),
+            "left_inner_finger": ((80, 255, 80), cv2.MARKER_TRIANGLE_UP),
+            "right_inner_finger": ((255, 255, 80), cv2.MARKER_TRIANGLE_UP),
+            "inner_finger_midpoint": ((0, 110, 220), cv2.MARKER_STAR),
+            "all_finger_midpoint": ((0, 80, 200), cv2.MARKER_STAR),
         }
         draw_uvs = dict(uvs)
         if args.draw_best_only and draw_uvs:
@@ -335,6 +369,8 @@ def main() -> None:
             "robotiq_85_base_link",
             "left_outer_finger",
             "right_outer_finger",
+            "left_inner_finger",
+            "right_inner_finger",
         ],
     )
     args = parser.parse_args()

@@ -12,7 +12,14 @@ from typing import Any
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cam2base_json import compare_T, episode_lookup_keys, find_T_cam2base, load_json  # noqa: E402
+from cam2base_json import (  # noqa: E402
+    SIXD_MODES,
+    compare_T,
+    episode_lookup_keys,
+    find_T_cam2base,
+    find_T_cam2base_candidates,
+    load_json,
+)
 
 
 def _load_pnp(path: Path) -> dict[str, Any] | None:
@@ -55,6 +62,10 @@ def main() -> None:
     parser.add_argument("--camera_serial", default=None,
                         help="Optional camera serial key in the reference JSON. "
                              "Defaults to serial parsed from PnP K source when available.")
+    parser.add_argument("--sixd_mode", default="auto",
+                        choices=["auto", *SIXD_MODES],
+                        help="How to interpret 6-vector reference poses. "
+                             "auto picks the convention closest to the PnP pose.")
     parser.add_argument("--out_json", type=Path, default=None)
     args = parser.parse_args()
 
@@ -67,11 +78,11 @@ def main() -> None:
 
     rows = []
     print(
-        "episode      status        source                         "
+        "episode      status        serial   source                                             "
         "trans_cm  rot_deg  dx_cm    dy_cm    dz_cm    pnp_rmse K"
     )
     print(
-        "------------ ------------- ------------------------------ "
+        "------------ ------------- -------- -------------------------------------------------- "
         "--------- -------- -------- -------- -------- -------- ------------------"
     )
     for ep in episodes:
@@ -90,14 +101,33 @@ def main() -> None:
         serial = args.camera_serial or _serial_from_pnp(pnp)
         if serial:
             preferred.append(serial)
-        T_ref, source = find_T_cam2base(ref, keys, preferred_fields=preferred)
+        if args.sixd_mode == "auto":
+            candidates = find_T_cam2base_candidates(ref, keys, preferred_fields=preferred)
+            scored = []
+            T_pnp = np.asarray(pnp["T_cam2base"], dtype=np.float64)
+            for T_candidate, source_candidate in candidates:
+                metrics_candidate = compare_T(T_pnp, T_candidate)
+                score = (
+                    metrics_candidate["rotation_delta_deg"]
+                    + 100.0 * metrics_candidate["translation_delta_m"]
+                )
+                scored.append((score, T_candidate, source_candidate, metrics_candidate))
+            if scored:
+                _, T_ref, source, precomputed_metrics = min(scored, key=lambda x: x[0])
+            else:
+                T_ref, source, precomputed_metrics = None, None, None
+        else:
+            T_ref, source = find_T_cam2base(
+                ref, keys, preferred_fields=preferred, sixd_mode=args.sixd_mode
+            )
+            precomputed_metrics = None
         if T_ref is None:
             print(f"{ep:<12} {'missing-ref':<13} keys={keys}")
             rows.append({"episode": ep, "status": "missing-reference", "lookup_keys": keys})
             continue
 
         T_pnp = np.asarray(pnp["T_cam2base"], dtype=np.float64)
-        metrics = compare_T(T_pnp, T_ref)
+        metrics = precomputed_metrics or compare_T(T_pnp, T_ref)
         K = pnp.get("K", {}) if isinstance(pnp.get("K"), dict) else {}
         rec = {
             "episode": ep,
@@ -114,7 +144,7 @@ def main() -> None:
         }
         rows.append(rec)
         print(
-            f"{ep:<12} {'ok':<13} {str(source)[:30]:<30} "
+            f"{ep:<12} {'ok':<13} {str(serial or '-'):<8} {str(source)[:50]:<50} "
             f"{100 * metrics['translation_delta_m']:9.2f} "
             f"{metrics['rotation_delta_deg']:8.2f} "
             f"{100 * metrics['dx_m']:8.2f} "

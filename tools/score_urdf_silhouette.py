@@ -247,6 +247,12 @@ def main() -> None:
     parser.add_argument("--pnp_json_name", default="pnp.json")
     parser.add_argument("--urdf_path", type=Path, default=DEFAULT_URDF)
     parser.add_argument("--mesh_dir", type=Path, default=None)
+    parser.add_argument(
+        "--urdf_backend",
+        choices=["simple", "yourdfpy", "auto"],
+        default="simple",
+        help="URDF renderer backend. Use yourdfpy to match the visual-scene path.",
+    )
     parser.add_argument("--mask_dirs", nargs="+", default=["000", "001"],
                         help="Segmentation folders to union. Defaults to arm+gripper.")
     parser.add_argument("--auto_robot_mask", action="store_true",
@@ -272,6 +278,7 @@ def main() -> None:
     masker = URDFRobotMasker(
         args.urdf_path,
         mesh_dir=args.mesh_dir,
+        backend=args.urdf_backend,
         downsample=args.downsample,
         dilate_px=args.dilate_px,
         verbose=True,

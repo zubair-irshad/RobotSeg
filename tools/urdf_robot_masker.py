@@ -1,9 +1,9 @@
 """URDF silhouette rendering utilities for camera/extrinsic QA.
 
-The implementation is deliberately lightweight: it parses the URDF with the
-standard library and rasterizes STL collision meshes with OpenCV. That keeps
-the DROID Franka overlay usable in the RobotSeg environment even when
-``yourdfpy``/``trimesh`` are not installed.
+The preferred backend uses ``yourdfpy``/``trimesh`` to flatten the articulated
+visual scene, matching the DROID Franka rendering path. A lightweight standard
+library STL backend is kept as a fallback for environments without those
+dependencies.
 """
 
 from __future__ import annotations
@@ -303,6 +303,47 @@ class _SimpleURDF:
         return np.vstack(vertices_all), np.vstack(faces_all).astype(np.int32)
 
 
+class _YourdfpyURDF:
+    def __init__(
+        self,
+        urdf_path: Path,
+        mesh_dir: Path | None = None,
+        verbose: bool = True,
+    ):
+        import yourdfpy
+
+        kwargs = dict(
+            build_scene_graph=True,
+            load_meshes=True,
+            build_collision_scene_graph=False,
+            load_collision_meshes=False,
+        )
+        if mesh_dir is not None:
+            kwargs["mesh_dir"] = str(mesh_dir)
+        self.urdf_path = urdf_path
+        self.mesh_dir = mesh_dir
+        self.robot = yourdfpy.URDF.load(str(urdf_path), **kwargs)
+        if verbose:
+            combined = self.robot.scene.dump(concatenate=True)
+            n_vertices = int(len(getattr(combined, "vertices", [])))
+            n_faces = int(len(getattr(combined, "faces", [])))
+            print(
+                f"[urdf_render] loaded {urdf_path} backend=yourdfpy "
+                f"root={self.robot.base_link} visual_vertices={n_vertices} "
+                f"visual_faces={n_faces}"
+            )
+
+    def combined_mesh(self, cfg: dict[str, float]) -> tuple[np.ndarray, np.ndarray]:
+        if cfg:
+            self.robot.update_cfg(cfg)
+        combined = self.robot.scene.dump(concatenate=True)
+        vertices = np.asarray(combined.vertices, dtype=np.float64)
+        faces = np.asarray(combined.faces, dtype=np.int32)
+        if len(vertices) == 0 or len(faces) == 0:
+            return np.zeros((0, 3), dtype=np.float64), np.zeros((0, 3), dtype=np.int32)
+        return vertices, faces
+
+
 class URDFRobotMasker:
     """Render a Franka + Robotiq URDF silhouette into a camera image."""
 
@@ -313,6 +354,7 @@ class URDFRobotMasker:
         downsample: int = 2,
         dilate_px: int = 3,
         geometry: str = "collision",
+        backend: str = "simple",
         gripper_joint_name: str = "finger_joint",
         gripper_open_rad: float = 0.0,
         gripper_closed_rad: float = 0.7,
@@ -322,12 +364,37 @@ class URDFRobotMasker:
         if mesh_dir is None:
             mesh_dir = _default_mesh_dir(self.urdf_path)
         self.mesh_dir = Path(mesh_dir) if mesh_dir is not None else None
-        self.robot = _SimpleURDF(
-            self.urdf_path,
-            mesh_dir=self.mesh_dir,
-            geometry=geometry,
-            verbose=verbose,
-        )
+        backend = backend.lower()
+        if backend not in {"simple", "yourdfpy", "auto"}:
+            raise ValueError("backend must be one of: simple, yourdfpy, auto")
+        self.backend = backend
+        if backend in {"yourdfpy", "auto"}:
+            try:
+                self.robot = _YourdfpyURDF(
+                    self.urdf_path,
+                    mesh_dir=self.mesh_dir,
+                    verbose=verbose,
+                )
+                self.backend = "yourdfpy"
+            except Exception:
+                if backend == "yourdfpy":
+                    raise
+                if verbose:
+                    print("[urdf_render] yourdfpy backend unavailable; falling back to simple STL loader")
+                self.robot = _SimpleURDF(
+                    self.urdf_path,
+                    mesh_dir=self.mesh_dir,
+                    geometry=geometry,
+                    verbose=verbose,
+                )
+                self.backend = "simple"
+        else:
+            self.robot = _SimpleURDF(
+                self.urdf_path,
+                mesh_dir=self.mesh_dir,
+                geometry=geometry,
+                verbose=verbose,
+            )
         self.downsample = max(1, int(downsample))
         self.dilate_px = int(dilate_px)
         self.gripper_joint_name = gripper_joint_name
@@ -357,8 +424,8 @@ class URDFRobotMasker:
         H = int(image_hw[0] if image_hw is not None else K["height"])
         W = int(image_hw[1] if image_hw is not None else K["width"])
         s = self.downsample
-        Hs = max(1, int(math.ceil(H / s)))
-        Ws = max(1, int(math.ceil(W / s)))
+        Hs = max(1, H // s)
+        Ws = max(1, W // s)
         Ks = {
             "fx": float(K["fx"]) / s,
             "fy": float(K["fy"]) / s,
@@ -382,7 +449,7 @@ class URDFRobotMasker:
         mask = np.zeros((Hs, Ws), dtype=np.uint8)
         if len(tri):
             proj = _project(verts_cam, Ks)
-            polys = np.rint(proj[:, :2][tri]).astype(np.int32)
+            polys = proj[:, :2][tri].astype(np.int32)
             cv2.fillPoly(mask, polys, color=1)
 
         mask = cv2.resize(mask, (W, H), interpolation=cv2.INTER_NEAREST)
@@ -448,12 +515,14 @@ def segment_robot_urdf(
     dilate_px: int = 3,
     gripper_open_rad: float = 0.0,
     gripper_closed_rad: float = 0.7,
+    backend: str = "simple",
 ) -> np.ndarray:
     masker = URDFRobotMasker(
         urdf_path,
         mesh_dir=mesh_dir,
         downsample=downsample,
         dilate_px=dilate_px,
+        backend=backend,
         gripper_open_rad=gripper_open_rad,
         gripper_closed_rad=gripper_closed_rad,
     )

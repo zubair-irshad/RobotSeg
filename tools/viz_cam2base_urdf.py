@@ -24,7 +24,7 @@ import numpy as np
 
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
-from cam2base_json import episode_lookup_keys, find_T_cam2base, load_json  # noqa: E402
+from cam2base_json import SIXD_MODES, episode_lookup_keys, find_T_cam2base, load_json  # noqa: E402
 from urdf_robot_masker import URDFRobotMasker  # noqa: E402
 
 
@@ -74,7 +74,12 @@ def _load_T_cam2base(dataset: str, ep_name: str, args: argparse.Namespace,
     serial = args.camera_serial or _serial_from_pnp(pnp)
     if serial:
         preferred.append(serial)
-    T, source = find_T_cam2base(data, keys, preferred_fields=preferred)
+    T, source = find_T_cam2base(
+        data,
+        keys,
+        preferred_fields=preferred,
+        sixd_mode=args.extrinsics_sixd_mode,
+    )
     if T is None:
         raise KeyError(
             f"Could not find {dataset}/{ep_name} in {args.extrinsics_json}; "
@@ -339,6 +344,12 @@ def main() -> None:
     parser.add_argument("--urdf_path", type=Path, default=DEFAULT_URDF)
     parser.add_argument("--mesh_dir", type=Path, default=None)
     parser.add_argument(
+        "--urdf_backend",
+        choices=["simple", "yourdfpy", "auto"],
+        default="simple",
+        help="URDF renderer backend. Use yourdfpy to match the visual-scene path.",
+    )
+    parser.add_argument(
         "--pnp_json_name",
         default="pnp.json",
         help="Per-episode PnP JSON filename, e.g. pnp.json or pnp_rlds.json.",
@@ -353,6 +364,13 @@ def main() -> None:
         "--camera_serial",
         default=None,
         help="Optional camera serial key when --extrinsics_json stores per-serial extrinsics.",
+    )
+    parser.add_argument(
+        "--extrinsics_sixd_mode",
+        default="rpy_cam2base",
+        choices=SIXD_MODES,
+        help="How to interpret 6-vector poses in --extrinsics_json. "
+             "DROID multiview files usually use rpy_cam2base.",
     )
     parser.add_argument("--out_dir_name", default="urdf_viz")
     parser.add_argument("--image_source", choices=["auto", "raw", "combined"], default="auto")
@@ -406,6 +424,7 @@ def main() -> None:
     masker = URDFRobotMasker(
         args.urdf_path,
         mesh_dir=args.mesh_dir,
+        backend=args.urdf_backend,
         downsample=args.downsample,
         dilate_px=args.dilate_px,
         gripper_open_rad=args.gripper_open_rad,

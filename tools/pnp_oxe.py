@@ -763,7 +763,7 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
             K = dict(K_override)
             K.setdefault("width", W)
             K.setdefault("height", H)
-            K["source"] = "K_json"
+            K.setdefault("source", "K_json")
             selected_from = "K_json"
         else:
             print(

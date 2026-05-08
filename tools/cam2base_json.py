@@ -9,6 +9,14 @@ from typing import Any
 import numpy as np
 
 
+SIXD_MODES = (
+    "rotvec_cam2base",
+    "rotvec_base2cam",
+    "rpy_cam2base",
+    "rpy_base2cam",
+)
+
+
 def load_json(path: Path) -> Any:
     with path.open() as f:
         return json.load(f)
@@ -39,7 +47,33 @@ def _axis_angle_matrix(rotvec: np.ndarray) -> np.ndarray:
     )
 
 
-def _matrix_from_value(value: Any) -> np.ndarray | None:
+def _rpy_matrix(rpy: np.ndarray) -> np.ndarray:
+    rx, ry, rz = rpy
+    cx, sx = np.cos(rx), np.sin(rx)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cz, sz = np.cos(rz), np.sin(rz)
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]], dtype=np.float64)
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], dtype=np.float64)
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]], dtype=np.float64)
+    return Rz @ Ry @ Rx
+
+
+def _sixd_to_T(arr: np.ndarray, sixd_mode: str) -> np.ndarray | None:
+    if sixd_mode not in SIXD_MODES:
+        raise ValueError(f"unknown sixd mode {sixd_mode!r}; expected one of {SIXD_MODES}")
+    out = np.eye(4, dtype=np.float64)
+    out[:3, 3] = arr[:3]
+    rot = arr[3:]
+    if sixd_mode.startswith("rotvec_"):
+        out[:3, :3] = _axis_angle_matrix(rot)
+    elif sixd_mode.startswith("rpy_"):
+        out[:3, :3] = _rpy_matrix(rot)
+    if sixd_mode.endswith("_base2cam"):
+        out = invert_se3(out)
+    return out
+
+
+def _matrix_from_value(value: Any, sixd_mode: str = "rotvec_cam2base") -> np.ndarray | None:
     try:
         arr = np.asarray(value, dtype=np.float64)
     except (TypeError, ValueError):
@@ -57,18 +91,14 @@ def _matrix_from_value(value: Any) -> np.ndarray | None:
         out[:3, :] = arr.reshape(3, 4)
         return out
     if arr.shape == (6,):
-        # DROID pnp_cam2base_multiview.json stores [x, y, z, rx, ry, rz],
-        # where r* is an axis-angle rotation vector for T_cam2base.
-        out = np.eye(4, dtype=np.float64)
-        out[:3, 3] = arr[:3]
-        out[:3, :3] = _axis_angle_matrix(arr[3:])
-        return out
+        return _sixd_to_T(arr, sixd_mode)
     return None
 
 
 def _extract_T_cam2base(
     record: Any,
     preferred_fields: list[str] | None = None,
+    sixd_mode: str = "rotvec_cam2base",
 ) -> tuple[np.ndarray | None, str | None]:
     preferred_fields = preferred_fields or []
     if isinstance(record, dict):
@@ -80,7 +110,7 @@ def _extract_T_cam2base(
             "T_cam_to_base",
         ):
             if key in record:
-                T = _matrix_from_value(record[key])
+                T = _matrix_from_value(record[key], sixd_mode=sixd_mode)
                 if T is not None:
                     return T, key
         for key in (
@@ -91,21 +121,21 @@ def _extract_T_cam2base(
             "T_base_to_cam",
         ):
             if key in record:
-                T = _matrix_from_value(record[key])
+                T = _matrix_from_value(record[key], sixd_mode=sixd_mode)
                 if T is not None:
                     return invert_se3(T), f"invert({key})"
         for key in preferred_fields:
             if key in record:
-                T = _matrix_from_value(record[key])
+                T = _matrix_from_value(record[key], sixd_mode=sixd_mode)
                 if T is not None:
                     return T, key
         for key, value in record.items():
             if key in {"relative_path", "path", "episode", "episode_id", "dataset"}:
                 continue
-            T = _matrix_from_value(value)
+            T = _matrix_from_value(value, sixd_mode=sixd_mode)
             if T is not None:
                 return T, key
-    T = _matrix_from_value(record)
+    T = _matrix_from_value(record, sixd_mode=sixd_mode)
     if T is not None:
         return T, "matrix"
     return None, None
@@ -198,15 +228,36 @@ def find_T_cam2base(
     data: Any,
     keys: list[str],
     preferred_fields: list[str] | None = None,
+    sixd_mode: str = "rotvec_cam2base",
 ) -> tuple[np.ndarray | None, str | None]:
     for record, source in _candidate_records(data, keys):
-        T, field = _extract_T_cam2base(record, preferred_fields=preferred_fields)
+        T, field = _extract_T_cam2base(
+            record, preferred_fields=preferred_fields, sixd_mode=sixd_mode
+        )
         if T is not None:
-            return T, f"{source}:{field}"
-    T, field = _extract_T_cam2base(data, preferred_fields=preferred_fields)
+            return T, f"{source}:{field}:{sixd_mode}"
+    T, field = _extract_T_cam2base(
+        data, preferred_fields=preferred_fields, sixd_mode=sixd_mode
+    )
     if T is not None and len(keys) <= 1:
-        return T, field
+        return T, f"{field}:{sixd_mode}"
     return None, None
+
+
+def find_T_cam2base_candidates(
+    data: Any,
+    keys: list[str],
+    preferred_fields: list[str] | None = None,
+    sixd_modes: tuple[str, ...] = SIXD_MODES,
+) -> list[tuple[np.ndarray, str]]:
+    out = []
+    for mode in sixd_modes:
+        T, source = find_T_cam2base(
+            data, keys, preferred_fields=preferred_fields, sixd_mode=mode
+        )
+        if T is not None and source is not None:
+            out.append((T, source))
+    return out
 
 
 def rotation_angle_deg(R_delta: np.ndarray) -> float:

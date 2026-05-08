@@ -27,6 +27,8 @@ URDF_IMAGE_SOURCE="${URDF_IMAGE_SOURCE:-combined}"
 URDF_MAX_FRAMES="${URDF_MAX_FRAMES:-32}"
 URDF_FRAME_STRIDE="${URDF_FRAME_STRIDE:-1}"
 URDF_BACKEND="${URDF_BACKEND:-simple}"
+MULTIVIEW_EXTRINSICS_JSON="${MULTIVIEW_EXTRINSICS_JSON:-$REPO_ROOT/pnp_cam2base_multiview.json}"
+MULTIVIEW_EXTRINSICS_MODE="${MULTIVIEW_EXTRINSICS_MODE:-rpy_cam2base}"
 
 echo "==> build DROID intrinsics: camera=$CAMERA"
 "$PYTHON" "$REPO_ROOT/tools/droid_hf_intrinsics.py" \
@@ -53,12 +55,22 @@ echo "==> pnp with DROID intrinsics only: point_source=$PNP_POINT_SOURCE"
 if [[ "$RUN_PNP_AUDIT" == "1" ]]; then
   echo
   echo "==> exact PnP audit panels"
+  AUDIT_EXTRINSICS_ARGS=()
+  if [[ -f "$MULTIVIEW_EXTRINSICS_JSON" ]]; then
+    AUDIT_EXTRINSICS_ARGS=(
+      --extrinsics_json "$MULTIVIEW_EXTRINSICS_JSON"
+      --extrinsics_sixd_mode "$MULTIVIEW_EXTRINSICS_MODE"
+    )
+  else
+    echo "[warn] multiview extrinsics JSON not found: $MULTIVIEW_EXTRINSICS_JSON"
+  fi
   "$PYTHON" "$REPO_ROOT/tools/viz_pnp_audit_panel.py" \
     --oxe_root "$OXE_ROOT" \
     --mask_root "$MASK_ROOT" \
     --dataset "$DATASET" \
     --urdf_path "$URDF_PATH" \
     --urdf_backend "$URDF_BACKEND" \
+    "${AUDIT_EXTRINSICS_ARGS[@]}" \
     --skip_bad_pnp
 fi
 

@@ -19,6 +19,12 @@ import numpy as np
 
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
+from cam2base_json import (  # noqa: E402
+    SIXD_MODES,
+    episode_lookup_keys,
+    find_T_cam2base,
+    load_json,
+)
 from pnp_oxe import EE_XYZ_DIMS, _fk_point_sequence, _K_to_mat  # noqa: E402
 from urdf_robot_masker import URDFRobotMasker  # noqa: E402
 from viz_cam2base_urdf import DEFAULT_URDF  # noqa: E402
@@ -106,6 +112,47 @@ def _load_gripper(traj, n: int) -> np.ndarray:
     return np.zeros(n, dtype=np.float64)
 
 
+def _serial_from_pnp(pnp: dict) -> str | None:
+    source = pnp.get("K", {}).get("source") if isinstance(pnp.get("K"), dict) else None
+    if not isinstance(source, str):
+        return None
+    marker = "serial="
+    if marker not in source:
+        return None
+    return source.split(marker, 1)[1].split()[0]
+
+
+def _episode_id_from_pnp(pnp: dict) -> str | None:
+    source = pnp.get("K", {}).get("source") if isinstance(pnp.get("K"), dict) else None
+    if not isinstance(source, str):
+        return None
+    marker = "episode_id="
+    if marker not in source:
+        return None
+    return source.split(marker, 1)[1].split()[0]
+
+
+def _load_reference_T(dataset: str, ep: str, pnp: dict, args) -> tuple[np.ndarray | None, str | None]:
+    if args.extrinsics_json is None:
+        return None, None
+    data = load_json(args.extrinsics_json)
+    keys = episode_lookup_keys(args.oxe_root, dataset, ep)
+    raw_id = _episode_id_from_pnp(pnp)
+    if raw_id and raw_id not in keys:
+        keys += [raw_id, f"{dataset}/{raw_id}"]
+    preferred = []
+    serial = args.camera_serial or _serial_from_pnp(pnp)
+    if serial:
+        preferred.append(serial)
+    T_ref, source = find_T_cam2base(
+        data,
+        keys,
+        preferred_fields=preferred,
+        sixd_mode=args.extrinsics_sixd_mode,
+    )
+    return T_ref, source
+
+
 def _project(point3d: np.ndarray, K: dict, rvec: np.ndarray, tvec: np.ndarray) -> np.ndarray:
     uv, _ = cv2.projectPoints(
         np.asarray(point3d, dtype=np.float64).reshape(1, 3),
@@ -175,6 +222,7 @@ def process_episode(dataset: str, ep: str, args, masker: URDFRobotMasker | None)
     rvec = np.asarray(pnp["rvec"], dtype=np.float64).reshape(3, 1)
     tvec = np.asarray(pnp["tvec"], dtype=np.float64).reshape(3, 1)
     T_cam2base = np.asarray(pnp["T_cam2base"], dtype=np.float64)
+    T_ref_cam2base, T_ref_source = _load_reference_T(dataset, ep, pnp, args)
 
     with np.load(ep_oxe / "trajectory.npz", allow_pickle=True) as traj:
         points = _load_points(dataset, traj, len(centroids), args, pnp.get("point_source", "eef_xyz"))
@@ -182,7 +230,10 @@ def process_episode(dataset: str, ep: str, args, masker: URDFRobotMasker | None)
         gripper = _load_gripper(traj, len(joints)) if joints is not None else None
 
         out_root = ep_seg / args.out_dir_name
-        dirs = {name: out_root / name for name in ("raw", "masks", "urdf", "reprojection", "panel")}
+        dirs = {
+            name: out_root / name
+            for name in ("raw", "masks", "urdf_pnp", "urdf_multiview", "reprojection", "panel")
+        }
         for d in dirs.values():
             d.mkdir(parents=True, exist_ok=True)
 
@@ -227,22 +278,43 @@ def process_episode(dataset: str, ep: str, args, masker: URDFRobotMasker | None)
                     T_cam2base,
                     joints[idx],
                     gripper_position=float(gripper[idx]) if gripper is not None and idx < len(gripper) else 0.0,
-                    color_bgr=(229, 132, 11),
-                    outline_bgr=(245, 165, 35),
+                    color_bgr=(255, 170, 40),
+                    outline_bgr=(255, 225, 120),
                     outline_px=1,
                     alpha=0.60,
+                )
+            urdf_ref_img = image.copy()
+            if (
+                masker is not None
+                and T_ref_cam2base is not None
+                and joints is not None
+                and idx < len(joints)
+            ):
+                urdf_ref_img, _ = masker.overlay(
+                    image,
+                    K,
+                    T_ref_cam2base,
+                    joints[idx],
+                    gripper_position=float(gripper[idx]) if gripper is not None and idx < len(gripper) else 0.0,
+                    color_bgr=(0, 145, 255),
+                    outline_bgr=(0, 210, 255),
+                    outline_px=1,
+                    alpha=0.62,
                 )
 
             cv2.imwrite(str(dirs["raw"] / f"{stem}.jpg"), _draw_header(image, f"raw {stem}"))
             cv2.imwrite(str(dirs["masks"] / f"{stem}.jpg"), _draw_header(mask_img, "body=green gripper=red"))
-            cv2.imwrite(str(dirs["urdf"] / f"{stem}.jpg"), _draw_header(urdf_img, "rendered URDF"))
+            cv2.imwrite(str(dirs["urdf_pnp"] / f"{stem}.jpg"), _draw_header(urdf_img, "URDF from PnP"))
+            ref_label = "URDF from multiview GT" if T_ref_cam2base is not None else "multiview GT missing"
+            cv2.imwrite(str(dirs["urdf_multiview"] / f"{stem}.jpg"), _draw_header(urdf_ref_img, ref_label))
             label = f"{status} err={err:.1f}px" if err is not None else status
             cv2.imwrite(str(dirs["reprojection"] / f"{stem}.jpg"), _draw_header(reproj, label))
 
             panels = [
                 _draw_header(image, f"raw {stem}"),
                 _draw_header(mask_img, "seg: body green / gripper red"),
-                _draw_header(urdf_img, "URDF render"),
+                _draw_header(urdf_img, "URDF: PnP estimate"),
+                _draw_header(urdf_ref_img, ref_label),
                 _draw_header(reproj, label),
             ]
             ph = max(p.shape[0] for p in panels)
@@ -262,6 +334,7 @@ def process_episode(dataset: str, ep: str, args, masker: URDFRobotMasker | None)
         "num_inliers": len(inliers),
         "rendered": len(panel_paths),
         "out_dir": str(ep_seg / args.out_dir_name),
+        "multiview_source": T_ref_source,
     }
 
 
@@ -279,6 +352,20 @@ def main() -> None:
     parser.add_argument("--urdf_path", type=Path, default=DEFAULT_URDF)
     parser.add_argument("--mesh_dir", type=Path, default=None)
     parser.add_argument("--urdf_backend", choices=["simple", "yourdfpy", "auto"], default="simple")
+    parser.add_argument(
+        "--extrinsics_json",
+        type=Path,
+        default=None,
+        help="Optional multiview/GT cam2base JSON to render as a separate orange URDF panel.",
+    )
+    parser.add_argument("--camera_serial", default=None)
+    parser.add_argument(
+        "--extrinsics_sixd_mode",
+        choices=SIXD_MODES,
+        default="rpy_cam2base",
+        help="How to interpret 6-vector entries in --extrinsics_json. "
+             "cam2base_json.py also inverts explicit base2cam records automatically.",
+    )
     args = parser.parse_args()
 
     masker = None
@@ -303,6 +390,7 @@ def main() -> None:
             f"[{args.dataset}/{r['episode']}] {r['status']} "
             f"pnp={r.get('pnp_status')} kept={r.get('num_kept')} "
             f"inliers={r.get('num_inliers')} rendered={r.get('rendered')} "
+            f"multiview={r.get('multiview_source')} "
             f"out={r.get('out_dir', '')}"
         )
     (ds_seg / "pnp_audit_summary.json").write_text(json.dumps(results, indent=2))

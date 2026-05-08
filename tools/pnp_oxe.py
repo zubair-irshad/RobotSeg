@@ -97,12 +97,85 @@ def _entry_to_record(entry):
             "area_frac": float(entry.get("area_frac", 0.0)),
             "n_components": int(entry.get("n_components", 1)),
             "arm_overlap_frac": float(entry.get("arm_overlap_frac", 0.0)),
+            "pre_subtract_area_frac": float(
+                entry.get("pre_subtract_area_frac", entry.get("area_frac", 0.0))
+            ),
             "observed": entry.get("observed", None),
         }
     # Legacy list form (no quality info; assume good).
     return {"centroid": entry, "conf_mean": 1.0, "conf_max": 1.0,
             "area_frac": 0.0, "n_components": 1,
-            "arm_overlap_frac": 0.0, "observed": True}
+            "arm_overlap_frac": 0.0, "pre_subtract_area_frac": 0.0,
+            "observed": True}
+
+
+def _mask_path(root: Path, stem: str) -> Path | None:
+    for ext in (".png", ".jpg", ".jpeg"):
+        path = root / f"{stem}{ext}"
+        if path.exists():
+            return path
+    return None
+
+
+def _read_binary_mask(path: Path, shape_hw: tuple[int, int]) -> np.ndarray | None:
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return None
+    if img.ndim == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    mask = img > 127
+    if mask.shape[:2] != shape_hw:
+        mask = cv2.resize(
+            mask.astype(np.uint8),
+            (shape_hw[1], shape_hw[0]),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
+    return mask
+
+
+def _load_masks_for_stem(ep_dir_seg: Path, stem: str, roots: list[str],
+                         shape_hw: tuple[int, int]) -> np.ndarray | None:
+    out = np.zeros(shape_hw, dtype=bool)
+    found = False
+    for root_name in roots:
+        path = _mask_path(ep_dir_seg / root_name, stem)
+        if path is None:
+            continue
+        mask = _read_binary_mask(path, shape_hw)
+        if mask is None:
+            continue
+        out |= mask
+        found = True
+    return out if found else None
+
+
+def _parse_mask_roots(text: str) -> list[str]:
+    return [x.strip() for x in text.split(",") if x.strip()]
+
+
+def _robot_proximity_ok(ep_dir_seg: Path, stem: str, centroid: list[float],
+                        W: int, H: int, args) -> tuple[bool, str | None]:
+    if not args.require_gripper_near_robot:
+        return True, None
+    roots = _parse_mask_roots(args.robot_mask_roots)
+    robot = _load_masks_for_stem(ep_dir_seg, stem, roots, (H, W))
+    if robot is None:
+        if args.skip_if_robot_mask_missing:
+            return False, "missing-robot-mask"
+        return True, None
+    if int(robot.sum()) < args.min_robot_mask_area_px:
+        return False, f"robot-mask-small({int(robot.sum())})"
+    cx, cy = int(round(float(centroid[0]))), int(round(float(centroid[1])))
+    if not (0 <= cx < W and 0 <= cy < H):
+        return False, "centroid-outside-image"
+    if robot[cy, cx]:
+        return True, None
+    inv = (~robot).astype(np.uint8)
+    dt = cv2.distanceTransform(inv, cv2.DIST_L2, 3)
+    dist = float(dt[cy, cx])
+    if dist > args.max_gripper_robot_dist_px:
+        return False, f"far-from-robot({dist:.1f}px)"
+    return True, None
 
 
 def _K_from_camera_json(cam_json: dict, W: int, H: int) -> dict | None:
@@ -441,7 +514,8 @@ def _fk_point_sequence(traj, n: int, args) -> tuple[np.ndarray | None, str]:
     return np.asarray(pts, dtype=np.float64), source
 
 
-def _filter_frames(centroids_json, ee_xyz_seq, W, H, args, ee_R_seq=None):
+def _filter_frames(centroids_json, ee_xyz_seq, W, H, args, ee_R_seq=None,
+                   ep_dir_seg: Path | None = None):
     """Return (pts3d Nx3, pts2d Nx2, kept_stems, rejected[, R_wrist Nx3x3]) post-filter."""
     img_area = float(W * H)
     min_area_eff = max(args.min_area, args.min_area_px / img_area)
@@ -480,6 +554,15 @@ def _filter_frames(centroids_json, ee_xyz_seq, W, H, args, ee_R_seq=None):
         if rec["area_frac"] < min_area_eff:
             rej.append((stem, f"area-small({rec['area_frac']:.4f})"))
             continue
+        area_px = rec["area_frac"] * img_area
+        if area_px < args.min_gripper_area_px:
+            rej.append((stem, f"area-px-small({area_px:.0f})"))
+            continue
+        if rec["pre_subtract_area_frac"] > 0:
+            residual_frac = rec["area_frac"] / rec["pre_subtract_area_frac"]
+            if residual_frac < args.min_post_subtract_area_ratio:
+                rej.append((stem, f"post-subtract-small({residual_frac:.3f})"))
+                continue
         if rec["area_frac"] > args.max_area:
             rej.append((stem, f"area-large({rec['area_frac']:.4f})"))
             continue
@@ -494,6 +577,11 @@ def _filter_frames(centroids_json, ee_xyz_seq, W, H, args, ee_R_seq=None):
                 cx > W - args.edge_margin or cy > H - args.edge_margin):
             rej.append((stem, "edge"))
             continue
+        if ep_dir_seg is not None:
+            ok, reason = _robot_proximity_ok(ep_dir_seg, stem, c, W, H, args)
+            if not ok:
+                rej.append((stem, reason or "far-from-robot"))
+                continue
 
         pts3d.append(xyz)
         pts2d.append([cx, cy])
@@ -969,7 +1057,7 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
     K_mat = _K_to_mat(K)
 
     pts3d, pts2d, kept_stems, rejected, R_kept = _filter_frames(
-        centroids, ee, W, H, args, ee_R_seq=ee_R
+        centroids, ee, W, H, args, ee_R_seq=ee_R, ep_dir_seg=ep_dir_seg
     )
 
     result = {
@@ -1108,11 +1196,42 @@ def main():
                         "Floored at --min_area_px regardless.")
     p.add_argument("--min_area_px", type=int, default=16,
                    help="Absolute pixel floor for the gripper mask.")
+    p.add_argument(
+        "--min_gripper_area_px",
+        type=int,
+        default=40,
+        help="Stricter absolute pixel floor for post-subtraction gripper masks used by PnP.",
+    )
+    p.add_argument(
+        "--min_post_subtract_area_ratio",
+        type=float,
+        default=0.08,
+        help="Reject when arm subtraction leaves only this fraction of the original gripper mask.",
+    )
     p.add_argument("--max_area", type=float, default=0.4)
     p.add_argument("--edge_margin", type=int, default=4,
                    help="Reject centroids within N px of any image border.")
     p.add_argument("--reject_fragmented", action="store_true", default=True,
                    help="Reject frames whose mask has >1 connected component.")
+    p.add_argument(
+        "--require_gripper_near_robot",
+        action="store_true",
+        help="Reject gripper centroids that are far from robot/body masks. "
+             "Useful when gripper segmentation fires on a scene object.",
+    )
+    p.add_argument(
+        "--robot_mask_roots",
+        default="002,000",
+        help="Comma-separated mask folders used for robot proximity. "
+             "Default tries full robot 002, then arm 000.",
+    )
+    p.add_argument("--max_gripper_robot_dist_px", type=float, default=18.0)
+    p.add_argument("--min_robot_mask_area_px", type=int, default=64)
+    p.add_argument(
+        "--skip_if_robot_mask_missing",
+        action="store_true",
+        help="If set, reject frames when no robot/arm mask exists for proximity gating.",
+    )
 
     # PnP
     p.add_argument("--reproj_thresh", type=float, default=8.0)

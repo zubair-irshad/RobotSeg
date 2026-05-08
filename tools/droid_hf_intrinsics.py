@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import numpy as np
 
 
 HF_REPO = "KarlP/droid"

@@ -321,6 +321,10 @@ class _SimpleURDF:
             return np.zeros((0, 3), dtype=np.float64), np.zeros((0, 3), dtype=np.int32)
         return np.vstack(vertices_all), np.vstack(faces_all).astype(np.int32)
 
+    def filter_cfg(self, cfg: dict[str, float]) -> dict[str, float]:
+        joint_names = {joint.name for joint in self.joints}
+        return {name: value for name, value in cfg.items() if name in joint_names}
+
 
 class _YourdfpyURDF:
     def __init__(
@@ -370,6 +374,12 @@ class _YourdfpyURDF:
         if len(vertices) == 0 or len(faces) == 0:
             return np.zeros((0, 3), dtype=np.float64), np.zeros((0, 3), dtype=np.int32)
         return vertices, faces
+
+    def filter_cfg(self, cfg: dict[str, float]) -> dict[str, float]:
+        joint_map = getattr(self.robot, "joint_map", None)
+        if joint_map is None:
+            joint_map = getattr(self.robot, "_joint_map", {})
+        return {name: value for name, value in cfg.items() if name in joint_map}
 
     def _combined_mesh_by_link(
         self,
@@ -515,6 +525,7 @@ class URDFRobotMasker:
             g = float(np.clip(gripper_position, 0.0, 1.0))
             lo, hi = self._grip_span
             cfg[self.gripper_joint_name] = lo + g * (hi - lo)
+        cfg = self.robot.filter_cfg(cfg)
         return cfg
 
     def render(

@@ -87,6 +87,8 @@ def _entry_to_record(entry):
     uses. Handles both the new dict format and the legacy [cx,cy] list."""
     if entry is None:
         return {"centroid": None, "conf_mean": 0.0, "conf_max": 0.0,
+                "conf_p10": 0.0, "conf_p50": 0.0, "conf_p90": 0.0,
+                "stability_05_07": 0.0, "stability_05_09": 0.0,
                 "area_frac": 0.0, "n_components": 0,
                 "arm_overlap_frac": 1.0, "observed": False}
     if isinstance(entry, dict):
@@ -94,6 +96,11 @@ def _entry_to_record(entry):
             "centroid": entry.get("centroid"),
             "conf_mean": float(entry.get("conf_mean", 1.0)),
             "conf_max":  float(entry.get("conf_max", 1.0)),
+            "conf_p10":  float(entry.get("conf_p10", 1.0)),
+            "conf_p50":  float(entry.get("conf_p50", 1.0)),
+            "conf_p90":  float(entry.get("conf_p90", 1.0)),
+            "stability_05_07": float(entry.get("stability_05_07", 1.0)),
+            "stability_05_09": float(entry.get("stability_05_09", 1.0)),
             "area_frac": float(entry.get("area_frac", 0.0)),
             "n_components": int(entry.get("n_components", 1)),
             "arm_overlap_frac": float(entry.get("arm_overlap_frac", 0.0)),
@@ -104,6 +111,8 @@ def _entry_to_record(entry):
         }
     # Legacy list form (no quality info; assume good).
     return {"centroid": entry, "conf_mean": 1.0, "conf_max": 1.0,
+            "conf_p10": 1.0, "conf_p50": 1.0, "conf_p90": 1.0,
+            "stability_05_07": 1.0, "stability_05_09": 1.0,
             "area_frac": 0.0, "n_components": 1,
             "arm_overlap_frac": 0.0, "pre_subtract_area_frac": 0.0,
             "observed": True}
@@ -560,6 +569,18 @@ def _filter_frames(centroids_json, ee_xyz_seq, W, H, args, ee_R_seq=None,
             continue
         if rec["conf_max"] < args.min_conf_max:
             rej.append((stem, f"low-conf-max({rec['conf_max']:.2f})"))
+            continue
+        if rec["conf_p10"] < args.min_conf_p10:
+            rej.append((stem, f"low-conf-p10({rec['conf_p10']:.2f})"))
+            continue
+        if rec["conf_p50"] < args.min_conf_p50:
+            rej.append((stem, f"low-conf-p50({rec['conf_p50']:.2f})"))
+            continue
+        if rec["stability_05_07"] < args.min_stability_05_07:
+            rej.append((stem, f"unstable-05-07({rec['stability_05_07']:.2f})"))
+            continue
+        if rec["stability_05_09"] < args.min_stability_05_09:
+            rej.append((stem, f"unstable-05-09({rec['stability_05_09']:.2f})"))
             continue
         if rec["area_frac"] < min_area_eff:
             rej.append((stem, f"area-small({rec['area_frac']:.4f})"))
@@ -1196,6 +1217,16 @@ def main():
                    help="Reject if peak sigmoid prob inside the mask < this. Catches "
                         "frames where the model never strongly believed any pixel "
                         "was the gripper.")
+    p.add_argument("--min_conf_p10", type=float, default=0.0,
+                   help="Reject if the 10th percentile sigmoid prob inside the "
+                        "mask is below this. Useful for removing fuzzy masks that "
+                        "barely clear the 0.5 threshold.")
+    p.add_argument("--min_conf_p50", type=float, default=0.0,
+                   help="Reject if the median sigmoid prob inside the mask is below this.")
+    p.add_argument("--min_stability_05_07", type=float, default=0.0,
+                   help="Reject if area(prob>0.7) / area(prob>0.5) is below this.")
+    p.add_argument("--min_stability_05_09", type=float, default=0.0,
+                   help="Reject if area(prob>0.9) / area(prob>0.5) is below this.")
     p.add_argument("--max_arm_overlap", type=float, default=1.0,
                    help="Reject if PRE-subtraction the gripper mask overlapped the "
                         "arm mask by more than this fraction. Off by default (=1.0) "

@@ -27,6 +27,11 @@ import numpy as np
 from natsort import natsorted
 from tqdm import tqdm
 
+try:
+    from utils import guided_refine_mask
+except ImportError:
+    guided_refine_mask = None
+
 
 CATEGORY2ID = {"arm": "000", "gripper": "001", "robot": "002"}
 # BGR colors per category
@@ -105,23 +110,45 @@ def _mask_stats(mask_u8, prob_u8=None):
             "area_frac": 0.0,
             "conf_mean": 0.0,
             "conf_max": 0.0,
+            "conf_p10": 0.0,
+            "conf_p50": 0.0,
+            "conf_p90": 0.0,
+            "stability_05_07": 0.0,
+            "stability_05_09": 0.0,
             "n_components": 0,
         }
     ys, xs = np.where(sel)
     centroid = [float(xs.mean()), float(ys.mean())]
     n_components = int(cv2.connectedComponents(mask_u8 // 255)[0] - 1)
     if prob_u8 is not None:
-        p = prob_u8[sel].astype(np.float32) / 255.0
+        prob = prob_u8.astype(np.float32) / 255.0
+        p = prob[sel]
         conf_mean = float(p.mean())
         conf_max = float(p.max())
+        conf_p10, conf_p50, conf_p90 = [
+            float(x) for x in np.percentile(p, [10, 50, 90])
+        ]
+        area05 = max(1, int((prob > 0.5).sum()))
+        stability_05_07 = float((prob > 0.7).sum() / area05)
+        stability_05_09 = float((prob > 0.9).sum() / area05)
     else:
         conf_mean = 1.0
         conf_max = 1.0
+        conf_p10 = 1.0
+        conf_p50 = 1.0
+        conf_p90 = 1.0
+        stability_05_07 = 1.0
+        stability_05_09 = 1.0
     return {
         "centroid": centroid,
         "area_frac": n / float(h * w),
         "conf_mean": conf_mean,
         "conf_max": conf_max,
+        "conf_p10": conf_p10,
+        "conf_p50": conf_p50,
+        "conf_p90": conf_p90,
+        "stability_05_07": stability_05_07,
+        "stability_05_09": stability_05_09,
         "n_components": n_components,
     }
 
@@ -331,6 +358,17 @@ def process_sequences(args, gpu_id, seq_list):
                     stem = frame_stems[idx]
                     mask = stacked[k]
                     prob = probs[k]
+                    img = None
+                    if args.guided_filter and idx != 0:
+                        if guided_refine_mask is None:
+                            raise RuntimeError(
+                                "--guided_filter requested, but test/utils.py "
+                                "guided_refine_mask could not be imported"
+                            )
+                        img_path = os.path.join(orig_seq_path, frame_files[idx])
+                        img = cv2.imread(img_path)
+                        if img is not None:
+                            mask = guided_refine_mask(mask, img)
                     cat_masks[stem] = mask
                     cat_probs[stem] = prob
                     save_pool.submit(_save_png, os.path.join(out_dir, f"{stem}.png"), mask)
@@ -342,8 +380,9 @@ def process_sequences(args, gpu_id, seq_list):
                     centroid = stats_by_stem[stem]["centroid"]
 
                     if (args.save_overlay or args.save_centroid_viz) and need_images:
-                        img_path = os.path.join(orig_seq_path, frame_files[idx])
-                        img = cv2.imread(img_path)
+                        if img is None:
+                            img_path = os.path.join(orig_seq_path, frame_files[idx])
+                            img = cv2.imread(img_path)
                         if img is not None:
                             if args.save_overlay:
                                 save_pool.submit(
@@ -479,6 +518,8 @@ def main():
                    help="Save per-frame image with mask centroid marker drawn.")
     p.add_argument("--save_prob", action="store_true",
                    help="Save per-frame sigmoid probability map as <stem>_prob.png.")
+    p.add_argument("--guided_filter", action="store_true",
+                   help="Apply the author-provided guided_refine_mask before saving masks.")
     p.add_argument("--offload_to_cpu", action="store_true", default=True,
                    help="Pass offload_video_to_cpu=True / offload_state_to_cpu=True "
                         "to predictor.init_state. Big memory win for long episodes; "

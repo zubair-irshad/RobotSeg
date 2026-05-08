@@ -26,6 +26,10 @@ def main() -> None:
     parser.add_argument("--no_use_observed_flag", dest="use_observed_flag", action="store_false")
     parser.add_argument("--min_conf", type=float, default=0.5)
     parser.add_argument("--min_conf_max", type=float, default=0.5)
+    parser.add_argument("--min_conf_p10", type=float, default=0.0)
+    parser.add_argument("--min_conf_p50", type=float, default=0.0)
+    parser.add_argument("--min_stability_05_07", type=float, default=0.0)
+    parser.add_argument("--min_stability_05_09", type=float, default=0.0)
     parser.add_argument("--max_arm_overlap", type=float, default=1.0)
     parser.add_argument("--min_area", type=float, default=0.0002)
     parser.add_argument("--min_area_px", type=int, default=16)
@@ -86,7 +90,9 @@ def main() -> None:
                 f"  {stem}: {reason} "
                 f"centroid={rec['centroid']} observed={rec['observed']} "
                 f"area={post:.5f} pre={pre:.5f} ratio={ratio:.3f} "
-                f"conf_max={rec['conf_max']:.2f} comps={rec['n_components']} "
+                f"conf_p10={rec['conf_p10']:.2f} conf_p50={rec['conf_p50']:.2f} "
+                f"conf_max={rec['conf_max']:.2f} "
+                f"stab07={rec['stability_05_07']:.2f} comps={rec['n_components']} "
                 f"arm_overlap={rec['arm_overlap_frac']:.2f}"
             )
 

@@ -46,6 +46,7 @@ def main() -> None:
     parser.add_argument("--min_gripper_robot_disk_frac", type=float, default=0.25)
     parser.add_argument("--robot_mask_roots", default="002,000")
     parser.add_argument("--max_gripper_robot_dist_px", type=float, default=18.0)
+    parser.add_argument("--max_gripper_robot_dist_frac", type=float, default=0.035)
     parser.add_argument("--min_robot_mask_area_px", type=int, default=64)
     parser.add_argument("--skip_if_robot_mask_missing", action="store_true")
     parser.add_argument("--show_rejected", type=int, default=40)

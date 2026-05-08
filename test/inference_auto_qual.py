@@ -144,7 +144,12 @@ def _entry_reject_reason(entry):
     return None
 
 
-def _centroid_near_mask(mask_u8, centroid, max_dist_px):
+def _effective_dist_thresh(max_dist_px, max_dist_frac, h, w):
+    frac_thresh = float(max_dist_frac) * float(max(h, w))
+    return max(float(max_dist_px), frac_thresh)
+
+
+def _centroid_near_mask(mask_u8, centroid, max_dist_px, max_dist_frac):
     if mask_u8 is None or centroid is None:
         return False, "missing-reference-mask"
     robot = mask_u8 > 127
@@ -156,10 +161,11 @@ def _centroid_near_mask(mask_u8, centroid, max_dist_px):
         return False, "centroid-outside-image"
     if robot[cy, cx]:
         return True, None
+    thresh = _effective_dist_thresh(max_dist_px, max_dist_frac, h, w)
     inv = (~robot).astype(np.uint8)
     dist = float(cv2.distanceTransform(inv, cv2.DIST_L2, 3)[cy, cx])
-    if dist > max_dist_px:
-        return False, f"far-from-arm({dist:.1f}px)"
+    if dist > thresh:
+        return False, f"far-from-arm({dist:.1f}px>{thresh:.1f}px)"
     return True, None
 
 
@@ -169,7 +175,10 @@ def _mark_pnp_acceptance(stats, arm_mask, args):
         reason = "not-observed"
     elif args.require_gripper_near_arm:
         ok, reason = _centroid_near_mask(
-            arm_mask, stats.get("centroid"), args.max_gripper_arm_dist_px
+            arm_mask,
+            stats.get("centroid"),
+            args.max_gripper_arm_dist_px,
+            args.max_gripper_arm_dist_frac,
         )
         if ok:
             reason = None
@@ -672,6 +681,9 @@ def main():
     p.add_argument("--no_require_gripper_near_arm", dest="require_gripper_near_arm",
                    action="store_false")
     p.add_argument("--max_gripper_arm_dist_px", type=float, default=18.0)
+    p.add_argument("--max_gripper_arm_dist_frac", type=float, default=0.035,
+                   help="Resolution-scaled proximity floor: effective distance is "
+                        "max(--max_gripper_arm_dist_px, frac * max(H,W)).")
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()
 

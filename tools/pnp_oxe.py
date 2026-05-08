@@ -165,6 +165,10 @@ def _parse_mask_roots(text: str) -> list[str]:
     return [x.strip() for x in text.split(",") if x.strip()]
 
 
+def _effective_dist_thresh(max_dist_px: float, max_dist_frac: float, W: int, H: int) -> float:
+    return max(float(max_dist_px), float(max_dist_frac) * float(max(W, H)))
+
+
 def _robot_proximity_ok(ep_dir_seg: Path, stem: str, centroid: list[float],
                         W: int, H: int, args) -> tuple[bool, str | None]:
     if not args.require_gripper_near_robot and not args.require_gripper_inside_robot:
@@ -195,8 +199,14 @@ def _robot_proximity_ok(ep_dir_seg: Path, stem: str, centroid: list[float],
     inv = (~robot).astype(np.uint8)
     dt = cv2.distanceTransform(inv, cv2.DIST_L2, 3)
     dist = float(dt[cy, cx])
-    if dist > args.max_gripper_robot_dist_px:
-        return False, f"far-from-robot({dist:.1f}px)"
+    thresh = _effective_dist_thresh(
+        args.max_gripper_robot_dist_px,
+        args.max_gripper_robot_dist_frac,
+        W,
+        H,
+    )
+    if dist > thresh:
+        return False, f"far-from-robot({dist:.1f}px>{thresh:.1f}px)"
     return True, None
 
 
@@ -1303,6 +1313,9 @@ def main():
              "Default tries full robot 002, then arm 000.",
     )
     p.add_argument("--max_gripper_robot_dist_px", type=float, default=18.0)
+    p.add_argument("--max_gripper_robot_dist_frac", type=float, default=0.035,
+                   help="Resolution-scaled proximity floor: effective distance is "
+                        "max(--max_gripper_robot_dist_px, frac * max(H,W)).")
     p.add_argument("--min_robot_mask_area_px", type=int, default=64)
     p.add_argument(
         "--skip_if_robot_mask_missing",

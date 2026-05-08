@@ -54,6 +54,49 @@ def _load_json(path: Path) -> Any:
         return json.load(f)
 
 
+def _path_variants(path: str) -> list[str]:
+    vals = []
+    queue = [path, path.strip(), path.strip().rstrip("/")]
+    prefixes = (
+        "gs://xembodiment_data/",
+        "gs://gresearch/robotics/",
+        "r2d2/r2d2-data-full/",
+        "r2d2-data-full/",
+    )
+    for val in list(queue):
+        for prefix in prefixes:
+            if val.startswith(prefix):
+                queue.append(val[len(prefix):])
+    for val in queue:
+        if not val:
+            continue
+        vals.append(val)
+        vals.append(val.lstrip("/"))
+        if val.endswith("/trajectory.h5"):
+            vals.append(val[: -len("/trajectory.h5")])
+        if val.endswith("/recordings/MP4"):
+            vals.append(val[: -len("/recordings/MP4")])
+        for marker in ("/r2d2/r2d2-data-full/", "/r2d2-data-full/"):
+            if marker in val:
+                vals.append(val.split(marker, 1)[1])
+    out = []
+    seen = set()
+    for val in vals:
+        if val and val not in seen:
+            seen.add(val)
+            out.append(val)
+    return out
+
+
+def _build_path_to_id(episode_id_to_path: dict[str, Any]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for episode_id, value in episode_id_to_path.items():
+        for raw in _flatten_strings(value):
+            for variant in _path_variants(raw):
+                out.setdefault(variant, episode_id)
+    return out
+
+
 def _read_image_size(ep_dir: Path) -> tuple[int, int]:
     for p in sorted((ep_dir / "frames").glob("*")):
         if p.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
@@ -91,11 +134,9 @@ def _episode_id_from_metadata(meta: dict, path_to_id: dict[str, str]) -> str | N
         m = re.search(r"metadata_([^/\\]+)\.json", val)
         if m:
             return m.group(1)
-        if val in path_to_id:
-            return path_to_id[val]
-        stripped = val.replace("gs://gresearch/robotics/", "")
-        if stripped in path_to_id:
-            return path_to_id[stripped]
+        for cand in _path_variants(val):
+            if cand in path_to_id:
+                return path_to_id[cand]
         for path, episode_id in path_to_id.items():
             if path.endswith(val) or val.endswith(path):
                 return episode_id
@@ -135,6 +176,7 @@ def _load_episode_id_overrides(path: Path | None, dataset: str) -> dict[str, str
 
 def _resolve_episode_id(ep: str, ep_dir: Path, dataset: str,
                         overrides: dict[str, str],
+                        dataset_map_metadata: dict[str, dict],
                         path_to_id: dict[str, str],
                         intrinsics: dict[str, Any]) -> tuple[str | None, str]:
     for key in (f"{dataset}/{ep}", ep, str(ep_dir)):
@@ -157,6 +199,12 @@ def _resolve_episode_id(ep: str, ep_dir: Path, dataset: str,
         episode_id = _episode_id_from_metadata(meta, path_to_id)
         if episode_id is not None:
             return episode_id, "episode_metadata.json"
+
+    meta = dataset_map_metadata.get(ep)
+    if meta is not None:
+        episode_id = _episode_id_from_metadata(meta, path_to_id)
+        if episode_id is not None:
+            return episode_id, "dataset_map.json"
 
     return None, "no episode id mapping"
 
@@ -193,6 +241,27 @@ def _flatten_strings(x: Any) -> list[str]:
             out += _flatten_strings(v)
         return out
     return []
+
+
+def _load_dataset_map_metadata(oxe_root: Path, dataset: str) -> dict[str, dict]:
+    path = oxe_root / "dataset_map.json"
+    if not path.exists():
+        return {}
+    try:
+        data = _load_json(path)
+    except json.JSONDecodeError:
+        return {}
+    ds = data.get(dataset) if isinstance(data, dict) else None
+    episodes = ds.get("episodes", []) if isinstance(ds, dict) else []
+    out: dict[str, dict] = {}
+    for rec in episodes:
+        if not isinstance(rec, dict):
+            continue
+        ep = rec.get("episode_id")
+        meta = rec.get("episode_metadata")
+        if isinstance(ep, str) and isinstance(meta, dict):
+            out[ep] = meta
+    return out
 
 
 def _serial_for_camera(serial_meta: Any, camera: str,
@@ -319,7 +388,7 @@ def main() -> None:
     paths = {name: _ensure_file(args.cache_dir, name) for name in FILES}
     intrinsics = _load_json(paths["intrinsics.json"])
     episode_id_to_path = _load_json(paths["episode_id_to_path.json"])
-    path_to_id = {v: k for k, v in episode_id_to_path.items()}
+    path_to_id = _build_path_to_id(episode_id_to_path)
     camera_serials = _load_json(paths["camera_serials.json"])
 
     ds_root = args.oxe_root / args.dataset
@@ -330,6 +399,7 @@ def main() -> None:
                                                       args.dataset)
     if episode_id_json is not None:
         print(f"Using episode id map: {episode_id_json}")
+    dataset_map_metadata = _load_dataset_map_metadata(args.oxe_root, args.dataset)
 
     episodes = args.episodes or sorted(
         p.name for p in ds_root.iterdir()
@@ -337,11 +407,13 @@ def main() -> None:
     )
 
     out = {args.dataset: {}}
+    resolved_episode_id_map: dict[str, str] = {}
     missing = []
     for ep in episodes:
         ep_dir = ds_root / ep
         episode_id, id_source = _resolve_episode_id(ep, ep_dir, args.dataset,
                                                     episode_id_overrides,
+                                                    dataset_map_metadata,
                                                     path_to_id, intrinsics)
         if episode_id is None:
             missing.append((ep, id_source))
@@ -366,6 +438,7 @@ def main() -> None:
             f"camera={args.camera} serial={serial}"
         )
         out[args.dataset][ep] = K
+        resolved_episode_id_map[ep] = episode_id
         print(
             f"[{ep}] id={episode_id} ({id_source}) serial={serial} "
             f"raw={K['raw_width']}x{K['raw_height']} -> {W}x{H} "
@@ -375,6 +448,10 @@ def main() -> None:
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(out, indent=2))
     print(f"\nWrote {args.out_json} with {len(out[args.dataset])} episode K entries")
+    if resolved_episode_id_map:
+        map_path = ds_root / "episode_id_map.json"
+        map_path.write_text(json.dumps({args.dataset: resolved_episode_id_map}, indent=2))
+        print(f"Wrote resolved episode id map: {map_path}")
     if missing:
         print("\nMissing:")
         for ep, reason in missing:

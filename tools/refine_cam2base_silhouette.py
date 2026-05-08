@@ -238,6 +238,10 @@ def _write_viz(args: argparse.Namespace, ep_oxe: Path, ep_seg: Path,
         return
     out_dir = ep_seg / args.viz_dir_name
     out_dir.mkdir(parents=True, exist_ok=True)
+    render_mask_dir = out_dir / "render_masks"
+    target_mask_dir = out_dir / "target_masks"
+    render_mask_dir.mkdir(exist_ok=True)
+    target_mask_dir.mkdir(exist_ok=True)
     H, W = int(K["height"]), int(K["width"])
     row_by_stem = {str(row["stem"]): row for row in rows}
     for sample in samples:
@@ -256,6 +260,8 @@ def _write_viz(args: argparse.Namespace, ep_oxe: Path, ep_seg: Path,
         if rec is None:
             rec = _mask_metrics(sample["target"], render, args.distance_clip)
         cv2.imwrite(str(out_dir / f"{stem}.jpg"), _make_score_viz(img, sample["target"], render, rec))
+        cv2.imwrite(str(render_mask_dir / f"{stem}.png"), render.astype(np.uint8) * 255)
+        cv2.imwrite(str(target_mask_dir / f"{stem}.png"), sample["target"].astype(np.uint8) * 255)
 
 
 def _process_episode(args: argparse.Namespace, masker: URDFRobotMasker,

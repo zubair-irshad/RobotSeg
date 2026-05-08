@@ -1079,6 +1079,22 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
             K["source"] = K_moge.get("source", "moge-2")
             selected_from = "moge"
 
+    if K is None and args.no_hfov_fallback:
+        if args.print_intrinsics:
+            print(
+                f"  [K/{ds_name}/{ep_dir_seg.name}] "
+                f"trajectory={_fmt_K(traj_K)} camera={_fmt_K(camera_K)} "
+                f"moge={_fmt_K(K_moge)} selected=none"
+            )
+        return {
+            "status": "skip-no-non-hfov-intrinsics",
+            "episode": ep_dir_seg.name,
+            "dataset": ds_name,
+            "image_size": [W, H],
+            "camera_json_exists": (ep_dir_oxe / "camera.json").exists(),
+            "trajectory_K_candidates": traj_K_candidates,
+        }
+
     if K is None:
         K = _default_K(W, H, args.hfov_deg)
         K["source"] = f"hfov={args.hfov_deg}deg"
@@ -1348,6 +1364,10 @@ def main():
                         "or per-episode camera.json intrinsics. If none are "
                         "usable, skip the episode instead of falling back to "
                         "MoGe/HFOV/estimated intrinsics.")
+    p.add_argument("--no_hfov_fallback", action="store_true",
+                   help="Skip episodes if --K_json/camera/trajectory/MoGe did "
+                        "not provide intrinsics. Use with --moge_intrinsics to "
+                        "avoid silently falling back to the HFOV guess.")
 
     p.add_argument("--solve_tool_offset", action="store_true",
                    help="Jointly estimate (R, t, offset_tool) where offset_tool "

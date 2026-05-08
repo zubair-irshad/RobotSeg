@@ -52,6 +52,21 @@ echo "==> extract matching raw-MP4 frames"
   --max_frames_per_seq "$MAX_FRAMES_PER_SEQ" \
   "${DOWNLOAD_ARGS[@]}"
 
+RAW_SUMMARY="$RAW_FRAME_ROOT/$DATASET/raw_mp4_extract_summary.json"
+RAW_OK_COUNT="$("$PYTHON" - "$RAW_SUMMARY" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    data = json.load(f)
+print(sum(1 for r in data.get("results", []) if r.get("status") == "ok" and r.get("num_saved", 0) > 0))
+PY
+)"
+if [[ "$RAW_OK_COUNT" == "0" ]]; then
+  echo "No raw MP4 frames were extracted. Stopping before RobotSeg." >&2
+  echo "Inspect: $RAW_SUMMARY" >&2
+  exit 1
+fi
+
 cd "$REPO_ROOT/test"
 
 echo

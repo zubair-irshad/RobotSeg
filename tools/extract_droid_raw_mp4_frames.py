@@ -13,6 +13,7 @@ Output layout mirrors the OXE subset:
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import shutil
@@ -84,6 +85,29 @@ def _path_candidates(raw_value: Any) -> list[str]:
     return uniq
 
 
+def _episode_id_path_candidates(episode_id: str) -> list[str]:
+    """Derive droid_raw/1.0.1 paths from raw IDs like LAB+uuid+timestamp."""
+    parts = episode_id.split("+")
+    if len(parts) < 3:
+        return []
+    lab = parts[0]
+    stamp = parts[-1]
+    try:
+        when = dt.datetime.strptime(stamp, "%Y-%m-%d-%Hh-%Mm-%Ss")
+    except ValueError:
+        return []
+    date_s = when.strftime("%Y-%m-%d")
+    # Raw sessions are named e.g. Tue_Dec_19_22:57:46_2023. Use wildcards
+    # for weekday/month/day formatting differences and success/failure split.
+    time_s = when.strftime("%H:%M:%S")
+    year_s = when.strftime("%Y")
+    return [
+        f"1.0.1/{lab}/*/{date_s}/*_{time_s}_{year_s}/recordings/MP4",
+        f"1.0.1/{lab}/success/{date_s}/*_{time_s}_{year_s}/recordings/MP4",
+        f"1.0.1/{lab}/failure/{date_s}/*_{time_s}_{year_s}/recordings/MP4",
+    ]
+
+
 def _gsutil_ls(pattern: str) -> list[str]:
     proc = subprocess.run(
         ["gsutil", "ls", pattern],
@@ -100,9 +124,11 @@ def _gsutil_ls(pattern: str) -> list[str]:
 def _find_gcs_mp4(args, episode_id: str, episode_id_to_path: dict[str, Any],
                   serial: str | None) -> str | None:
     raw_value = episode_id_to_path.get(episode_id)
-    if raw_value is None:
-        return None
-    for rel in _path_candidates(raw_value):
+    rels = []
+    if raw_value is not None:
+        rels += _path_candidates(raw_value)
+    rels += _episode_id_path_candidates(episode_id)
+    for rel in rels:
         bases = []
         if rel.startswith("gs://"):
             bases.append(rel)
@@ -111,6 +137,8 @@ def _find_gcs_mp4(args, episode_id: str, episode_id_to_path: dict[str, Any],
             hits = _gsutil_ls(f"{base.rstrip('/')}/*.mp4")
             if not hits:
                 hits = _gsutil_ls(f"{base.rstrip('/')}/*/*.mp4")
+            if not hits:
+                hits = _gsutil_ls(f"{base.rstrip('/')}/*/*/*.mp4")
             if serial:
                 serial_hits = [h for h in hits if serial in Path(h).name or serial in h]
                 if serial_hits:
@@ -140,7 +168,7 @@ def _download_mp4(args, episode_id: str, gcs_uri: str, serial: str | None) -> Pa
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists() and dst.stat().st_size > 0:
         return dst
-    subprocess.run(["gsutil", "cp", gcs_uri, str(dst)], check=True)
+    subprocess.run(["gsutil", "-m", "cp", gcs_uri, str(dst)], check=True)
     return dst
 
 

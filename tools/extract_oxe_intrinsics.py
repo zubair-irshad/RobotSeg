@@ -23,7 +23,7 @@ THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 from oxe_registry import OXE_DATASETS, DEFAULT_DATASETS_FOR_PNP  # noqa: E402
 from download_oxe_subset import (  # noqa: E402
-    GCS_ROOT, _lazy_import_tfds, extract_intrinsics,
+    GCS_ROOT, _jsonable, _lazy_import_tfds, extract_intrinsics,
 )
 
 
@@ -60,6 +60,13 @@ def main():
             ep_dir = ds_root / f"episode_{i:04d}"
             if not ep_dir.exists():
                 continue
+            try:
+                ep_meta = _jsonable(episode["episode_metadata"])
+                (ep_dir / "episode_metadata.json").write_text(
+                    json.dumps(ep_meta, indent=2)
+                )
+            except Exception:
+                pass
             try:
                 first_step = next(iter(episode["steps"].as_numpy_iterator()))
             except StopIteration:

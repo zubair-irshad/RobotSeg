@@ -83,6 +83,24 @@ def _to_numpy(x):
     return x
 
 
+def _jsonable(x):
+    """Convert TFDS metadata leaves to JSON-safe Python values."""
+    x = _to_numpy(x)
+    if isinstance(x, dict):
+        return {str(k): _jsonable(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_jsonable(v) for v in x]
+    if isinstance(x, np.ndarray):
+        if x.ndim == 0:
+            return _jsonable(x.item())
+        return x.tolist()
+    if isinstance(x, bytes):
+        return x.decode("utf-8", errors="replace")
+    if isinstance(x, np.generic):
+        return x.item()
+    return x
+
+
 # ----- camera intrinsics extraction -------------------------------------
 # Scan the RLDS feature spec / a step / episode_metadata for anything that
 # looks like camera intrinsics, so we don't have to guess at PnP time.
@@ -204,6 +222,12 @@ def process_episode(episode, cfg: dict, ep_dir: Path, frame_stride: int) -> dict
     steps = list(episode["steps"].as_numpy_iterator())
     if not steps:
         return {"num_frames_saved": 0, "num_steps_total": 0}
+
+    try:
+        ep_meta = _jsonable(episode["episode_metadata"])
+        (ep_dir / "episode_metadata.json").write_text(json.dumps(ep_meta, indent=2))
+    except Exception:
+        ep_meta = None
 
     # Save any intrinsics-like fields the RLDS publishes so PnP doesn't guess.
     cam_meta = extract_intrinsics(episode, steps[0])

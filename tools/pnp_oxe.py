@@ -135,6 +135,117 @@ def _K_from_camera_json(cam_json: dict, W: int, H: int) -> dict | None:
     return best[1] if best else None
 
 
+def _normalize_if_needed(K: np.ndarray, W: int, H: int) -> tuple[np.ndarray, str]:
+    """Scale normalized intrinsics to pixels when they look like [0..1] K."""
+    K = np.asarray(K, dtype=np.float64).copy()
+    normalized = (
+        0 < K[0, 0] <= 5.0 and 0 < K[1, 1] <= 5.0
+        and 0 <= K[0, 2] <= 1.5 and 0 <= K[1, 2] <= 1.5
+    )
+    if normalized:
+        K[0, 0] *= W
+        K[1, 1] *= H
+        K[0, 2] *= W
+        K[1, 2] *= H
+        return K, ":normalized"
+    return K, ""
+
+
+def _K_candidate_from_array(arr: np.ndarray, path: str, W: int, H: int) -> dict | None:
+    """Parse a plausible K from one trajectory.npz array."""
+    try:
+        arr = np.asarray(arr)
+    except Exception:
+        return None
+    if arr.dtype.kind not in "fiu":
+        return None
+    try:
+        data = arr.astype(np.float64)
+    except Exception:
+        return None
+    if not np.all(np.isfinite(data)):
+        data = data[np.isfinite(data)]
+        if data.size == 0:
+            return None
+
+    K = None
+    if data.size == 9:
+        K = data.reshape(3, 3)
+    elif data.ndim >= 2 and data.shape[-2:] == (3, 3):
+        mats = data.reshape(-1, 3, 3)
+        mats = mats[np.all(np.isfinite(mats), axis=(1, 2))]
+        if len(mats):
+            K = np.median(mats, axis=0)
+    elif data.shape[-1:] == (4,):
+        rows = data.reshape(-1, 4)
+        rows = rows[np.all(np.isfinite(rows), axis=1)]
+        if len(rows):
+            fx, fy, cx, cy = np.median(rows, axis=0).tolist()
+            K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1.0]],
+                         dtype=np.float64)
+
+    if K is None:
+        return None
+    K, suffix = _normalize_if_needed(K, W, H)
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    if fx <= 0 or fy <= 0:
+        return None
+    if not (0 <= cx <= W and 0 <= cy <= H):
+        return None
+    if fx < 0.1 * W or fy < 0.1 * H or fx > 20 * W or fy > 20 * H:
+        return None
+
+    name = path.lower()
+    hint_bonus = 1000.0 if any(
+        h in name for h in (
+            "intrinsic", "camera_matrix", "camera_k", "cam_k",
+            "exterior_image_1_left", "image_1_left", "left",
+        )
+    ) else 0.0
+    center_score = -(abs(cx - 0.5 * W) + abs(cy - 0.5 * H))
+    aspect_score = -abs((fx / max(fy, 1e-9)) - (W / max(H, 1)))
+    return {
+        "fx": fx, "fy": fy, "cx": cx, "cy": cy,
+        "width": W, "height": H,
+        "source": f"trajectory.npz:{path}{suffix}",
+        "_score": float(hint_bonus + center_score + 20.0 * aspect_score),
+    }
+
+
+def _K_from_trajectory_npz(traj, W: int, H: int) -> tuple[dict | None, list[dict]]:
+    """Scan trajectory.npz for stored camera intrinsics.
+
+    Handles direct 3x3 K, flattened 9-vector K, packed [fx,fy,cx,cy], and
+    per-frame stacks of those. Returns (best, candidates).
+    """
+    candidates = []
+    for key in getattr(traj, "files", []):
+        try:
+            cand = _K_candidate_from_array(traj[key], key, W, H)
+        except Exception:
+            cand = None
+        if cand is not None:
+            candidates.append(cand)
+    candidates.sort(key=lambda c: c.get("_score", 0.0), reverse=True)
+    public = []
+    for cand in candidates:
+        clean = dict(cand)
+        clean.pop("_score", None)
+        public.append(clean)
+    return (public[0] if public else None), public
+
+
+def _fmt_K(K: dict | None) -> str:
+    if not K:
+        return "none"
+    return (
+        f"{K.get('source', '?')} "
+        f"fx={float(K['fx']):.2f} fy={float(K['fy']):.2f} "
+        f"cx={float(K['cx']):.2f} cy={float(K['cy']):.2f}"
+    )
+
+
 def _default_K(W: int, H: int, hfov_deg: float) -> dict:
     fx = 0.5 * W / math.tan(0.5 * math.radians(hfov_deg))
     return {"fx": fx, "fy": fx, "cx": 0.5 * W, "cy": 0.5 * H,
@@ -145,6 +256,32 @@ def _K_to_mat(K: dict) -> np.ndarray:
     return np.array([[K["fx"], 0, K["cx"]],
                      [0, K["fy"], K["cy"]],
                      [0, 0, 1.0]], dtype=np.float64)
+
+
+def _lookup_K_override(K_overrides: dict, ds_name: str, ep_name: str) -> dict | None:
+    """Accept dataset-wide or per-episode K override JSONs.
+
+    Supported forms:
+      {"droid": {"fx":..., "fy":..., "cx":..., "cy":...}}
+      {"droid": {"episode_0000": {"fx":...}}}
+      {"droid/episode_0000": {"fx":...}}
+      {"episode_0000": {"fx":...}}
+    """
+    if not K_overrides:
+        return None
+    for key in (f"{ds_name}/{ep_name}", ep_name):
+        val = K_overrides.get(key)
+        if isinstance(val, dict) and all(k in val for k in ("fx", "fy", "cx", "cy")):
+            return val
+
+    ds_val = K_overrides.get(ds_name)
+    if isinstance(ds_val, dict):
+        if all(k in ds_val for k in ("fx", "fy", "cx", "cy")):
+            return ds_val
+        ep_val = ds_val.get(ep_name)
+        if isinstance(ep_val, dict) and all(k in ep_val for k in ("fx", "fy", "cx", "cy")):
+            return ep_val
+    return None
 
 
 def _read_image_size(seq_frames_dir: Path) -> tuple[int, int] | None:
@@ -590,43 +727,73 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
         return {"status": "skip-no-image", "episode": ep_dir_seg.name}
     W, H = img_size
 
+    traj_K, traj_K_candidates = _K_from_trajectory_npz(traj, W, H)
+
     # Resolution order for K:
     #   --K_json override
+    # > trajectory.npz intrinsics (--trajectory_intrinsics)
     # > per-episode camera.json (saved by download_oxe_subset.py from RLDS)
     # > MoGe-2 robust-median estimate over N sampled frames (--moge_intrinsics)
     # > HFOV guess (default).
     K = None
+    selected_from = None
     if K_override is not None:
         K = dict(K_override)
         K.setdefault("width", W)
         K.setdefault("height", H)
         K["source"] = "K_json"
-    if K is None:
-        cam_path = ep_dir_oxe / "camera.json"
-        if cam_path.exists():
-            try:
-                cam_json = json.loads(cam_path.read_text())
-                K = _K_from_camera_json(cam_json, W, H)
-            except Exception:
-                K = None
+        selected_from = "K_json"
+    if K is None and args.trajectory_intrinsics and traj_K is not None:
+        K = dict(traj_K)
+        selected_from = "trajectory"
+    if args.require_trajectory_intrinsics and traj_K is None:
+        if args.print_intrinsics:
+            print(f"  [K/{ds_name}/{ep_dir_seg.name}] trajectory=none")
+        return {
+            "status": "skip-no-trajectory-intrinsics",
+            "episode": ep_dir_seg.name,
+            "dataset": ds_name,
+            "image_size": [W, H],
+            "trajectory_K_candidates": traj_K_candidates,
+        }
+    camera_K = None
+    cam_path = ep_dir_oxe / "camera.json"
+    if cam_path.exists():
+        try:
+            cam_json = json.loads(cam_path.read_text())
+            camera_K = _K_from_camera_json(cam_json, W, H)
+        except Exception:
+            camera_K = None
+    if K is None and camera_K is not None:
+        K = camera_K
+        selected_from = "camera_json"
     K_known = K is not None
     if args.require_known_intrinsics and not K_known:
+        if args.print_intrinsics:
+            print(
+                f"  [K/{ds_name}/{ep_dir_seg.name}] "
+                f"trajectory={_fmt_K(traj_K)} camera={_fmt_K(camera_K)} selected=none"
+            )
         return {
             "status": "skip-no-known-intrinsics",
             "episode": ep_dir_seg.name,
             "dataset": ds_name,
             "image_size": [W, H],
             "camera_json_exists": (ep_dir_oxe / "camera.json").exists(),
+            "trajectory_K_candidates": traj_K_candidates,
         }
 
     K_moge = None
+    moge_cache_K = None
+    moge_cache = ep_dir_seg / "moge_K.json"
+    if moge_cache.exists():
+        try:
+            moge_cache_K = json.loads(moge_cache.read_text())
+        except Exception:
+            moge_cache_K = None
     if K is None and args.moge_intrinsics:
-        moge_cache = ep_dir_seg / "moge_K.json"
-        if moge_cache.exists() and not args.moge_recompute:
-            try:
-                K_moge = json.loads(moge_cache.read_text())
-            except Exception:
-                K_moge = None
+        if moge_cache_K is not None and not args.moge_recompute:
+            K_moge = moge_cache_K
         if K_moge is None:
             from moge_intrinsics import estimate_K_for_frames
             K_moge = estimate_K_for_frames(
@@ -641,10 +808,20 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
         if K_moge is not None:
             K = {k: K_moge[k] for k in ("fx", "fy", "cx", "cy", "width", "height")}
             K["source"] = K_moge.get("source", "moge-2")
+            selected_from = "moge"
 
     if K is None:
         K = _default_K(W, H, args.hfov_deg)
         K["source"] = f"hfov={args.hfov_deg}deg"
+        selected_from = "hfov"
+    if args.print_intrinsics:
+        print(
+            f"  [K/{ds_name}/{ep_dir_seg.name}] "
+            f"trajectory={_fmt_K(traj_K)} | "
+            f"camera={_fmt_K(camera_K)} | "
+            f"moge_cache={_fmt_K(moge_cache_K)} | "
+            f"selected({selected_from})={_fmt_K(K)}"
+        )
     K_mat = _K_to_mat(K)
 
     pts3d, pts2d, kept_stems, rejected, R_kept = _filter_frames(
@@ -657,6 +834,8 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
         "image_size": [W, H],
         "K": K,
         "K_known": K_known,
+        "K_selected_from": selected_from,
+        "trajectory_K_candidates": traj_K_candidates,
         "num_total": len(centroids),
         "num_kept_after_filter": len(kept_stems),
         "rejection_breakdown": _rejection_breakdown(rejected),
@@ -810,10 +989,21 @@ def main():
     p.add_argument("--moge_recompute", action="store_true",
                    help="Ignore cached <ep>/moge_K.json and re-run MoGe-2.")
     p.add_argument("--moge_verbose", action="store_true")
+    p.add_argument("--trajectory_intrinsics", action="store_true",
+                   help="Prefer intrinsics found inside trajectory.npz before "
+                        "camera.json / MoGe / HFOV. Scans for K, flattened K, "
+                        "or packed [fx,fy,cx,cy] arrays.")
+    p.add_argument("--require_trajectory_intrinsics", action="store_true",
+                   help="Skip episodes that do not contain usable trajectory.npz "
+                        "intrinsics. Implies no fallback to camera.json/MoGe/HFOV.")
+    p.add_argument("--print_intrinsics", action="store_true",
+                   help="Print trajectory, camera.json, cached MoGe, and selected "
+                        "intrinsics for each episode.")
     p.add_argument("--require_known_intrinsics", action="store_true",
-                   help="Use only --K_json or per-episode camera.json intrinsics. "
-                        "If neither is usable, skip the episode instead of "
-                        "falling back to MoGe/HFOV/estimated intrinsics.")
+                   help="Use only --K_json, requested trajectory.npz intrinsics, "
+                        "or per-episode camera.json intrinsics. If none are "
+                        "usable, skip the episode instead of falling back to "
+                        "MoGe/HFOV/estimated intrinsics.")
 
     p.add_argument("--solve_tool_offset", action="store_true",
                    help="Jointly estimate (R, t, offset_tool) where offset_tool "
@@ -870,10 +1060,10 @@ def main():
             print(f"[skip] {ds}: no episodes")
             continue
 
-        K_override = K_overrides.get(ds)
         results = []
         for ep_seg in episodes:
             ep_oxe = ds_oxe / ep_seg.name
+            K_override = _lookup_K_override(K_overrides, ds, ep_seg.name)
             r = process_episode(ds, ep_oxe, ep_seg, K_override, args)
             results.append(r)
             tag = r.get("status", "?")
@@ -887,6 +1077,7 @@ def main():
                              f"({r['tool_offset_norm_m']*100:.1f}cm)")
                 extra = (f"  rmse={r['rmse_px']:.2f}px  "
                          f"inliers={r['num_inliers']}/{r['num_kept_after_filter']}"
+                         f"  K={r.get('K', {}).get('source', '?')}"
                          f"{off_s}")
             elif "rejection_breakdown" in r:
                 extra = (f"  kept={r['num_kept_after_filter']}/{r['num_total']}"

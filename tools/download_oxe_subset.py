@@ -101,6 +101,36 @@ def _jsonable(x):
     return x
 
 
+def _droid_episode_key_from_metadata(meta: dict | None) -> str | None:
+    """Best-effort raw DROID key extraction from RLDS episode_metadata.
+
+    DROID metadata exposes paths like recording_folderpath/file_path. Some
+    releases include the raw episode key directly in a metadata filename such
+    as metadata_AUTOLab+...json. Keep this local and best-effort; the HF
+    intrinsics tool can still resolve paths through episode_id_to_path.json.
+    """
+    if not isinstance(meta, dict):
+        return None
+    vals: list[str] = []
+    for key in ("episode_id", "id", "recording_folderpath", "file_path"):
+        val = meta.get(key)
+        if isinstance(val, str) and val:
+            vals.append(val)
+    rec = meta.get("recording_folderpath")
+    fp = meta.get("file_path")
+    if isinstance(rec, str) and isinstance(fp, str):
+        vals += [f"{rec}/{fp}", f"{rec}--{fp}"]
+    for val in vals:
+        name = Path(val).name
+        if name.startswith("metadata_") and name.endswith(".json"):
+            return name[len("metadata_"):-len(".json")]
+        if "+" in val:
+            for part in val.replace("\\", "/").split("/"):
+                if part.count("+") >= 2:
+                    return part.removeprefix("metadata_").removesuffix(".json")
+    return None
+
+
 # ----- camera intrinsics extraction -------------------------------------
 # Scan the RLDS feature spec / a step / episode_metadata for anything that
 # looks like camera intrinsics, so we don't have to guess at PnP time.
@@ -338,7 +368,7 @@ def process_episode(episode, cfg: dict, ep_dir: Path, frame_stride: int) -> dict
         f"state_schema: {cfg['state_schema']}\n"
     )
 
-    return {
+    out_meta = {
         "num_frames_saved": len(kept_idx),
         "num_steps_total": len(steps),
         "rgb_key_used": rgb_key,
@@ -346,6 +376,12 @@ def process_episode(episode, cfg: dict, ep_dir: Path, frame_stride: int) -> dict
         "joint_dim": int(joint_positions[0].shape[0]) if joint_positions else 0,
         "action_dim": int(actions[0].shape[0]) if actions else 0,
     }
+    if ep_meta is not None:
+        out_meta["episode_metadata"] = ep_meta
+        droid_key = _droid_episode_key_from_metadata(ep_meta)
+        if droid_key is not None:
+            out_meta["droid_episode_id"] = droid_key
+    return out_meta
 
 
 def process_dataset(name: str, cfg: dict, out_dir: Path,
@@ -369,20 +405,31 @@ def process_dataset(name: str, cfg: dict, out_dir: Path,
     ds_out.mkdir(parents=True, exist_ok=True)
 
     episodes_meta = []
+    episode_id_map: dict[str, str] = {}
     for i, episode in enumerate(tqdm(ds, total=num_episodes, desc=name)):
-        ep_dir = ds_out / f"episode_{i:04d}"
+        local_ep = f"episode_{i:04d}"
+        ep_dir = ds_out / local_ep
         try:
             meta = process_episode(episode, cfg, ep_dir, frame_stride)
-            meta["episode_id"] = f"episode_{i:04d}"
+            meta["episode_id"] = local_ep
+            droid_episode_id = meta.get("droid_episode_id")
+            if isinstance(droid_episode_id, str):
+                episode_id_map[local_ep] = droid_episode_id
             episodes_meta.append(meta)
         except Exception as e:
             print(f"  [warn] episode {i} failed: {e}")
+
+    if episode_id_map:
+        (ds_out / "episode_id_map.json").write_text(
+            json.dumps({name: episode_id_map}, indent=2)
+        )
 
     return {
         "embodiment": cfg["embodiment"],
         "version": cfg["version"],
         "state_schema": cfg["state_schema"],
         "num_episodes": len(episodes_meta),
+        "episode_id_map": episode_id_map,
         "episodes": episodes_meta,
     }
 

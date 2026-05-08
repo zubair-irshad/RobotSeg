@@ -321,10 +321,16 @@ def main() -> None:
     episode_id_to_path = _load_json(paths["episode_id_to_path.json"])
     path_to_id = {v: k for k, v in episode_id_to_path.items()}
     camera_serials = _load_json(paths["camera_serials.json"])
-    episode_id_overrides = _load_episode_id_overrides(args.episode_id_json,
-                                                      args.dataset)
 
     ds_root = args.oxe_root / args.dataset
+    episode_id_json = args.episode_id_json
+    if episode_id_json is None and (ds_root / "episode_id_map.json").exists():
+        episode_id_json = ds_root / "episode_id_map.json"
+    episode_id_overrides = _load_episode_id_overrides(episode_id_json,
+                                                      args.dataset)
+    if episode_id_json is not None:
+        print(f"Using episode id map: {episode_id_json}")
+
     episodes = args.episodes or sorted(
         p.name for p in ds_root.iterdir()
         if p.is_dir() and not p.name.startswith(".") and not p.name.startswith("_")

@@ -65,6 +65,15 @@ def _mask_path(root: Path, stem: str) -> Path | None:
     return None
 
 
+def _is_primary_mask_image(path: Path) -> bool:
+    if path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+        return False
+    stem = path.stem
+    if stem.startswith("_"):
+        return False
+    return not stem.endswith(("_overlay", "_prob", "_centroid"))
+
+
 def _read_mask(path: Path, shape_hw: tuple[int, int]) -> np.ndarray | None:
     img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if img is None:
@@ -116,7 +125,7 @@ def _available_stems(ep_seg: Path, mask_dirs: list[str]) -> list[str]:
         if not root.exists():
             continue
         for p in root.iterdir():
-            if p.suffix.lower() in {".png", ".jpg", ".jpeg"}:
+            if _is_primary_mask_image(p):
                 stems.add(p.stem)
     return sorted(stems)
 
@@ -232,27 +241,40 @@ def process_episode(args: argparse.Namespace, masker: URDFRobotMasker,
     if args.auto_robot_mask and (ep_seg / "002").exists():
         mask_dirs = ["002"]
     stems = _available_stems(ep_seg, mask_dirs)
+    num_candidate_stems = len(stems)
     if args.frame_stride > 1:
         stems = stems[::args.frame_stride]
     if args.max_frames > 0:
         stems = stems[:args.max_frames]
 
     rows = []
+    skip_counts: dict[str, int] = {}
+
+    def skip(reason: str) -> None:
+        skip_counts[reason] = skip_counts.get(reason, 0) + 1
+
     for stem in stems:
         try:
             idx = int(stem)
         except ValueError:
+            skip("non-integer-stem")
             continue
         if idx >= len(joints):
+            skip("idx-out-of-range")
             continue
         target = _load_target_mask(
             ep_seg, stem, mask_dirs, (H, W),
             subtract_dirs=args.subtract_mask_dirs,
         )
         if target is None:
+            skip("missing-target-mask")
             continue
         area_frac = float(target.sum()) / float(H * W)
-        if area_frac < args.min_target_area or area_frac > args.max_target_area:
+        if area_frac < args.min_target_area:
+            skip("target-area-small")
+            continue
+        if area_frac > args.max_target_area:
+            skip("target-area-large")
             continue
         render = masker.render(
             K,
@@ -280,6 +302,9 @@ def process_episode(args: argparse.Namespace, masker: URDFRobotMasker,
         "T_source": T_source,
         "mask_dirs": mask_dirs,
         "subtract_mask_dirs": args.subtract_mask_dirs,
+        "num_candidate_stems": num_candidate_stems,
+        "num_stems_after_sampling": len(stems),
+        "skip_counts": skip_counts,
         "render_include_prefixes": list(args.render_include_prefixes or ()),
         "render_exclude_prefixes": list(args.render_exclude_prefixes or ()),
         "metrics": agg,
@@ -366,7 +391,14 @@ def main() -> None:
                 f"n={int(metrics.get('n', 0))}"
             )
         else:
-            print(f"[{args.dataset}/{ep}] {result.get('status')}")
+            extra = ""
+            if result.get("status") == "bad-no-scored-frames":
+                extra = (
+                    f" candidates={result.get('num_candidate_stems', 0)} "
+                    f"sampled={result.get('num_stems_after_sampling', 0)} "
+                    f"skips={result.get('skip_counts', {})}"
+                )
+            print(f"[{args.dataset}/{ep}] {result.get('status')}{extra}")
 
     out_path = args.out_json
     if out_path is None:

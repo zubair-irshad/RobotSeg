@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Run PnP on raw-MP4 DROID RobotSeg masks and compare to multiview GT.
-# No silhouette/differentiable refinement is run here.
+# Run PnP on raw-MP4 DROID RobotSeg masks, refine the pose against rendered
+# body silhouettes, and compare original/refined extrinsics to multiview GT.
 
 set -euo pipefail
 
@@ -23,7 +23,11 @@ URDF_BACKEND="${URDF_BACKEND:-simple}"
 MULTIVIEW_EXTRINSICS_JSON="${MULTIVIEW_EXTRINSICS_JSON:-$REPO_ROOT/pnp_cam2base_multiview.json}"
 MULTIVIEW_EXTRINSICS_MODE="${MULTIVIEW_EXTRINSICS_MODE:-rpy_cam2base}"
 PNP_JSON_NAME="${PNP_JSON_NAME:-pnp.json}"
+REFINED_PNP_JSON_NAME="${REFINED_PNP_JSON_NAME:-pnp_silhouette_refined.json}"
 RUN_LOWRES_PNP="${RUN_LOWRES_PNP:-1}"
+RUN_SILHOUETTE_REFINE="${RUN_SILHOUETTE_REFINE:-1}"
+REFINE_FRAME_STRIDE="${REFINE_FRAME_STRIDE:-1}"
+REFINE_MAX_FRAMES="${REFINE_MAX_FRAMES:-32}"
 
 echo "==> build DROID intrinsics at raw-MP4 frame resolution"
 "$PYTHON" "$REPO_ROOT/tools/droid_hf_intrinsics.py" \
@@ -74,6 +78,50 @@ if [[ -f "$MULTIVIEW_EXTRINSICS_JSON" ]]; then
     --skip_bad_pnp
 fi
 
+if [[ "$RUN_SILHOUETTE_REFINE" == "1" ]]; then
+  echo
+  echo "==> refine raw-MP4 cam2base against body masks"
+  "$PYTHON" "$REPO_ROOT/tools/refine_cam2base_silhouette.py" \
+    --oxe_root "$OXE_ROOT" \
+    --mask_root "$MASK_ROOT" \
+    --dataset "$DATASET" \
+    --pnp_json_name "$PNP_JSON_NAME" \
+    --out_pnp_json_name "$REFINED_PNP_JSON_NAME" \
+    --urdf_path "$URDF_PATH" \
+    --urdf_backend "$URDF_BACKEND" \
+    --mask_dirs 000 \
+    --render_link_prefixes panda_link \
+    --frame_stride "$REFINE_FRAME_STRIDE" \
+    --max_frames "$REFINE_MAX_FRAMES" \
+    --viz_dir_name silhouette_refined_viz
+
+  if [[ -f "$MULTIVIEW_EXTRINSICS_JSON" ]]; then
+    echo
+    echo "==> compare refined raw-MP4 PnP to multiview"
+    "$PYTHON" "$REPO_ROOT/tools/compare_cam2base_extrinsics.py" \
+      --oxe_root "$OXE_ROOT" \
+      --mask_root "$MASK_ROOT" \
+      --dataset "$DATASET" \
+      --pnp_json_name "$REFINED_PNP_JSON_NAME" \
+      --reference_json "$MULTIVIEW_EXTRINSICS_JSON" \
+      --sixd_mode "$MULTIVIEW_EXTRINSICS_MODE"
+
+    echo
+    echo "==> render refined raw-MP4 PnP audit panels"
+    "$PYTHON" "$REPO_ROOT/tools/viz_pnp_audit_panel.py" \
+      --oxe_root "$OXE_ROOT" \
+      --mask_root "$MASK_ROOT" \
+      --dataset "$DATASET" \
+      --urdf_path "$URDF_PATH" \
+      --urdf_backend "$URDF_BACKEND" \
+      --extrinsics_json "$MULTIVIEW_EXTRINSICS_JSON" \
+      --extrinsics_sixd_mode "$MULTIVIEW_EXTRINSICS_MODE" \
+      --pnp_json_name "$REFINED_PNP_JSON_NAME" \
+      --out_dir_name pnp_audit_raw_mp4_refined \
+      --skip_bad_pnp
+  fi
+fi
+
 if [[ "$RUN_LOWRES_PNP" == "1" && -d "$LOWRES_MASK_ROOT/$DATASET" ]]; then
   echo
   echo "==> build DROID intrinsics at low-res RLDS frame resolution"
@@ -112,6 +160,18 @@ if [[ -f "$MULTIVIEW_EXTRINSICS_JSON" && -d "$LOWRES_MASK_ROOT/$DATASET" ]]; the
     --sixd_mode "$MULTIVIEW_EXTRINSICS_MODE"
 fi
 
+RAW_COMPARE_JSON="$MASK_ROOT/$DATASET/cam2base_compare_${PNP_JSON_NAME%.json}.json"
+REFINED_COMPARE_JSON="$MASK_ROOT/$DATASET/cam2base_compare_${REFINED_PNP_JSON_NAME%.json}.json"
+if [[ -f "$RAW_COMPARE_JSON" && -f "$REFINED_COMPARE_JSON" ]]; then
+  echo
+  echo "==> summarize raw PnP before/after silhouette refinement"
+  "$PYTHON" "$REPO_ROOT/tools/summarize_cam2base_compare.py" \
+    --before "$RAW_COMPARE_JSON" \
+    --after "$REFINED_COMPARE_JSON"
+fi
+
 echo
-echo "Raw comparison JSON: $MASK_ROOT/$DATASET/cam2base_compare_${PNP_JSON_NAME%.json}.json"
+echo "Raw comparison JSON: $RAW_COMPARE_JSON"
+echo "Refined comparison JSON: $REFINED_COMPARE_JSON"
 echo "Raw audit panels:    $MASK_ROOT/$DATASET/episode_XXXX/pnp_audit_raw_mp4/"
+echo "Refined audit panels: $MASK_ROOT/$DATASET/episode_XXXX/pnp_audit_raw_mp4_refined/"

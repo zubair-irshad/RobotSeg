@@ -270,10 +270,15 @@ def compare_T(a: np.ndarray, b: np.ndarray) -> dict[str, float]:
     a = np.asarray(a, dtype=np.float64)
     b = np.asarray(b, dtype=np.float64)
     delta = invert_se3(a) @ b
+    rel_t = delta[:3, 3]
     return {
         "translation_delta_m": float(np.linalg.norm(a[:3, 3] - b[:3, 3])),
         "rotation_delta_deg": rotation_angle_deg(delta[:3, :3]),
         "dx_m": float(b[0, 3] - a[0, 3]),
         "dy_m": float(b[1, 3] - a[1, 3]),
         "dz_m": float(b[2, 3] - a[2, 3]),
+        "relative_translation_m": float(np.linalg.norm(rel_t)),
+        "rel_x_m": float(rel_t[0]),
+        "rel_y_m": float(rel_t[1]),
+        "rel_z_m": float(rel_t[2]),
     }

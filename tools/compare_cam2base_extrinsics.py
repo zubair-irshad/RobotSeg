@@ -79,11 +79,11 @@ def main() -> None:
     rows = []
     print(
         "episode      status        serial   source                                             "
-        "trans_cm  rot_deg  dx_cm    dy_cm    dz_cm    pnp_rmse K"
+        "center_cm rot_deg  rel_cm   rel_x   rel_y   rel_z   pnp_rmse K"
     )
     print(
         "------------ ------------- -------- -------------------------------------------------- "
-        "--------- -------- -------- -------- -------- -------- ------------------"
+        "--------- -------- -------- ------- ------- ------- -------- ------------------"
     )
     for ep in episodes:
         pnp_path = ds_seg / ep / args.pnp_json_name
@@ -147,9 +147,10 @@ def main() -> None:
             f"{ep:<12} {'ok':<13} {str(serial or '-'):<8} {str(source)[:50]:<50} "
             f"{100 * metrics['translation_delta_m']:9.2f} "
             f"{metrics['rotation_delta_deg']:8.2f} "
-            f"{100 * metrics['dx_m']:8.2f} "
-            f"{100 * metrics['dy_m']:8.2f} "
-            f"{100 * metrics['dz_m']:8.2f} "
+            f"{100 * metrics['relative_translation_m']:8.2f} "
+            f"{100 * metrics['rel_x_m']:7.2f} "
+            f"{100 * metrics['rel_y_m']:7.2f} "
+            f"{100 * metrics['rel_z_m']:7.2f} "
             f"{float(pnp.get('rmse_px', float('nan'))):8.2f} "
             f"{str(K.get('source', '-'))[:18]}"
         )

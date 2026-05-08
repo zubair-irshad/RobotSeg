@@ -347,6 +347,10 @@ def _scale_intrinsics(record: Any, target_w: int, target_h: int,
     # KarlP/droid stores [fx, cx, fy, cy] under cameraMatrix.
     raw, rec_w, rec_h = _extract_camera_matrix(record)
     fx, cx, fy, cy = raw
+    if not all(np.isfinite(v) for v in (fx, cx, fy, cy)):
+        raise ValueError(f"non-finite cameraMatrix values: {raw}")
+    if fx <= 0 or fy <= 0:
+        raise ValueError(f"non-positive focal length in cameraMatrix: {raw}")
     raw_w = raw_w or rec_w
     raw_h = raw_h or rec_h
     src_w, src_h, mode = _choose_source_resolution(fx, cx, fy, cy, target_w,

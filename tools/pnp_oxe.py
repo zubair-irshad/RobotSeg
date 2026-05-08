@@ -246,6 +246,27 @@ def _fmt_K(K: dict | None) -> str:
     )
 
 
+def _valid_K_dict(K: dict | None, W: int, H: int) -> bool:
+    if not isinstance(K, dict):
+        return False
+    try:
+        fx = float(K["fx"])
+        fy = float(K["fy"])
+        cx = float(K["cx"])
+        cy = float(K["cy"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not all(np.isfinite(v) for v in (fx, fy, cx, cy)):
+        return False
+    if fx <= 0 or fy <= 0:
+        return False
+    if not (0 <= cx <= W and 0 <= cy <= H):
+        return False
+    if fx < 0.1 * W or fy < 0.1 * H or fx > 20 * W or fy > 20 * H:
+        return False
+    return True
+
+
 def _default_K(W: int, H: int, hfov_deg: float) -> dict:
     fx = 0.5 * W / math.tan(0.5 * math.radians(hfov_deg))
     return {"fx": fx, "fy": fx, "cx": 0.5 * W, "cy": 0.5 * H,
@@ -738,11 +759,17 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
     K = None
     selected_from = None
     if K_override is not None:
-        K = dict(K_override)
-        K.setdefault("width", W)
-        K.setdefault("height", H)
-        K["source"] = "K_json"
-        selected_from = "K_json"
+        if _valid_K_dict(K_override, W, H):
+            K = dict(K_override)
+            K.setdefault("width", W)
+            K.setdefault("height", H)
+            K["source"] = "K_json"
+            selected_from = "K_json"
+        else:
+            print(
+                f"  [warn] {ds_name}/{ep_dir_seg.name}: ignoring invalid K_json "
+                f"{_fmt_K(K_override)}"
+            )
     if K is None and args.trajectory_intrinsics and traj_K is not None:
         K = dict(traj_K)
         selected_from = "trajectory"

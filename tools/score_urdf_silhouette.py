@@ -8,8 +8,10 @@ rendered mask to segmentation masks such as 000=arm and 001=gripper.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -200,6 +202,70 @@ def _parse_prefixes(text: str | None) -> tuple[str, ...] | None:
     return vals or None
 
 
+def _pruned_urdf_path(
+    urdf_path: Path,
+    include_prefixes: tuple[str, ...] | None,
+    exclude_prefixes: tuple[str, ...] | None,
+) -> Path | None:
+    if not include_prefixes and not exclude_prefixes:
+        return None
+    key = json.dumps(
+        {"include": include_prefixes or (), "exclude": exclude_prefixes or ()},
+        sort_keys=True,
+    )
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:10]
+    return urdf_path.parent / f".{urdf_path.stem}.score_pruned_{digest}.urdf"
+
+
+def _link_allowed_for_prune(
+    name: str,
+    include_prefixes: tuple[str, ...] | None,
+    exclude_prefixes: tuple[str, ...] | None,
+) -> bool:
+    if include_prefixes and not any(name.startswith(prefix) for prefix in include_prefixes):
+        return False
+    if exclude_prefixes and any(name.startswith(prefix) for prefix in exclude_prefixes):
+        return False
+    return True
+
+
+def _write_pruned_urdf(
+    urdf_path: Path,
+    include_prefixes: tuple[str, ...] | None,
+    exclude_prefixes: tuple[str, ...] | None,
+) -> Path:
+    out_path = _pruned_urdf_path(urdf_path, include_prefixes, exclude_prefixes)
+    if out_path is None:
+        return urdf_path
+    if out_path.exists() and out_path.stat().st_mtime >= urdf_path.stat().st_mtime:
+        return out_path
+
+    tree = ET.parse(urdf_path)
+    root = tree.getroot()
+    keep_links: set[str] = set()
+    for link in root.findall("link"):
+        name = link.attrib.get("name", "")
+        if _link_allowed_for_prune(name, include_prefixes, exclude_prefixes):
+            keep_links.add(name)
+        else:
+            root.remove(link)
+
+    for joint in list(root.findall("joint")):
+        parent = joint.find("parent")
+        child = joint.find("child")
+        parent_name = parent.attrib.get("link", "") if parent is not None else ""
+        child_name = child.attrib.get("link", "") if child is not None else ""
+        if parent_name not in keep_links or child_name not in keep_links:
+            root.remove(joint)
+
+    for tag in ("transmission", "gazebo"):
+        for elem in list(root.findall(tag)):
+            root.remove(elem)
+
+    tree.write(out_path, encoding="utf-8", xml_declaration=True)
+    return out_path
+
+
 def _load_extrinsics_override(args: argparse.Namespace, ep_name: str) -> tuple[np.ndarray | None, str | None]:
     if args.extrinsics_data is None:
         return None, None
@@ -351,6 +417,19 @@ def main() -> None:
         default=None,
         help="Comma-separated URDF link prefixes to suppress from the render.",
     )
+    parser.add_argument(
+        "--prune_urdf_for_filtered_render",
+        action="store_true",
+        default=True,
+        help="For --render_link_prefixes/--exclude_render_link_prefixes, write a pruned "
+             "URDF and render it through the normal full-scene backend. This is more "
+             "robust than per-link mesh extraction in yourdfpy.",
+    )
+    parser.add_argument(
+        "--no_prune_urdf_for_filtered_render",
+        dest="prune_urdf_for_filtered_render",
+        action="store_false",
+    )
     parser.add_argument("--extrinsics_json", type=Path, default=None)
     parser.add_argument("--extrinsics_sixd_mode", default="rpy_cam2base")
     parser.add_argument("--extrinsics_preferred_fields", nargs="*", default=None)
@@ -375,8 +454,23 @@ def main() -> None:
         if p.is_dir() and p.name.startswith("episode_")
     )
 
+    urdf_path = args.urdf_path
+    render_include_prefixes = args.render_include_prefixes
+    render_exclude_prefixes = args.render_exclude_prefixes
+    if args.prune_urdf_for_filtered_render and (render_include_prefixes or render_exclude_prefixes):
+        urdf_path = _write_pruned_urdf(
+            args.urdf_path,
+            render_include_prefixes,
+            render_exclude_prefixes,
+        )
+        print(f"[urdf_render] pruned URDF for scoring: {urdf_path}")
+        render_include_prefixes = None
+        render_exclude_prefixes = None
+    args.render_include_prefixes = render_include_prefixes
+    args.render_exclude_prefixes = render_exclude_prefixes
+
     masker = URDFRobotMasker(
-        args.urdf_path,
+        urdf_path,
         mesh_dir=args.mesh_dir,
         backend=args.urdf_backend,
         downsample=args.downsample,

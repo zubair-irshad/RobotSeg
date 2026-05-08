@@ -377,6 +377,29 @@ class _YourdfpyURDF:
         include_link_prefixes: tuple[str, ...] | None,
         exclude_link_prefixes: tuple[str, ...] | None,
     ) -> tuple[np.ndarray, np.ndarray]:
+        link_names = [
+            link for link in self.robot.link_map
+            if _link_allowed(link, include_link_prefixes, exclude_link_prefixes)
+        ]
+        if hasattr(self.robot, "visual_trimesh_fk"):
+            try:
+                mesh_fk = self.robot.visual_trimesh_fk(cfg=cfg, links=link_names)
+                vertices_all: list[np.ndarray] = []
+                faces_all: list[np.ndarray] = []
+                offset = 0
+                for mesh, T_mesh in mesh_fk.items():
+                    vertices = np.asarray(getattr(mesh, "vertices", []), dtype=np.float64)
+                    faces = np.asarray(getattr(mesh, "faces", []), dtype=np.int32)
+                    if len(vertices) == 0 or len(faces) == 0:
+                        continue
+                    vertices_all.append(_apply_transform(vertices, np.asarray(T_mesh, dtype=np.float64)))
+                    faces_all.append(faces + offset)
+                    offset += len(vertices)
+                if vertices_all:
+                    return np.vstack(vertices_all), np.vstack(faces_all).astype(np.int32)
+            except Exception:
+                pass
+
         link_T = self.link_transforms(cfg)
         vertices_all: list[np.ndarray] = []
         faces_all: list[np.ndarray] = []

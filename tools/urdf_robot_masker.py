@@ -142,6 +142,18 @@ class _Joint:
     mimic: _Mimic | None = None
 
 
+def _link_allowed(
+    link: str,
+    include_prefixes: tuple[str, ...] | None,
+    exclude_prefixes: tuple[str, ...] | None,
+) -> bool:
+    if include_prefixes and not any(link.startswith(prefix) for prefix in include_prefixes):
+        return False
+    if exclude_prefixes and any(link.startswith(prefix) for prefix in exclude_prefixes):
+        return False
+    return True
+
+
 class _SimpleURDF:
     def __init__(
         self,
@@ -284,12 +296,19 @@ class _SimpleURDF:
                 stack.append(joint.child)
         return out
 
-    def combined_mesh(self, cfg: dict[str, float]) -> tuple[np.ndarray, np.ndarray]:
+    def combined_mesh(
+        self,
+        cfg: dict[str, float],
+        include_link_prefixes: tuple[str, ...] | None = None,
+        exclude_link_prefixes: tuple[str, ...] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         link_T = self.link_transforms(cfg)
         vertices_all: list[np.ndarray] = []
         faces_all: list[np.ndarray] = []
         offset = 0
         for link, chunks in self.meshes_by_link.items():
+            if not _link_allowed(link, include_link_prefixes, exclude_link_prefixes):
+                continue
             T = link_T.get(link)
             if T is None:
                 continue
@@ -333,15 +352,65 @@ class _YourdfpyURDF:
                 f"visual_faces={n_faces}"
             )
 
-    def combined_mesh(self, cfg: dict[str, float]) -> tuple[np.ndarray, np.ndarray]:
+    def combined_mesh(
+        self,
+        cfg: dict[str, float],
+        include_link_prefixes: tuple[str, ...] | None = None,
+        exclude_link_prefixes: tuple[str, ...] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         if cfg:
             self.robot.update_cfg(cfg)
+        if include_link_prefixes or exclude_link_prefixes:
+            return self._combined_mesh_by_link(
+                cfg, include_link_prefixes, exclude_link_prefixes
+            )
         combined = self.robot.scene.dump(concatenate=True)
         vertices = np.asarray(combined.vertices, dtype=np.float64)
         faces = np.asarray(combined.faces, dtype=np.int32)
         if len(vertices) == 0 or len(faces) == 0:
             return np.zeros((0, 3), dtype=np.float64), np.zeros((0, 3), dtype=np.int32)
         return vertices, faces
+
+    def _combined_mesh_by_link(
+        self,
+        cfg: dict[str, float],
+        include_link_prefixes: tuple[str, ...] | None,
+        exclude_link_prefixes: tuple[str, ...] | None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        link_T = self.link_transforms(cfg)
+        vertices_all: list[np.ndarray] = []
+        faces_all: list[np.ndarray] = []
+        offset = 0
+        for link, link_obj in self.robot.link_map.items():
+            if not _link_allowed(link, include_link_prefixes, exclude_link_prefixes):
+                continue
+            T_link = link_T.get(link)
+            if T_link is None:
+                continue
+            visuals = getattr(link_obj, "visuals", []) or []
+            for visual in visuals:
+                T_visual = getattr(visual, "origin", None)
+                if T_visual is None:
+                    T_visual = np.eye(4, dtype=np.float64)
+                T = T_link @ np.asarray(T_visual, dtype=np.float64)
+                geometry = getattr(visual, "geometry", None)
+                mesh_obj = getattr(geometry, "mesh", None)
+                meshes = getattr(mesh_obj, "meshes", None)
+                if meshes is None and mesh_obj is not None and hasattr(mesh_obj, "vertices"):
+                    meshes = [mesh_obj]
+                if not meshes:
+                    continue
+                for mesh in meshes:
+                    vertices = np.asarray(getattr(mesh, "vertices", []), dtype=np.float64)
+                    faces = np.asarray(getattr(mesh, "faces", []), dtype=np.int32)
+                    if len(vertices) == 0 or len(faces) == 0:
+                        continue
+                    vertices_all.append(_apply_transform(vertices, T))
+                    faces_all.append(faces + offset)
+                    offset += len(vertices)
+        if not vertices_all:
+            return np.zeros((0, 3), dtype=np.float64), np.zeros((0, 3), dtype=np.int32)
+        return np.vstack(vertices_all), np.vstack(faces_all).astype(np.int32)
 
     def link_transforms(self, cfg: dict[str, float]) -> dict[str, np.ndarray]:
         if cfg:
@@ -432,6 +501,8 @@ class URDFRobotMasker:
         joint_positions: np.ndarray,
         gripper_position: float = 0.0,
         image_hw: tuple[int, int] | None = None,
+        include_link_prefixes: tuple[str, ...] | None = None,
+        exclude_link_prefixes: tuple[str, ...] | None = None,
     ) -> np.ndarray:
         H = int(image_hw[0] if image_hw is not None else K["height"])
         W = int(image_hw[1] if image_hw is not None else K["width"])
@@ -445,7 +516,11 @@ class URDFRobotMasker:
             "cy": float(K["cy"]) / s,
         }
 
-        vertices, faces = self.robot.combined_mesh(self._cfg(joint_positions, gripper_position))
+        vertices, faces = self.robot.combined_mesh(
+            self._cfg(joint_positions, gripper_position),
+            include_link_prefixes=include_link_prefixes,
+            exclude_link_prefixes=exclude_link_prefixes,
+        )
         if len(vertices) == 0 or len(faces) == 0:
             return np.zeros((H, W), dtype=bool)
 

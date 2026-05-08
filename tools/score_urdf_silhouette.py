@@ -17,6 +17,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cam2base_json import episode_lookup_keys, find_T_cam2base  # noqa: E402
 from urdf_robot_masker import URDFRobotMasker  # noqa: E402
 from viz_cam2base_urdf import DEFAULT_URDF  # noqa: E402
 
@@ -81,7 +82,8 @@ def _read_mask(path: Path, shape_hw: tuple[int, int]) -> np.ndarray | None:
 
 
 def _load_target_mask(ep_seg: Path, stem: str, mask_dirs: list[str],
-                      shape_hw: tuple[int, int]) -> np.ndarray | None:
+                      shape_hw: tuple[int, int],
+                      subtract_dirs: list[str] | None = None) -> np.ndarray | None:
     out = np.zeros(shape_hw, dtype=bool)
     found = False
     for name in mask_dirs:
@@ -93,6 +95,17 @@ def _load_target_mask(ep_seg: Path, stem: str, mask_dirs: list[str],
             continue
         out |= mask
         found = True
+    if found and subtract_dirs:
+        subtract = np.zeros(shape_hw, dtype=bool)
+        for name in subtract_dirs:
+            path = _mask_path(ep_seg / name, stem)
+            if path is None:
+                continue
+            mask = _read_mask(path, shape_hw)
+            if mask is None:
+                continue
+            subtract |= mask
+        out &= ~subtract
     return out if found else None
 
 
@@ -168,6 +181,25 @@ def _aggregate(rows: list[dict[str, float]]) -> dict[str, float]:
     return out
 
 
+def _parse_prefixes(text: str | None) -> tuple[str, ...] | None:
+    if text is None:
+        return None
+    vals = tuple(x.strip() for x in text.split(",") if x.strip())
+    return vals or None
+
+
+def _load_extrinsics_override(args: argparse.Namespace, ep_name: str) -> tuple[np.ndarray | None, str | None]:
+    if args.extrinsics_data is None:
+        return None, None
+    keys = episode_lookup_keys(args.oxe_root, args.dataset, ep_name)
+    return find_T_cam2base(
+        args.extrinsics_data,
+        keys,
+        preferred_fields=args.extrinsics_preferred_fields,
+        sixd_mode=args.extrinsics_sixd_mode,
+    )
+
+
 def process_episode(args: argparse.Namespace, masker: URDFRobotMasker,
                     ep_name: str) -> dict[str, Any]:
     ep_oxe = args.oxe_root / args.dataset / ep_name
@@ -184,6 +216,13 @@ def process_episode(args: argparse.Namespace, masker: URDFRobotMasker,
     gripper = _load_gripper_array(traj, len(joints), args.gripper_key)
     K = pnp["K"]
     T_cam2base = np.asarray(pnp["T_cam2base"], dtype=np.float64)
+    T_source = f"{args.pnp_json_name}:T_cam2base"
+    T_override, T_override_source = _load_extrinsics_override(args, ep_name)
+    if T_override is not None:
+        T_cam2base = np.asarray(T_override, dtype=np.float64)
+        T_source = f"{args.extrinsics_json}:{T_override_source}"
+    elif args.extrinsics_data is not None:
+        return {"episode": ep_name, "status": "skip-no-extrinsics"}
     H = int(K.get("height", pnp.get("image_size", [0, 0])[1]))
     W = int(K.get("width", pnp.get("image_size", [0, 0])[0]))
     if H <= 0 or W <= 0:
@@ -206,7 +245,10 @@ def process_episode(args: argparse.Namespace, masker: URDFRobotMasker,
             continue
         if idx >= len(joints):
             continue
-        target = _load_target_mask(ep_seg, stem, mask_dirs, (H, W))
+        target = _load_target_mask(
+            ep_seg, stem, mask_dirs, (H, W),
+            subtract_dirs=args.subtract_mask_dirs,
+        )
         if target is None:
             continue
         area_frac = float(target.sum()) / float(H * W)
@@ -218,6 +260,8 @@ def process_episode(args: argparse.Namespace, masker: URDFRobotMasker,
             joints[idx],
             gripper_position=float(gripper[idx]),
             image_hw=(H, W),
+            include_link_prefixes=args.render_include_prefixes,
+            exclude_link_prefixes=args.render_exclude_prefixes,
         )
         rec = _mask_metrics(target, render, args.distance_clip)
         rec["stem"] = stem
@@ -233,7 +277,11 @@ def process_episode(args: argparse.Namespace, masker: URDFRobotMasker,
         "K_source": K.get("source", "unknown") if isinstance(K, dict) else "unknown",
         "pnp_rmse_px": pnp.get("rmse_px"),
         "pnp_inliers": pnp.get("num_inliers"),
+        "T_source": T_source,
         "mask_dirs": mask_dirs,
+        "subtract_mask_dirs": args.subtract_mask_dirs,
+        "render_include_prefixes": list(args.render_include_prefixes or ()),
+        "render_exclude_prefixes": list(args.render_exclude_prefixes or ()),
         "metrics": agg,
     }
 
@@ -255,8 +303,23 @@ def main() -> None:
     )
     parser.add_argument("--mask_dirs", nargs="+", default=["000", "001"],
                         help="Segmentation folders to union. Defaults to arm+gripper.")
+    parser.add_argument("--subtract_mask_dirs", nargs="+", default=[],
+                        help="Segmentation folders to subtract from the target mask.")
     parser.add_argument("--auto_robot_mask", action="store_true",
                         help="Use folder 002 if present, otherwise --mask_dirs.")
+    parser.add_argument(
+        "--render_link_prefixes",
+        default=None,
+        help="Comma-separated URDF link prefixes to render, e.g. panda_link for arm/body only.",
+    )
+    parser.add_argument(
+        "--exclude_render_link_prefixes",
+        default=None,
+        help="Comma-separated URDF link prefixes to suppress from the render.",
+    )
+    parser.add_argument("--extrinsics_json", type=Path, default=None)
+    parser.add_argument("--extrinsics_sixd_mode", default="rpy_cam2base")
+    parser.add_argument("--extrinsics_preferred_fields", nargs="*", default=None)
     parser.add_argument("--joint_key", default=None)
     parser.add_argument("--gripper_key", default=None)
     parser.add_argument("--frame_stride", type=int, default=4)
@@ -268,6 +331,9 @@ def main() -> None:
     parser.add_argument("--max_target_area", type=float, default=0.60)
     parser.add_argument("--out_json", type=Path, default=None)
     args = parser.parse_args()
+    args.render_include_prefixes = _parse_prefixes(args.render_link_prefixes)
+    args.render_exclude_prefixes = _parse_prefixes(args.exclude_render_link_prefixes)
+    args.extrinsics_data = _load_json(args.extrinsics_json) if args.extrinsics_json else None
 
     ds_seg = args.mask_root / args.dataset
     episodes = args.episodes or sorted(
@@ -292,6 +358,7 @@ def main() -> None:
         if result.get("status") == "ok":
             print(
                 f"[{args.dataset}/{ep}] ok "
+                f"T={result.get('T_source')} "
                 f"pnp_rmse={result.get('pnp_rmse_px')} "
                 f"iou_med={metrics.get('iou_median', 0.0):.3f} "
                 f"coverage_med={metrics.get('target_coverage_median', 0.0):.3f} "

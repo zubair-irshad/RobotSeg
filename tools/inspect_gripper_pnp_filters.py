@@ -35,6 +35,9 @@ def main() -> None:
     parser.add_argument("--edge_margin", type=int, default=4)
     parser.add_argument("--reject_fragmented", action="store_true", default=True)
     parser.add_argument("--require_gripper_near_robot", action="store_true")
+    parser.add_argument("--require_gripper_inside_robot", action="store_true")
+    parser.add_argument("--gripper_robot_disk_radius_px", type=int, default=5)
+    parser.add_argument("--min_gripper_robot_disk_frac", type=float, default=0.25)
     parser.add_argument("--robot_mask_roots", default="002,000")
     parser.add_argument("--max_gripper_robot_dist_px", type=float, default=18.0)
     parser.add_argument("--min_robot_mask_area_px", type=int, default=64)
@@ -81,6 +84,7 @@ def main() -> None:
             ratio = post / pre if pre > 0 else 0.0
             print(
                 f"  {stem}: {reason} "
+                f"centroid={rec['centroid']} observed={rec['observed']} "
                 f"area={post:.5f} pre={pre:.5f} ratio={ratio:.3f} "
                 f"conf_max={rec['conf_max']:.2f} comps={rec['n_components']} "
                 f"arm_overlap={rec['arm_overlap_frac']:.2f}"

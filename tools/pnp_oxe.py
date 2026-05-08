@@ -155,7 +155,7 @@ def _parse_mask_roots(text: str) -> list[str]:
 
 def _robot_proximity_ok(ep_dir_seg: Path, stem: str, centroid: list[float],
                         W: int, H: int, args) -> tuple[bool, str | None]:
-    if not args.require_gripper_near_robot:
+    if not args.require_gripper_near_robot and not args.require_gripper_inside_robot:
         return True, None
     roots = _parse_mask_roots(args.robot_mask_roots)
     robot = _load_masks_for_stem(ep_dir_seg, stem, roots, (H, W))
@@ -168,7 +168,17 @@ def _robot_proximity_ok(ep_dir_seg: Path, stem: str, centroid: list[float],
     cx, cy = int(round(float(centroid[0]))), int(round(float(centroid[1])))
     if not (0 <= cx < W and 0 <= cy < H):
         return False, "centroid-outside-image"
-    if robot[cy, cx]:
+
+    if args.require_gripper_inside_robot:
+        radius = max(0, int(args.gripper_robot_disk_radius_px))
+        disk = np.zeros((H, W), dtype=np.uint8)
+        cv2.circle(disk, (cx, cy), radius, 1, thickness=-1)
+        sel = disk.astype(bool)
+        cover = float(robot[sel].mean()) if np.any(sel) else float(robot[cy, cx])
+        if cover < args.min_gripper_robot_disk_frac:
+            return False, f"outside-robot-mask({cover:.2f})"
+
+    if robot[cy, cx] or not args.require_gripper_near_robot:
         return True, None
     inv = (~robot).astype(np.uint8)
     dt = cv2.distanceTransform(inv, cv2.DIST_L2, 3)
@@ -1219,6 +1229,14 @@ def main():
         help="Reject gripper centroids that are far from robot/body masks. "
              "Useful when gripper segmentation fires on a scene object.",
     )
+    p.add_argument(
+        "--require_gripper_inside_robot",
+        action="store_true",
+        help="Reject gripper centroids whose local neighborhood is not covered "
+             "by the robot/body mask. Stricter than --require_gripper_near_robot.",
+    )
+    p.add_argument("--gripper_robot_disk_radius_px", type=int, default=5)
+    p.add_argument("--min_gripper_robot_disk_frac", type=float, default=0.25)
     p.add_argument(
         "--robot_mask_roots",
         default="002,000",

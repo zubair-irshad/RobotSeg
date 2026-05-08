@@ -65,7 +65,10 @@ def _save_centroid_viz(path, image_bgr, centroid, color=(0, 0, 255)):
     cv2.imwrite(path, viz)
 
 
-def _save_combined(path, image_bgr, masks_by_cat, ee_centroid, alpha=0.5):
+def _save_combined(
+    path, image_bgr, masks_by_cat, ee_centroid, ee_accept=True,
+    ee_reject_reason=None, alpha=0.5,
+):
     """Overlay multiple category masks with their colors, and mark EE centroid."""
     viz = image_bgr.copy().astype(np.float32)
     for cat, mask in masks_by_cat.items():
@@ -80,11 +83,18 @@ def _save_combined(path, image_bgr, masks_by_cat, ee_centroid, alpha=0.5):
 
     if ee_centroid is not None:
         cx, cy = int(round(ee_centroid[0])), int(round(ee_centroid[1]))
-        cv2.drawMarker(viz, (cx, cy), (255, 255, 255),
-                       markerType=cv2.MARKER_CROSS, markerSize=26, thickness=3)
-        cv2.circle(viz, (cx, cy), 7, (0, 255, 255), 2)
-        cv2.putText(viz, "EE", (cx + 10, cy - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+        if ee_accept:
+            cv2.drawMarker(viz, (cx, cy), (255, 255, 255),
+                           markerType=cv2.MARKER_CROSS, markerSize=26, thickness=3)
+            cv2.circle(viz, (cx, cy), 7, (0, 255, 255), 2)
+            cv2.putText(viz, "EE", (cx + 10, cy - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+        else:
+            cv2.drawMarker(viz, (cx, cy), (0, 0, 255),
+                           markerType=cv2.MARKER_TILTED_CROSS, markerSize=30, thickness=3)
+            label = ee_reject_reason or "REJECT"
+            cv2.putText(viz, label[:18], (cx + 10, cy - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 2, cv2.LINE_AA)
     cv2.imwrite(path, viz)
 
 
@@ -120,6 +130,52 @@ def _entry_centroid(entry):
     if isinstance(entry, dict):
         return entry.get("centroid")
     return entry
+
+
+def _entry_accept(entry):
+    if isinstance(entry, dict):
+        return bool(entry.get("accepted_for_pnp", entry.get("observed", True)))
+    return True
+
+
+def _entry_reject_reason(entry):
+    if isinstance(entry, dict):
+        return entry.get("reject_reason")
+    return None
+
+
+def _centroid_near_mask(mask_u8, centroid, max_dist_px):
+    if mask_u8 is None or centroid is None:
+        return False, "missing-reference-mask"
+    robot = mask_u8 > 127
+    if not np.any(robot):
+        return False, "empty-reference-mask"
+    h, w = robot.shape[:2]
+    cx, cy = int(round(float(centroid[0]))), int(round(float(centroid[1])))
+    if not (0 <= cx < w and 0 <= cy < h):
+        return False, "centroid-outside-image"
+    if robot[cy, cx]:
+        return True, None
+    inv = (~robot).astype(np.uint8)
+    dist = float(cv2.distanceTransform(inv, cv2.DIST_L2, 3)[cy, cx])
+    if dist > max_dist_px:
+        return False, f"far-from-arm({dist:.1f}px)"
+    return True, None
+
+
+def _mark_pnp_acceptance(stats, arm_mask, args):
+    reason = None
+    if not stats.get("observed", True):
+        reason = "not-observed"
+    elif args.require_gripper_near_arm:
+        ok, reason = _centroid_near_mask(
+            arm_mask, stats.get("centroid"), args.max_gripper_arm_dist_px
+        )
+        if ok:
+            reason = None
+    stats["accepted_for_pnp"] = reason is None
+    stats["reject_reason"] = reason
+    return stats
 
 
 def _mask_stats(mask_u8, prob_u8=None):
@@ -484,6 +540,7 @@ def process_sequences(args, gpu_id, seq_list):
                     s["observed"] = bool(s["centroid"] is not None
                                          and s["area_frac"] > 0
                                          and s["conf_max"] >= 0.7)
+                    s = _mark_pnp_acceptance(s, amask, args)
                     new_stats[stem] = s
                     continue
                 # How much of the original gripper mask was actually arm?
@@ -523,6 +580,7 @@ def process_sequences(args, gpu_id, seq_list):
                     and s["conf_max"] >= 0.7
                     and s["n_components"] == 1
                 )
+                s = _mark_pnp_acceptance(s, amask, args)
                 new_stats[stem] = s
             centroids_by_cat["gripper"] = new_stats
             with open(os.path.join(grip_dir, "centroids.json"), "w") as f:
@@ -544,12 +602,17 @@ def process_sequences(args, gpu_id, seq_list):
                 if img is None:
                     continue
                 ee = None
+                ee_accept = True
+                ee_reject_reason = None
                 if ee_cat is not None:
-                    ee = _entry_centroid(centroids_by_cat.get(ee_cat, {}).get(stem))
+                    ee_entry = centroids_by_cat.get(ee_cat, {}).get(stem)
+                    ee = _entry_centroid(ee_entry)
+                    ee_accept = _entry_accept(ee_entry)
+                    ee_reject_reason = _entry_reject_reason(ee_entry)
                 save_pool.submit(
                     _save_combined,
                     os.path.join(combined_dir, f"{stem}.jpg"),
-                    img, per_cat_mask, ee,
+                    img, per_cat_mask, ee, ee_accept, ee_reject_reason,
                 )
 
         # Clean up the temporary low-res view (if any) for this episode.
@@ -603,6 +666,12 @@ def main():
                         "subtracting it out cleans up gripper-mask bleed-over.")
     p.add_argument("--no_subtract_arm_from_gripper", dest="subtract_arm_from_gripper",
                    action="store_false")
+    p.add_argument("--require_gripper_near_arm", action="store_true", default=True,
+                   help="Mark gripper frames rejected for PnP if the centroid is "
+                        "far from the arm mask after arm subtraction.")
+    p.add_argument("--no_require_gripper_near_arm", dest="require_gripper_near_arm",
+                   action="store_false")
+    p.add_argument("--max_gripper_arm_dist_px", type=float, default=18.0)
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()
 

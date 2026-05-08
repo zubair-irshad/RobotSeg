@@ -90,7 +90,8 @@ def _entry_to_record(entry):
                 "conf_p10": 0.0, "conf_p50": 0.0, "conf_p90": 0.0,
                 "stability_05_07": 0.0, "stability_05_09": 0.0,
                 "area_frac": 0.0, "n_components": 0,
-                "arm_overlap_frac": 1.0, "observed": False}
+                "arm_overlap_frac": 1.0, "observed": False,
+                "accepted_for_pnp": False, "reject_reason": "missing-entry"}
     if isinstance(entry, dict):
         return {
             "centroid": entry.get("centroid"),
@@ -108,6 +109,8 @@ def _entry_to_record(entry):
                 entry.get("pre_subtract_area_frac", entry.get("area_frac", 0.0))
             ),
             "observed": entry.get("observed", None),
+            "accepted_for_pnp": entry.get("accepted_for_pnp", None),
+            "reject_reason": entry.get("reject_reason", None),
         }
     # Legacy list form (no quality info; assume good).
     return {"centroid": entry, "conf_mean": 1.0, "conf_max": 1.0,
@@ -115,7 +118,7 @@ def _entry_to_record(entry):
             "stability_05_07": 1.0, "stability_05_09": 1.0,
             "area_frac": 0.0, "n_components": 1,
             "arm_overlap_frac": 0.0, "pre_subtract_area_frac": 0.0,
-            "observed": True}
+            "observed": True, "accepted_for_pnp": None, "reject_reason": None}
 
 
 def _mask_path(root: Path, stem: str) -> Path | None:
@@ -563,6 +566,9 @@ def _filter_frames(centroids_json, ee_xyz_seq, W, H, args, ee_R_seq=None,
         # unobserved (e.g. 16th frame in your bridge episode), drop it.
         if args.use_observed_flag and rec["observed"] is False:
             rej.append((stem, "not-observed"))
+            continue
+        if args.use_mask_stage_accept and rec["accepted_for_pnp"] is False:
+            rej.append((stem, rec["reject_reason"] or "mask-stage-reject"))
             continue
         if rec["conf_mean"] < args.min_conf:
             rej.append((stem, f"low-conf({rec['conf_mean']:.2f})"))
@@ -1210,6 +1216,10 @@ def main():
                    help="Honor centroids.json[*].observed (set by inference) as a "
                         "hard reject. Disable with --no_use_observed_flag.")
     p.add_argument("--no_use_observed_flag", dest="use_observed_flag",
+                   action="store_false")
+    p.add_argument("--use_mask_stage_accept", action="store_true", default=True,
+                   help="Honor centroids.json[*].accepted_for_pnp when present.")
+    p.add_argument("--no_use_mask_stage_accept", dest="use_mask_stage_accept",
                    action="store_false")
     p.add_argument("--min_conf", type=float, default=0.5,
                    help="Reject if mean sigmoid prob inside the gripper mask < this.")

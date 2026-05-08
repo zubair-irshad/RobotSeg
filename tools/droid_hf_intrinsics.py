@@ -63,7 +63,14 @@ def _path_variants(path: str) -> list[str]:
         "r2d2/r2d2-data-full/",
         "r2d2-data-full/",
     )
-    for val in list(queue):
+    seen_queue = set()
+    i = 0
+    while i < len(queue):
+        val = queue[i]
+        i += 1
+        if not val or val in seen_queue:
+            continue
+        seen_queue.add(val)
         for prefix in prefixes:
             if val.startswith(prefix):
                 queue.append(val[len(prefix):])
@@ -76,7 +83,8 @@ def _path_variants(path: str) -> list[str]:
             vals.append(val[: -len("/trajectory.h5")])
         if val.endswith("/recordings/MP4"):
             vals.append(val[: -len("/recordings/MP4")])
-        for marker in ("/r2d2/r2d2-data-full/", "/r2d2-data-full/"):
+        for marker in ("r2d2/r2d2-data-full/", "r2d2-data-full/",
+                       "/r2d2/r2d2-data-full/", "/r2d2-data-full/"):
             if marker in val:
                 vals.append(val.split(marker, 1)[1])
     out = []
@@ -383,6 +391,8 @@ def main() -> None:
     parser.add_argument("--episodes", nargs="+", default=None)
     parser.add_argument("--episode_id_json", type=Path, default=None,
                         help="Optional JSON mapping local episode names to raw DROID episode IDs.")
+    parser.add_argument("--debug_mapping", action="store_true",
+                        help="Print metadata path variants for unresolved episodes.")
     args = parser.parse_args()
 
     paths = {name: _ensure_file(args.cache_dir, name) for name in FILES}
@@ -416,6 +426,15 @@ def main() -> None:
                                                     dataset_map_metadata,
                                                     path_to_id, intrinsics)
         if episode_id is None:
+            if args.debug_mapping:
+                meta = _load_episode_metadata(ep_dir) or dataset_map_metadata.get(ep)
+                if isinstance(meta, dict):
+                    print(f"\n[{ep}] mapping debug candidates:")
+                    for val in _metadata_candidates(meta):
+                        print(f"  raw: {val}")
+                        for cand in _path_variants(val):
+                            hit = " HIT" if cand in path_to_id else ""
+                            print(f"    {cand}{hit}")
             missing.append((ep, id_source))
             continue
         intr_entry = intrinsics.get(episode_id)

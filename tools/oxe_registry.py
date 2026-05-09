@@ -49,6 +49,7 @@ OXE_DATASETS = {
         "version": "0.1.0",
         "rgb_keys": ["image", "hand_image"],
         "state_key": "robot_state",
+        "joint_key": "robot_state",
         "action_key": "action",
         "state_schema": (
             "robot_state[15]: joints(0:6), gripper_is_closed(6), "

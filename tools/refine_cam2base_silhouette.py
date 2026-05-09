@@ -40,6 +40,15 @@ from urdf_robot_masker import URDFRobotMasker  # noqa: E402
 from viz_cam2base_urdf import DEFAULT_URDF  # noqa: E402
 
 
+def _parse_groups(text: str) -> tuple[int, ...]:
+    vals = []
+    for part in str(text).split(","):
+        part = part.strip()
+        if part:
+            vals.append(int(part))
+    return tuple(vals) or (2,)
+
+
 def _loss_from_metric(args: argparse.Namespace, rec: dict[str, float]) -> float:
     if rec["render_area"] <= 0 or rec["target_area"] <= 0:
         return args.distance_clip * 4.0
@@ -180,8 +189,20 @@ def _load_samples(args: argparse.Namespace, ep_oxe: Path, ep_seg: Path,
         return [], {"bad-image-size": 1}
 
     traj = np.load(ep_oxe / "trajectory.npz")
-    if getattr(args, "mujoco_xml_path", None) is not None and "google_robot_all_qpos" in traj.files:
-        joints = np.asarray(traj["google_robot_all_qpos"], dtype=np.float64)
+    if getattr(args, "mujoco_xml_path", None) is not None:
+        candidates = []
+        if args.mujoco_qpos_key:
+            candidates.append(args.mujoco_qpos_key)
+        candidates += ["google_robot_all_qpos", "all_qpos", "joint_position", "joint_positions", "joints", "q"]
+        joints = None
+        for key in candidates:
+            if key in traj.files:
+                joints = np.asarray(traj[key], dtype=np.float64)
+                break
+        if joints is None:
+            raise ValueError(
+                f"trajectory.npz does not contain MuJoCo qpos. Tried: {candidates}"
+            )
         if joints.ndim == 1:
             joints = joints.reshape(1, -1)
     else:
@@ -391,11 +412,12 @@ def _best_viewpoint_initial_pose(
     if args.mujoco_xml_path is None:
         raise ValueError("--init_pose_source best_viewpoint requires --mujoco_xml_path")
     from viz_fractal_mujoco_viewpoints import (  # noqa: E402
-        FRACTAL_VIEWPOINTS,
         FreeCameraGoogleRobotRenderer,
+        _load_viewpoints,
     )
 
     H, W = int(K["height"]), int(K["width"])
+    viewpoints = _load_viewpoints(args.viewpoints_json)
     renderer = FreeCameraGoogleRobotRenderer(args.mujoco_xml_path, H, W)
     try:
         best_idx = -1
@@ -403,7 +425,7 @@ def _best_viewpoint_initial_pose(
         best_loss = float("inf")
         best_rows: list[dict[str, float]] = []
         best_metrics: dict[str, float] = {}
-        for idx, viewpoint in enumerate(FRACTAL_VIEWPOINTS):
+        for idx, viewpoint in enumerate(viewpoints):
             rows = []
             losses = []
             for sample in samples:
@@ -423,10 +445,10 @@ def _best_viewpoint_initial_pose(
                 best_metrics = metrics
         if best_idx < 0:
             raise RuntimeError("no Fractal viewpoint produced a valid score")
-        T = renderer.T_cam2base_from_viewpoint(samples[0]["joint"], FRACTAL_VIEWPOINTS[best_idx])
+        T = renderer.T_cam2base_from_viewpoint(samples[0]["joint"], viewpoints[best_idx])
         return T, {
             "viewpoint_index": best_idx,
-            "viewpoint": FRACTAL_VIEWPOINTS[best_idx],
+            "viewpoint": viewpoints[best_idx],
             "loss": best_loss,
             "metrics": best_metrics,
             "rows": best_rows,
@@ -554,6 +576,8 @@ def main() -> None:
     parser.add_argument("--pnp_json_name", default="pnp.json")
     parser.add_argument("--out_pnp_json_name", default="pnp_silhouette_refined.json")
     parser.add_argument("--init_pose_source", choices=["pnp", "best_viewpoint"], default="pnp")
+    parser.add_argument("--viewpoints_json", type=Path, default=None,
+                        help="Optional JSON list of MuJoCo free-camera viewpoints for --init_pose_source best_viewpoint.")
     parser.add_argument("--urdf_path", type=Path, default=DEFAULT_URDF)
     parser.add_argument("--mesh_dir", type=Path, default=None)
     parser.add_argument("--urdf_backend", choices=["simple", "yourdfpy", "auto"], default="yourdfpy")
@@ -563,6 +587,12 @@ def main() -> None:
         default=None,
         help="Render silhouettes with this MuJoCo XML and trajectory['google_robot_all_qpos'] instead of URDF joints.",
     )
+    parser.add_argument("--mujoco_qpos_key", default=None,
+                        help="trajectory.npz key to use as MuJoCo qpos. "
+                             "Defaults to google_robot_all_qpos/all_qpos/joint_position fallbacks.")
+    parser.add_argument("--mujoco_geom_groups", default="2",
+                        help="Comma-separated MuJoCo geom groups to render. Google Robot uses 2; "
+                             "other XMLs may need 0,1,2,3,4,5.")
     parser.add_argument(
         "--mujoco_postprocess",
         choices=["none", "auge", "flip_x", "flip_y", "rot180"],
@@ -609,6 +639,7 @@ def main() -> None:
             args.mujoco_xml_path,
             verbose=True,
             postprocess=args.mujoco_postprocess,
+            geom_groups=_parse_groups(args.mujoco_geom_groups),
         )
     else:
         include_prefixes = _parse_prefixes(args.render_link_prefixes)

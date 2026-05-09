@@ -30,6 +30,15 @@ from urdf_robot_masker import URDFRobotMasker  # noqa: E402
 from viz_cam2base_urdf import DEFAULT_URDF  # noqa: E402
 
 
+def _parse_groups(text: str) -> tuple[int, ...]:
+    vals = []
+    for part in str(text).split(","):
+        part = part.strip()
+        if part:
+            vals.append(int(part))
+    return tuple(vals) or (2,)
+
+
 def _read_json(path: Path) -> dict:
     return json.loads(path.read_text())
 
@@ -112,12 +121,17 @@ def _load_gripper(traj, n: int) -> np.ndarray:
     return np.zeros(n, dtype=np.float64)
 
 
-def _load_mujoco_qpos(traj) -> np.ndarray | None:
-    if "google_robot_all_qpos" in traj.files:
-        arr = np.asarray(traj["google_robot_all_qpos"], dtype=np.float64)
-    elif "all_qpos" in traj.files:
-        arr = np.asarray(traj["all_qpos"], dtype=np.float64)
-    else:
+def _load_mujoco_qpos(traj, key: str | None = None) -> np.ndarray | None:
+    candidates = []
+    if key:
+        candidates.append(key)
+    candidates += ["google_robot_all_qpos", "all_qpos", "joint_position", "joint_positions", "joints", "q"]
+    arr = None
+    for name in candidates:
+        if name in traj.files:
+            arr = np.asarray(traj[name], dtype=np.float64)
+            break
+    if arr is None:
         return None
     if arr.ndim == 1:
         arr = arr.reshape(1, -1)
@@ -239,7 +253,7 @@ def process_episode(dataset: str, ep: str, args, masker: URDFRobotMasker | None)
     with np.load(ep_oxe / "trajectory.npz", allow_pickle=True) as traj:
         points = _load_points(dataset, traj, len(centroids), args, pnp.get("point_source", "eef_xyz"))
         joints = _load_joints(traj)
-        mujoco_qpos = _load_mujoco_qpos(traj) if args.mujoco_xml_path is not None else None
+        mujoco_qpos = _load_mujoco_qpos(traj, args.mujoco_qpos_key) if args.mujoco_xml_path is not None else None
         render_state = mujoco_qpos if mujoco_qpos is not None else joints
         gripper = _load_gripper(traj, len(joints)) if joints is not None else None
 
@@ -370,6 +384,12 @@ def main() -> None:
     parser.add_argument("--mujoco_xml_path", type=Path, default=None,
                         help="Render robot overlays with this MuJoCo XML instead of URDF. "
                              "For Fractal, use AugE robot_xml/google_robot/scene.xml.")
+    parser.add_argument("--mujoco_qpos_key", default=None,
+                        help="trajectory.npz key to use as MuJoCo qpos. "
+                             "Defaults to google_robot_all_qpos/all_qpos/joint_position fallbacks.")
+    parser.add_argument("--mujoco_geom_groups", default="2",
+                        help="Comma-separated MuJoCo geom groups to render. Google Robot uses 2; "
+                             "other XMLs may need 0,1,2,3,4,5.")
     parser.add_argument(
         "--mujoco_postprocess",
         choices=["none", "auge", "flip_x", "flip_y", "rot180"],
@@ -418,6 +438,7 @@ def main() -> None:
             args.mujoco_xml_path,
             verbose=True,
             postprocess=args.mujoco_postprocess,
+            geom_groups=_parse_groups(args.mujoco_geom_groups),
         )
     elif not args.no_urdf:
         masker = URDFRobotMasker(

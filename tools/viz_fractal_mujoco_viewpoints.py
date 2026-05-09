@@ -61,6 +61,28 @@ def _mask_path(ep_seg: Path, root: str, stem: str) -> Path | None:
     return None
 
 
+def _load_viewpoints(path: Path | None) -> list[dict]:
+    if path is None:
+        return FRACTAL_VIEWPOINTS
+    data = json.loads(path.expanduser().read_text())
+    if isinstance(data, dict):
+        for key in ("viewpoints", "bridge_viewpoints", "fractal20220817_data", "berkeley_autolab_ur5"):
+            if key in data:
+                data = data[key]
+                if isinstance(data, dict) and "viewpoints" in data:
+                    data = data["viewpoints"]
+                break
+    if not isinstance(data, list):
+        raise ValueError(f"viewpoints JSON must be a list or contain a viewpoints list: {path}")
+    out = []
+    for item in data:
+        v = dict(item)
+        if "camera_fov" not in v and "fovy" in v:
+            v["camera_fov"] = v["fovy"]
+        out.append(v)
+    return out
+
+
 def _draw_header(img: np.ndarray, text: str) -> np.ndarray:
     out = img.copy()
     cv2.rectangle(out, (0, 0), (out.shape[1], 24), (0, 0, 0), -1)
@@ -228,13 +250,16 @@ def process_episode(args: argparse.Namespace, ep_name: str) -> dict:
                 rows.append({"episode": ep_name, "stem": stem, "status": "skip-qpos-range"})
                 continue
             H, W = img.shape[:2]
-            target = _read_mask(_mask_path(ep_seg, "000", stem) or _mask_path(ep_seg, "002", stem), (H, W))
+            target = np.zeros((H, W), dtype=bool)
+            for mask_dir in args.target_mask_dirs:
+                target |= _read_mask(_mask_path(ep_seg, mask_dir, stem), (H, W))
             renderer = FreeCameraGoogleRobotRenderer(args.mujoco_xml_path, H, W)
+            viewpoints = _load_viewpoints(args.viewpoints_json)
             frame_dir = out_root / f"frame_{stem}"
             frame_dir.mkdir(parents=True, exist_ok=True)
             frame_rows = []
             tiles = [_draw_header(img, f"raw {stem}")]
-            for vidx, viewpoint in enumerate(FRACTAL_VIEWPOINTS):
+            for vidx, viewpoint in enumerate(viewpoints):
                 mask = renderer.render_mask(qpos[idx], viewpoint)
                 rec = _metrics(target, mask)
                 rec.update({"episode": ep_name, "stem": stem, "viewpoint": vidx, "status": "ok"})
@@ -274,6 +299,8 @@ def main() -> None:
     p.add_argument("--frames", nargs="+", default=None)
     p.add_argument("--pnp_json_name", default="pnp_fovy57.json")
     p.add_argument("--mujoco_xml_path", type=Path, required=True)
+    p.add_argument("--viewpoints_json", type=Path, default=None)
+    p.add_argument("--target_mask_dirs", nargs="+", default=["000"])
     p.add_argument("--out_dir_name", default="mujoco_viewpoint_check")
     p.add_argument("--max_frames", type=int, default=4)
     p.add_argument("--top_k", type=int, default=5)

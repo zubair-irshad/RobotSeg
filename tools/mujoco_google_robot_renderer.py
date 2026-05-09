@@ -77,7 +77,7 @@ def _xml_with_camera(xml_path: Path, T_cam2base: np.ndarray, K: dict[str, float]
 
 class MuJoCoGoogleRobotRenderer:
     def __init__(self, xml_path: str | Path, verbose: bool = True,
-                 postprocess: str = "none"):
+                 postprocess: str = "none", geom_groups: tuple[int, ...] = (2,)):
         os.environ.setdefault("MUJOCO_GL", "egl")
         import mujoco  # type: ignore
 
@@ -92,6 +92,7 @@ class MuJoCoGoogleRobotRenderer:
         self.data = None
         self.renderer = None
         self.postprocess = postprocess
+        self.geom_groups = tuple(int(g) for g in geom_groups)
 
     def _postprocess_mask(self, mask: np.ndarray, mode: str | None = None) -> np.ndarray:
         mode = self.postprocess if mode is None else mode
@@ -135,10 +136,11 @@ class MuJoCoGoogleRobotRenderer:
         self.renderer = self.mujoco.Renderer(self.model, height=H, width=W)
         self.scene_option = self.mujoco.MjvOption()
         # Google Robot visual geoms are group 2 in the MuJoCo Menagerie XML.
-        # Rendering only that group avoids floor/world geoms entering the mask.
+        # Other robot XMLs can override this with --mujoco_geom_groups.
         self.scene_option.geomgroup[:] = 0
-        if len(self.scene_option.geomgroup) > 2:
-            self.scene_option.geomgroup[2] = 1
+        for group in self.geom_groups:
+            if 0 <= group < len(self.scene_option.geomgroup):
+                self.scene_option.geomgroup[group] = 1
         self._cache_key = key
         if self.verbose:
             print(f"[mujoco_render] loaded {self.xml_path} camera=pnp_cam size={W}x{H}")

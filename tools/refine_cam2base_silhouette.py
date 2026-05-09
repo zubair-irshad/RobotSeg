@@ -639,10 +639,11 @@ def main() -> None:
             results.append(result)
             if result.get("status") == "ok":
                 marker = "improved" if result["improved"] else "kept"
+                viewpoint_index = result.get("viewpoint_index")
+                viewpoint_suffix = "" if viewpoint_index is None else f":v{int(viewpoint_index):02d}"
                 print(
                     f"[{args.dataset}/{ep}] {marker} "
-                    f"init={result.get('init_pose_source')}"
-                    f"{'' if result.get('viewpoint_index') is None else f':v{int(result.get('viewpoint_index')):02d}'} "
+                    f"init={result.get('init_pose_source')}{viewpoint_suffix} "
                     f"loss {_fmt_metric(result.get('init_loss'))}->{_fmt_metric(result.get('written_loss'))} "
                     f"iou {_fmt_metric(result.get('init_iou_median'))}->{_fmt_metric(result.get('final_iou_median'))} "
                     f"written_iou={_fmt_metric(result.get('iou_median'))} "

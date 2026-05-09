@@ -266,6 +266,13 @@ def _clip_params(args: argparse.Namespace, x: np.ndarray) -> np.ndarray:
     return x
 
 
+def _fmt_metric(value: Any, digits: int = 3, default: str = "-") -> str:
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return default
+
+
 def _optimize_pose(args: argparse.Namespace, objective) -> tuple[np.ndarray, float, int]:
     x = np.zeros(6, dtype=np.float64)
     best = float(objective(x))
@@ -408,21 +415,6 @@ def _process_episode(args: argparse.Namespace, masker,
 
     rvec, tvec, T_base2cam = _T_to_rvec_tvec(T_out)
     reproj = _reprojection_metrics(args, ep_oxe, ep_seg, pnp, K, rvec, tvec)
-    init_rmse = init_reproj.get("rmse_px")
-    final_rmse = reproj.get("rmse_px")
-    if (
-        improved
-        and init_rmse is not None
-        and final_rmse is not None
-        and float(final_rmse) > float(init_rmse) + float(args.max_reproj_worsen_px)
-    ):
-        improved = False
-        T_out = T0
-        rows_out = init_rows
-        loss_out = init_loss
-        rvec, tvec, T_base2cam = _T_to_rvec_tvec(T_out)
-        reproj = init_reproj
-
     out = copy.deepcopy(pnp)
     out["T_cam2base"] = np.asarray(T_out, dtype=float).tolist()
     out["T_base2cam"] = T_base2cam
@@ -451,7 +443,6 @@ def _process_episode(args: argparse.Namespace, masker,
         "final_metrics": _aggregate(final_rows),
         "init_reprojection": init_reproj,
         "written_reprojection": reproj,
-        "max_reproj_worsen_px": args.max_reproj_worsen_px,
     }
     out_path = ep_seg / args.out_pnp_json_name
     out_path.write_text(json.dumps(out, indent=2))
@@ -518,12 +509,6 @@ def main() -> None:
     parser.add_argument("--sweeps_per_scale", type=int, default=4)
     parser.add_argument("--max_evals", type=int, default=240)
     parser.add_argument("--min_loss_improvement", type=float, default=1e-4)
-    parser.add_argument(
-        "--max_reproj_worsen_px",
-        type=float,
-        default=3.0,
-        help="Keep the initial PnP pose if silhouette refinement worsens TCP reprojection RMSE by more than this.",
-    )
     parser.add_argument("--polish", action="store_true", default=True)
     parser.add_argument("--no_polish", dest="polish", action="store_false")
     parser.add_argument("--w_target_to_render", type=float, default=1.0)
@@ -567,21 +552,26 @@ def main() -> None:
         if p.is_dir() and p.name.startswith("episode_")
     )
     results = []
-    for ep in episodes:
-        result = _process_episode(args, masker, ep)
-        results.append(result)
-        if result.get("status") == "ok":
-            marker = "improved" if result["improved"] else "kept"
-            print(
-                f"[{args.dataset}/{ep}] {marker} "
-                f"loss {result['init_loss']:.3f}->{result['written_loss']:.3f} "
-                f"iou={result.get('iou_median', 0.0):.3f} "
-                f"cov={result.get('coverage_median', 0.0):.3f} "
-                f"t2r={result.get('t2r_median', 0.0):.2f}px "
-                f"evals={result['num_evals']} n={result['num_samples']}"
-            )
-        else:
-            print(f"[{args.dataset}/{ep}] {result.get('status')}")
+    try:
+        for ep in episodes:
+            result = _process_episode(args, masker, ep)
+            results.append(result)
+            if result.get("status") == "ok":
+                marker = "improved" if result["improved"] else "kept"
+                print(
+                    f"[{args.dataset}/{ep}] {marker} "
+                    f"loss {_fmt_metric(result.get('init_loss'))}->{_fmt_metric(result.get('written_loss'))} "
+                    f"iou={_fmt_metric(result.get('iou_median'))} "
+                    f"cov={_fmt_metric(result.get('coverage_median'))} "
+                    f"t2r={_fmt_metric(result.get('t2r_median'), 2)}px "
+                    f"evals={result.get('num_evals')} n={result.get('num_samples')}"
+                )
+            else:
+                print(f"[{args.dataset}/{ep}] {result.get('status')}")
+    finally:
+        close = getattr(masker, "close", None)
+        if callable(close):
+            close()
 
     out_path = args.summary_json
     if out_path is None:

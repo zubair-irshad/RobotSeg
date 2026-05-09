@@ -29,6 +29,9 @@ SEG_EXTRA_ARGS_STR="${SEG_EXTRA_ARGS_STR:---no_require_gripper_near_arm --relax_
 PNP_EXTRA_ARGS_STR="${PNP_EXTRA_ARGS_STR:---no_use_observed_flag --no_use_mask_stage_accept --no_reject_fragmented --min_conf 0.0 --min_conf_max 0.0 --min_gripper_area_px 8 --min_post_subtract_area_ratio 0.0}"
 RUN_URDF_IK="${RUN_URDF_IK:-0}"
 RUN_AUGE_IK="${RUN_AUGE_IK:-0}"
+RUN_VIEWPOINT_CHECK="${RUN_VIEWPOINT_CHECK:-0}"
+RUN_SILHOUETTE_REFINE="${RUN_SILHOUETTE_REFINE:-0}"
+REFINED_PNP_JSON_NAME="${REFINED_PNP_JSON_NAME:-pnp_fovy${FRACTAL_CAMERA_FOV}_silhouette_refined.json}"
 AUGE_ROOT="${AUGE_ROOT:-$HOME/AugE-Toolkit}"
 GOOGLE_URDF_PATH="${GOOGLE_URDF_PATH:-$HOME/RobotSeg/data/urdfs/google_robot/google_robot_description/urdf/google_robot.urdf}"
 GOOGLE_URDF_BACKEND="${GOOGLE_URDF_BACKEND:-yourdfpy}"
@@ -115,13 +118,35 @@ fi
   "${PNP_EXTRA_ARGS[@]}" \
   --viz
 
+VIS_PNP_JSON_NAME="$PNP_JSON_NAME"
+if [[ "$RUN_SILHOUETTE_REFINE" == "1" ]]; then
+  if [[ "$RUN_AUGE_IK" != "1" || ! -f "$GOOGLE_MUJOCO_XML_PATH" ]]; then
+    echo "[warn] silhouette refinement needs RUN_AUGE_IK=1 and GOOGLE_MUJOCO_XML_PATH=$GOOGLE_MUJOCO_XML_PATH" >&2
+  else
+    echo
+    echo "==> refine PnP cam2base against MuJoCo Google Robot body silhouettes"
+    "$PYTHON" "$REPO_ROOT/tools/refine_cam2base_silhouette.py" \
+      --oxe_root "$OXE_ROOT" \
+      --mask_root "$MASK_ROOT" \
+      --dataset "$DATASET" \
+      --pnp_json_name "$PNP_JSON_NAME" \
+      --out_pnp_json_name "$REFINED_PNP_JSON_NAME" \
+      --mujoco_xml_path "$GOOGLE_MUJOCO_XML_PATH" \
+      --mask_dirs 000 \
+      --frame_stride 4 \
+      --max_frames 24 \
+      --viz_dir_name silhouette_refined_viz
+    VIS_PNP_JSON_NAME="$REFINED_PNP_JSON_NAME"
+  fi
+fi
+
 echo
 echo "==> TCP projection panels: projected Fractal observation['state'][:3] vs gripper centroid"
 "$PYTHON" "$REPO_ROOT/tools/viz_eef_projection.py" \
   --oxe_root "$OXE_ROOT" \
   --mask_root "$MASK_ROOT" \
   --dataset "$DATASET" \
-  --pnp_json_name "$PNP_JSON_NAME" \
+  --pnp_json_name "$VIS_PNP_JSON_NAME" \
   --frames_from_pnp kept \
   --frame_stride 1 \
   --max_frames 0 \
@@ -150,10 +175,25 @@ fi
   --oxe_root "$OXE_ROOT" \
   --mask_root "$MASK_ROOT" \
   --dataset "$DATASET" \
-  --pnp_json_name "$PNP_JSON_NAME" \
+  --pnp_json_name "$VIS_PNP_JSON_NAME" \
   --out_dir_name pnp_audit_fractal \
   "${AUDIT_URDF_ARGS[@]}" \
   --skip_bad_pnp
+
+if [[ "$RUN_VIEWPOINT_CHECK" == "1" ]]; then
+  if [[ ! -f "$GOOGLE_MUJOCO_XML_PATH" ]]; then
+    echo "[warn] Google Robot MuJoCo XML not found: $GOOGLE_MUJOCO_XML_PATH" >&2
+  else
+    echo
+    echo "==> MuJoCo free-camera viewpoint sanity check"
+    "$PYTHON" "$REPO_ROOT/tools/viz_fractal_mujoco_viewpoints.py" \
+      --oxe_root "$OXE_ROOT" \
+      --mask_root "$MASK_ROOT" \
+      --dataset "$DATASET" \
+      --pnp_json_name "$VIS_PNP_JSON_NAME" \
+      --mujoco_xml_path "$GOOGLE_MUJOCO_XML_PATH"
+  fi
+fi
 
 if [[ "$RUN_URDF_IK" == "1" ]]; then
   if [[ ! -f "$GOOGLE_URDF_PATH" ]]; then
@@ -174,7 +214,7 @@ if [[ "$RUN_URDF_IK" == "1" ]]; then
       --oxe_root "$OXE_ROOT" \
       --mask_root "$MASK_ROOT" \
       --dataset "$DATASET" \
-      --pnp_json_name "$PNP_JSON_NAME" \
+      --pnp_json_name "$VIS_PNP_JSON_NAME" \
       --urdf_path "$GOOGLE_URDF_PATH" \
       --urdf_backend "$GOOGLE_URDF_BACKEND" \
       --skip_bad_pnp \
@@ -187,12 +227,14 @@ echo "==> PnP reprojection summary"
 "$PYTHON" "$REPO_ROOT/tools/summarize_pnp_errors.py" \
   --mask_root "$MASK_ROOT" \
   --dataset "$DATASET" \
-  --pnp_json_name "$PNP_JSON_NAME"
+  --pnp_json_name "$VIS_PNP_JSON_NAME"
 
 echo
 echo "Done."
 echo "Masks:       $MASK_ROOT/$DATASET/episode_XXXX/{000,001,combined}/"
 echo "PnP JSON:    $MASK_ROOT/$DATASET/episode_XXXX/$PNP_JSON_NAME"
+echo "Refined PnP: $MASK_ROOT/$DATASET/episode_XXXX/$REFINED_PNP_JSON_NAME (when RUN_SILHOUETTE_REFINE=1)"
 echo "TCP panels:  $MASK_ROOT/$DATASET/episode_XXXX/tcp_pnp_candidate_compare/"
 echo "PnP audit:   $MASK_ROOT/$DATASET/episode_XXXX/pnp_audit_fractal/"
+echo "Viewpoints:  $MASK_ROOT/$DATASET/episode_XXXX/mujoco_viewpoint_check/ (when RUN_VIEWPOINT_CHECK=1)"
 echo "URDF IK:     $MASK_ROOT/$DATASET/episode_XXXX/urdf_tcp_ik_overlay/ (when RUN_URDF_IK=1)"

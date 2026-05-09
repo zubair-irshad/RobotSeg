@@ -162,7 +162,12 @@ def _load_samples(args: argparse.Namespace, ep_oxe: Path, ep_seg: Path,
         return [], {"bad-image-size": 1}
 
     traj = np.load(ep_oxe / "trajectory.npz")
-    joints = _load_joint_array(traj, args.joint_key)
+    if getattr(args, "mujoco_xml_path", None) is not None and "google_robot_all_qpos" in traj.files:
+        joints = np.asarray(traj["google_robot_all_qpos"], dtype=np.float64)
+        if joints.ndim == 1:
+            joints = joints.reshape(1, -1)
+    else:
+        joints = _load_joint_array(traj, args.joint_key)
     gripper = _load_gripper_array(traj, len(joints), args.gripper_key)
     stems = _available_stems(ep_seg, args.mask_dirs)
     if args.frame_stride > 1:
@@ -212,7 +217,7 @@ def _load_samples(args: argparse.Namespace, ep_oxe: Path, ep_seg: Path,
     return samples, skips
 
 
-def _score_pose(args: argparse.Namespace, masker: URDFRobotMasker,
+def _score_pose(args: argparse.Namespace, masker,
                 samples: list[dict[str, Any]], K: dict[str, Any],
                 T_cam2base: np.ndarray) -> tuple[float, list[dict[str, float]]]:
     rows: list[dict[str, float]] = []
@@ -322,7 +327,7 @@ def _optimize_pose(args: argparse.Namespace, objective) -> tuple[np.ndarray, flo
 
 
 def _write_viz(args: argparse.Namespace, ep_oxe: Path, ep_seg: Path,
-               masker: URDFRobotMasker, samples: list[dict[str, Any]],
+               masker, samples: list[dict[str, Any]],
                K: dict[str, Any], T_cam2base: np.ndarray,
                rows: list[dict[str, float]]) -> None:
     if not args.viz_dir_name:
@@ -355,7 +360,7 @@ def _write_viz(args: argparse.Namespace, ep_oxe: Path, ep_seg: Path,
         cv2.imwrite(str(target_mask_dir / f"{stem}.png"), sample["target"].astype(np.uint8) * 255)
 
 
-def _process_episode(args: argparse.Namespace, masker: URDFRobotMasker,
+def _process_episode(args: argparse.Namespace, masker,
                      ep_name: str) -> dict[str, Any]:
     ep_oxe = args.oxe_root / args.dataset / ep_name
     ep_seg = args.mask_root / args.dataset / ep_name
@@ -457,6 +462,17 @@ def main() -> None:
     parser.add_argument("--urdf_path", type=Path, default=DEFAULT_URDF)
     parser.add_argument("--mesh_dir", type=Path, default=None)
     parser.add_argument("--urdf_backend", choices=["simple", "yourdfpy", "auto"], default="yourdfpy")
+    parser.add_argument(
+        "--mujoco_xml_path",
+        type=Path,
+        default=None,
+        help="Render silhouettes with this MuJoCo XML and trajectory['google_robot_all_qpos'] instead of URDF joints.",
+    )
+    parser.add_argument(
+        "--mujoco_postprocess",
+        choices=["none", "auge", "flip_x", "flip_y", "rot180"],
+        default="none",
+    )
     parser.add_argument("--mask_dirs", nargs="+", default=["000"])
     parser.add_argument("--subtract_mask_dirs", nargs="+", default=[])
     parser.add_argument("--render_link_prefixes", default="panda_link")
@@ -491,21 +507,30 @@ def main() -> None:
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
-    include_prefixes = _parse_prefixes(args.render_link_prefixes)
-    exclude_prefixes = _parse_prefixes(args.exclude_render_link_prefixes)
-    urdf_path = args.urdf_path
-    if include_prefixes or exclude_prefixes:
-        urdf_path = _write_pruned_urdf(args.urdf_path, include_prefixes, exclude_prefixes)
-        print(f"[urdf_refine] pruned URDF: {urdf_path}")
+    if args.mujoco_xml_path is not None:
+        from mujoco_google_robot_renderer import MuJoCoGoogleRobotRenderer  # noqa: E402
 
-    masker = URDFRobotMasker(
-        urdf_path,
-        mesh_dir=args.mesh_dir,
-        backend=args.urdf_backend,
-        downsample=args.downsample,
-        dilate_px=args.dilate_px,
-        verbose=True,
-    )
+        masker = MuJoCoGoogleRobotRenderer(
+            args.mujoco_xml_path,
+            verbose=True,
+            postprocess=args.mujoco_postprocess,
+        )
+    else:
+        include_prefixes = _parse_prefixes(args.render_link_prefixes)
+        exclude_prefixes = _parse_prefixes(args.exclude_render_link_prefixes)
+        urdf_path = args.urdf_path
+        if include_prefixes or exclude_prefixes:
+            urdf_path = _write_pruned_urdf(args.urdf_path, include_prefixes, exclude_prefixes)
+            print(f"[urdf_refine] pruned URDF: {urdf_path}")
+
+        masker = URDFRobotMasker(
+            urdf_path,
+            mesh_dir=args.mesh_dir,
+            backend=args.urdf_backend,
+            downsample=args.downsample,
+            dilate_px=args.dilate_px,
+            verbose=True,
+        )
 
     ds_seg = args.mask_root / args.dataset
     episodes = args.episodes or sorted(

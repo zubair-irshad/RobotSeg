@@ -96,7 +96,7 @@ def _centroid(entry: Any) -> np.ndarray | None:
     return arr[:2] if arr.size >= 2 else None
 
 
-def _load_joints(traj: np.lib.npyio.NpzFile) -> np.ndarray:
+def _load_joints(traj: np.lib.npyio.NpzFile) -> np.ndarray | None:
     for key in ("joint_position", "joint_positions", "joints", "q", "arm_joints"):
         if key in traj.files:
             arr = np.asarray(traj[key], dtype=np.float64)
@@ -104,7 +104,7 @@ def _load_joints(traj: np.lib.npyio.NpzFile) -> np.ndarray:
                 arr = arr.reshape(1, -1)
             if arr.shape[1] >= 7:
                 return arr[:, :7]
-    raise ValueError("trajectory.npz has no joint_position-like array")
+    return None
 
 
 def _load_gripper(traj: np.lib.npyio.NpzFile, n: int) -> np.ndarray:
@@ -341,8 +341,18 @@ def process_episode(args: argparse.Namespace, ep_name: str,
 
     with np.load(ep_oxe / "trajectory.npz", allow_pickle=True) as traj:
         joints = _load_joints(traj)
-        gripper = _load_gripper(traj, len(joints))
-        eef = _load_eef(traj, len(joints))
+        if joints is not None:
+            n_traj = len(joints)
+            gripper = _load_gripper(traj, n_traj)
+        else:
+            if "eef_xyz" in traj.files:
+                n_traj = int(np.asarray(traj["eef_xyz"]).shape[0])
+            elif "state" in traj.files:
+                n_traj = int(np.asarray(traj["state"]).shape[0])
+            else:
+                n_traj = 0
+            gripper = np.zeros(n_traj, dtype=np.float64)
+        eef = _load_eef(traj, n_traj)
 
     out_dir = ep_seg / args.out_dir_name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -355,7 +365,7 @@ def process_episode(args: argparse.Namespace, ep_name: str,
     for ordinal, img_path in enumerate(frames):
         if img_path not in selected:
             continue
-        idx = _frame_idx(img_path.stem, ordinal, len(joints))
+        idx = _frame_idx(img_path.stem, ordinal, n_traj)
         if idx is None:
             continue
         c = _centroid(centroids.get(img_path.stem))
@@ -368,7 +378,7 @@ def process_episode(args: argparse.Namespace, ep_name: str,
         points: dict[str, np.ndarray] = {}
         if eef is not None:
             points["eef_xyz"] = eef[idx]
-        if masker is not None:
+        if masker is not None and joints is not None:
             cfg = masker._cfg(joints[idx], float(gripper[idx]))
             link_T = masker.robot.link_transforms(cfg)
             for link in args.links:
@@ -502,6 +512,8 @@ def main() -> None:
     parser.add_argument("--extrinsics_sixd_mode", choices=SIXD_MODES, default="rpy_cam2base")
     parser.add_argument("--camera_serial", default=None)
     parser.add_argument("--urdf_path", type=Path, default=DEFAULT_URDF)
+    parser.add_argument("--no_urdf", action="store_true",
+                        help="Only draw candidates available without URDF FK, e.g. eef_xyz.")
     parser.add_argument("--urdf_backend", choices=["simple", "yourdfpy", "auto"], default="simple")
     parser.add_argument("--image_source", choices=["auto", "raw", "combined"], default="auto")
     parser.add_argument("--out_dir_name", default="eef_projection_viz")
@@ -559,8 +571,10 @@ def main() -> None:
     episodes = args.episodes or sorted(
         p.name for p in ds_seg.iterdir() if p.is_dir() and p.name.startswith("episode_")
     )
-    masker = URDFRobotMasker(args.urdf_path, backend=args.urdf_backend, downsample=4,
-                             dilate_px=0, verbose=False)
+    masker = None
+    if not args.no_urdf:
+        masker = URDFRobotMasker(args.urdf_path, backend=args.urdf_backend, downsample=4,
+                                 dilate_px=0, verbose=False)
 
     results = []
     for ep in episodes:

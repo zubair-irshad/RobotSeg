@@ -23,6 +23,7 @@ import numpy as np
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 from cam2base_json import invert_se3  # noqa: E402
+from pnp_oxe import EE_XYZ_DIMS, _fk_point_sequence, _K_to_mat  # noqa: E402
 from score_urdf_silhouette import (  # noqa: E402
     _aggregate,
     _available_stems,
@@ -47,6 +48,96 @@ def _T_to_rvec_tvec(T_cam2base: np.ndarray) -> tuple[list[float], list[float], l
         T_base2cam[:3, 3].astype(float).tolist(),
         T_base2cam.astype(float).tolist(),
     )
+
+
+def _centroid(entry: Any) -> np.ndarray | None:
+    if entry is None:
+        return None
+    if isinstance(entry, dict):
+        val = entry.get("centroid")
+    else:
+        val = entry
+    if val is None:
+        return None
+    arr = np.asarray(val, dtype=np.float64).reshape(-1)
+    return arr[:2] if arr.size >= 2 else None
+
+
+def _reprojection_metrics(
+    args: argparse.Namespace,
+    ep_oxe: Path,
+    ep_seg: Path,
+    pnp: dict[str, Any],
+    K: dict[str, Any],
+    rvec: list[float],
+    tvec: list[float],
+) -> dict[str, Any]:
+    stems = pnp.get("inlier_stems") or pnp.get("kept_stems") or []
+    if not stems:
+        return {"num_reprojection_stems": 0}
+    centroids_path = ep_seg / "001" / "centroids.json"
+    traj_path = ep_oxe / "trajectory.npz"
+    if not centroids_path.exists() or not traj_path.exists():
+        return {"num_reprojection_stems": 0}
+    centroids = json.loads(centroids_path.read_text())
+    with np.load(traj_path, allow_pickle=True) as traj:
+        n = max([int(s) for s in stems if str(s).isdigit()] + [0]) + 1
+        source = pnp.get("point_source", "eef_xyz")
+        if source == "eef_xyz":
+            if "eef_xyz" in traj.files:
+                points = np.asarray(traj["eef_xyz"], dtype=np.float64)
+            else:
+                state = np.asarray(traj["state"], dtype=np.float64)
+                a, b = EE_XYZ_DIMS[args.dataset]
+                points = state[:, a:b]
+        else:
+            fk_args = argparse.Namespace(
+                pnp_point_source=source,
+                urdf_path=args.urdf_path,
+                mesh_dir=args.mesh_dir,
+                urdf_backend=args.urdf_backend,
+            )
+            points, status = _fk_point_sequence(traj, n, fk_args)
+            if points is None:
+                return {"num_reprojection_stems": 0, "reprojection_skip": status}
+
+    K_mat = _K_to_mat(K)
+    rvec_arr = np.asarray(rvec, dtype=np.float64).reshape(3, 1)
+    tvec_arr = np.asarray(tvec, dtype=np.float64).reshape(3, 1)
+    errors = []
+    used = []
+    for stem in stems:
+        stem = str(stem)
+        if not stem.isdigit():
+            continue
+        idx = int(stem)
+        if idx >= len(points):
+            continue
+        c = _centroid(centroids.get(stem))
+        if c is None:
+            continue
+        uv, _ = cv2.projectPoints(
+            np.asarray(points[idx], dtype=np.float64).reshape(1, 3),
+            rvec_arr,
+            tvec_arr,
+            K_mat,
+            np.zeros(5),
+        )
+        err = float(np.linalg.norm(uv.reshape(2) - c))
+        if np.isfinite(err):
+            errors.append(err)
+            used.append(stem)
+    if not errors:
+        return {"num_reprojection_stems": 0}
+    arr = np.asarray(errors, dtype=np.float64)
+    return {
+        "num_reprojection_stems": len(used),
+        "reprojection_stems": used,
+        "rmse_px": float(np.sqrt(np.mean(arr ** 2))),
+        "max_err_px": float(arr.max()),
+        "mean_err_px": float(arr.mean()),
+        "median_err_px": float(np.median(arr)),
+    }
 
 
 def _apply_delta(T0: np.ndarray, x: np.ndarray) -> np.ndarray:
@@ -314,6 +405,11 @@ def _process_episode(args: argparse.Namespace, masker: URDFRobotMasker,
     out["pose_source"] = "silhouette_refined" if improved else "silhouette_refine_kept_initial"
     out["refined_from_pnp_json"] = args.pnp_json_name
     out["refined_from_pnp_rmse_px"] = pnp.get("rmse_px")
+    reproj = _reprojection_metrics(args, ep_oxe, ep_seg, pnp, K, rvec, tvec)
+    if "rmse_px" in reproj:
+        out["rmse_px"] = reproj["rmse_px"]
+        out["max_err_px"] = reproj["max_err_px"]
+        out["refined_reprojection"] = reproj
     out["silhouette_refinement"] = {
         "status": "improved" if improved else "kept-initial",
         "init_loss": init_loss,

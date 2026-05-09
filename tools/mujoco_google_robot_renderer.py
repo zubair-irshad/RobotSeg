@@ -139,6 +139,16 @@ class MuJoCoGoogleRobotRenderer:
             self.data.qpos[7:9] = 0.333 + g * (1.0 - 0.333)
         self.mujoco.mj_forward(self.model, self.data)
 
+        # Primary path: render only the robot visual geom group into an empty
+        # scene and threshold non-background RGB. This is more reliable across
+        # MuJoCo versions than depth, whose background value can appear finite.
+        self.renderer.update_scene(self.data, camera="pnp_cam", scene_option=self.scene_option)
+        rgb = self.renderer.render()
+        mask = np.any(rgb > 12, axis=2)
+        area = int(mask.sum())
+        if 0 < area < int(0.65 * mask.size):
+            return mask
+
         try:
             self.renderer.update_scene(self.data, camera="pnp_cam", scene_option=self.scene_option)
             self.renderer.enable_segmentation_rendering()
@@ -146,14 +156,14 @@ class MuJoCoGoogleRobotRenderer:
             self.renderer.disable_segmentation_rendering()
             if seg.ndim == 3:
                 if np.issubdtype(seg.dtype, np.signedinteger):
-                    mask = np.any(seg >= 0, axis=2)
+                    mask = seg[..., 0] >= 0
                 else:
-                    mask = np.any(seg > 0, axis=2)
+                    mask = seg[..., 0] > 0
             else:
                 mask = seg >= 0 if np.issubdtype(seg.dtype, np.signedinteger) else seg > 0
             # If segmentation semantics differ across MuJoCo versions and mark
             # most of the frame as foreground, fall back to depth.
-            if 0 < int(mask.sum()) < int(0.8 * mask.size):
+            if 0 < int(mask.sum()) < int(0.65 * mask.size):
                 return mask
         except Exception:
             try:
@@ -166,8 +176,8 @@ class MuJoCoGoogleRobotRenderer:
             self.renderer.enable_depth_rendering()
             depth = self.renderer.render()
             self.renderer.disable_depth_rendering()
-            mask = np.isfinite(depth) & (depth > 0.0)
-            if 0 < int(mask.sum()) < int(0.8 * mask.size):
+            mask = np.isfinite(depth) & (depth > 0.0) & (depth < 0.99)
+            if 0 < int(mask.sum()) < int(0.65 * mask.size):
                 return mask
         except Exception:
             try:
@@ -175,9 +185,7 @@ class MuJoCoGoogleRobotRenderer:
             except Exception:
                 pass
 
-        self.renderer.update_scene(self.data, camera="pnp_cam", scene_option=self.scene_option)
-        rgb = self.renderer.render()
-        return np.any(rgb > 5, axis=2)
+        return np.zeros(image_hw, dtype=bool)
 
     def overlay(self, image: np.ndarray, K: dict[str, float], T_cam2base: np.ndarray,
                 joint_positions: np.ndarray, gripper_position: float = 0.0,

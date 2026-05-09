@@ -93,20 +93,23 @@ class MuJoCoGoogleRobotRenderer:
         self.renderer = None
         self.postprocess = postprocess
 
-    def _postprocess_mask(self, mask: np.ndarray) -> np.ndarray:
-        if self.postprocess == "none":
+    def _postprocess_mask(self, mask: np.ndarray, mode: str | None = None) -> np.ndarray:
+        mode = self.postprocess if mode is None else mode
+        if mode == "none":
             return mask
-        if self.postprocess == "auge":
+        if mode == "auge":
             # Matches AugE core.utils.get_overlay_img:
             #   cv2.flip(mask, 1), then cv2.rotate(..., ROTATE_180)
+            # Only use this with low-level mjr_readPixels-style buffers.
+            # mujoco.Renderer.render() already returns top-left image order.
             return cv2.rotate(cv2.flip(mask.astype(np.uint8), 1), cv2.ROTATE_180) > 0
-        if self.postprocess == "flip_x":
+        if mode == "flip_x":
             return cv2.flip(mask.astype(np.uint8), 1) > 0
-        if self.postprocess == "flip_y":
+        if mode == "flip_y":
             return cv2.flip(mask.astype(np.uint8), 0) > 0
-        if self.postprocess == "rot180":
+        if mode == "rot180":
             return cv2.rotate(mask.astype(np.uint8), cv2.ROTATE_180) > 0
-        raise ValueError(f"unknown MuJoCo postprocess: {self.postprocess}")
+        raise ValueError(f"unknown MuJoCo postprocess: {mode}")
 
     def _ensure_renderer(self, K: dict[str, float], T_cam2base: np.ndarray,
                          image_hw: tuple[int, int]):
@@ -142,7 +145,8 @@ class MuJoCoGoogleRobotRenderer:
 
     def render(self, K: dict[str, float], T_cam2base: np.ndarray,
                qpos: np.ndarray, gripper_position: float = 0.0,
-               image_hw: tuple[int, int] | None = None) -> np.ndarray:
+               image_hw: tuple[int, int] | None = None,
+               postprocess: str | None = None) -> np.ndarray:
         if image_hw is None:
             image_hw = (int(K["height"]), int(K["width"]))
         self._ensure_renderer(K, T_cam2base, image_hw)
@@ -164,7 +168,7 @@ class MuJoCoGoogleRobotRenderer:
         mask = np.any(rgb > 12, axis=2)
         area = int(mask.sum())
         if 0 < area < int(0.65 * mask.size):
-            return self._postprocess_mask(mask)
+            return self._postprocess_mask(mask, postprocess)
 
         try:
             self.renderer.update_scene(self.data, camera="pnp_cam", scene_option=self.scene_option)
@@ -181,7 +185,7 @@ class MuJoCoGoogleRobotRenderer:
             # If segmentation semantics differ across MuJoCo versions and mark
             # most of the frame as foreground, fall back to depth.
             if 0 < int(mask.sum()) < int(0.65 * mask.size):
-                return self._postprocess_mask(mask)
+                return self._postprocess_mask(mask, postprocess)
         except Exception:
             try:
                 self.renderer.disable_segmentation_rendering()
@@ -195,7 +199,7 @@ class MuJoCoGoogleRobotRenderer:
             self.renderer.disable_depth_rendering()
             mask = np.isfinite(depth) & (depth > 0.0) & (depth < 0.99)
             if 0 < int(mask.sum()) < int(0.65 * mask.size):
-                return self._postprocess_mask(mask)
+                return self._postprocess_mask(mask, postprocess)
         except Exception:
             try:
                 self.renderer.disable_depth_rendering()
@@ -209,9 +213,9 @@ class MuJoCoGoogleRobotRenderer:
                 color_bgr=(255, 170, 40), outline_bgr=(255, 225, 120),
                 outline_px: int = 1, alpha: float = 0.60):
         mask = self.render(
-            K,
-            T_cam2base,
-            joint_positions,
+            K=K,
+            T_cam2base=T_cam2base,
+            qpos=joint_positions,
             gripper_position=gripper_position,
             image_hw=image.shape[:2],
         )

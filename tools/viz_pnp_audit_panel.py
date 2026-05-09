@@ -374,7 +374,8 @@ def main() -> None:
         "--mujoco_postprocess",
         choices=["none", "auge", "flip_x", "flip_y", "rot180"],
         default="none",
-        help="Optional postprocess for MuJoCo masks. 'auge' matches AugE get_overlay_img.",
+        help="Optional postprocess for MuJoCo masks. Keep 'none' for mujoco.Renderer.render(); "
+             "'auge' is only for low-level AugE/mjr_readPixels-style buffers.",
     )
     parser.add_argument("--urdf_path", type=Path, default=DEFAULT_URDF)
     parser.add_argument("--mesh_dir", type=Path, default=None)

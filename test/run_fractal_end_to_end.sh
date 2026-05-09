@@ -223,11 +223,20 @@ if [[ "$RUN_URDF_IK" == "1" ]]; then
 fi
 
 echo
-echo "==> PnP reprojection summary"
+echo "==> PnP reprojection summary: base $PNP_JSON_NAME"
 "$PYTHON" "$REPO_ROOT/tools/summarize_pnp_errors.py" \
   --mask_root "$MASK_ROOT" \
   --dataset "$DATASET" \
-  --pnp_json_name "$VIS_PNP_JSON_NAME"
+  --pnp_json_name "$PNP_JSON_NAME"
+
+if [[ "$VIS_PNP_JSON_NAME" != "$PNP_JSON_NAME" ]]; then
+  echo
+  echo "==> PnP reprojection summary: refined $VIS_PNP_JSON_NAME"
+  "$PYTHON" "$REPO_ROOT/tools/summarize_pnp_errors.py" \
+    --mask_root "$MASK_ROOT" \
+    --dataset "$DATASET" \
+    --pnp_json_name "$VIS_PNP_JSON_NAME"
+fi
 
 echo
 echo "Done."

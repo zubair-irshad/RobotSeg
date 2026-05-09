@@ -382,6 +382,11 @@ def _process_episode(args: argparse.Namespace, masker,
 
     T0 = np.asarray(pnp["T_cam2base"], dtype=np.float64)
     init_loss, init_rows = _score_pose(args, masker, samples, K, T0)
+    init_rvec = pnp.get("rvec")
+    init_tvec = pnp.get("tvec")
+    init_reproj = {}
+    if init_rvec is not None and init_tvec is not None:
+        init_reproj = _reprojection_metrics(args, ep_oxe, ep_seg, pnp, K, init_rvec, init_tvec)
 
     cache: dict[tuple[float, ...], float] = {}
 
@@ -402,6 +407,22 @@ def _process_episode(args: argparse.Namespace, masker,
     loss_out = final_loss if improved else init_loss
 
     rvec, tvec, T_base2cam = _T_to_rvec_tvec(T_out)
+    reproj = _reprojection_metrics(args, ep_oxe, ep_seg, pnp, K, rvec, tvec)
+    init_rmse = init_reproj.get("rmse_px")
+    final_rmse = reproj.get("rmse_px")
+    if (
+        improved
+        and init_rmse is not None
+        and final_rmse is not None
+        and float(final_rmse) > float(init_rmse) + float(args.max_reproj_worsen_px)
+    ):
+        improved = False
+        T_out = T0
+        rows_out = init_rows
+        loss_out = init_loss
+        rvec, tvec, T_base2cam = _T_to_rvec_tvec(T_out)
+        reproj = init_reproj
+
     out = copy.deepcopy(pnp)
     out["T_cam2base"] = np.asarray(T_out, dtype=float).tolist()
     out["T_base2cam"] = T_base2cam
@@ -410,7 +431,6 @@ def _process_episode(args: argparse.Namespace, masker,
     out["pose_source"] = "silhouette_refined" if improved else "silhouette_refine_kept_initial"
     out["refined_from_pnp_json"] = args.pnp_json_name
     out["refined_from_pnp_rmse_px"] = pnp.get("rmse_px")
-    reproj = _reprojection_metrics(args, ep_oxe, ep_seg, pnp, K, rvec, tvec)
     if "rmse_px" in reproj:
         out["rmse_px"] = reproj["rmse_px"]
         out["max_err_px"] = reproj["max_err_px"]
@@ -429,6 +449,9 @@ def _process_episode(args: argparse.Namespace, masker,
         "metrics": _aggregate(rows_out),
         "init_metrics": _aggregate(init_rows),
         "final_metrics": _aggregate(final_rows),
+        "init_reprojection": init_reproj,
+        "written_reprojection": reproj,
+        "max_reproj_worsen_px": args.max_reproj_worsen_px,
     }
     out_path = ep_seg / args.out_pnp_json_name
     out_path.write_text(json.dumps(out, indent=2))
@@ -495,6 +518,12 @@ def main() -> None:
     parser.add_argument("--sweeps_per_scale", type=int, default=4)
     parser.add_argument("--max_evals", type=int, default=240)
     parser.add_argument("--min_loss_improvement", type=float, default=1e-4)
+    parser.add_argument(
+        "--max_reproj_worsen_px",
+        type=float,
+        default=3.0,
+        help="Keep the initial PnP pose if silhouette refinement worsens TCP reprojection RMSE by more than this.",
+    )
     parser.add_argument("--polish", action="store_true", default=True)
     parser.add_argument("--no_polish", dest="polish", action="store_false")
     parser.add_argument("--w_target_to_render", type=float, default=1.0)

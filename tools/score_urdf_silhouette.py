@@ -199,8 +199,8 @@ def _make_score_viz(image_bgr: np.ndarray, target: np.ndarray,
 
     panels = [target_panel, render_panel, diff_panel]
     labels = [
-        "body mask",
-        "panda render",
+        "target mask",
+        "robot render",
         "diff green=target red=render yellow=overlap",
     ]
     for panel, label in zip(panels, labels):

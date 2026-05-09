@@ -307,7 +307,12 @@ def process_episode(episode, cfg: dict, ep_dir: Path, frame_stride: int) -> dict
             v = _nested_get(step["observation"], joint_key)
             if v is not None:
                 try:
-                    joint_positions.append(np.asarray(v).ravel())
+                    joint = np.asarray(v).ravel()
+                    if ds_name == "berkeley_autolab_ur5":
+                        # robot_state[15]: arm joints are [0:6]; dim 6 is
+                        # gripper_is_closed, and [7:10] is TCP xyz.
+                        joint = joint[:6]
+                    joint_positions.append(joint)
                 except Exception:
                     pass
 

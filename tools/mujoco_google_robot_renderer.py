@@ -143,7 +143,11 @@ class MuJoCoGoogleRobotRenderer:
                 self.scene_option.geomgroup[group] = 1
         self._cache_key = key
         if self.verbose:
-            print(f"[mujoco_render] loaded {self.xml_path} camera=pnp_cam size={W}x{H}")
+            print(
+                f"[mujoco_render] loaded {self.xml_path} camera=pnp_cam "
+                f"size={W}x{H} nq={self.model.nq} ngeom={self.model.ngeom} "
+                f"geom_groups={self.geom_groups}"
+            )
 
     def render(self, K: dict[str, float], T_cam2base: np.ndarray,
                qpos: np.ndarray, gripper_position: float = 0.0,

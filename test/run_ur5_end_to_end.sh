@@ -26,10 +26,13 @@ PNP_EXTRA_ARGS_STR="${PNP_EXTRA_ARGS_STR:---no_use_observed_flag --no_use_mask_s
 SEG_EXTRA_ARGS_STR="${SEG_EXTRA_ARGS_STR:---no_require_gripper_near_arm --relax_gripper_observed}"
 RUN_MUJOCO_RENDER="${RUN_MUJOCO_RENDER:-1}"
 RUN_SILHOUETTE_REFINE="${RUN_SILHOUETTE_REFINE:-0}"
+RUN_VIEWPOINT_INIT_REFINE="${RUN_VIEWPOINT_INIT_REFINE:-0}"
 AUGE_ROOT="${AUGE_ROOT:-$HOME/AugE-Toolkit}"
 UR5_MUJOCO_XML_PATH="${UR5_MUJOCO_XML_PATH:-$AUGE_ROOT/robot_xml/universal_robots_ur5e/scene.xml}"
 UR5_MUJOCO_QPOS_KEY="${UR5_MUJOCO_QPOS_KEY:-joint_position}"
-UR5_MUJOCO_GEOM_GROUPS="${UR5_MUJOCO_GEOM_GROUPS:-0,1,2,3,4,5}"
+UR5_MUJOCO_GEOM_GROUPS="${UR5_MUJOCO_GEOM_GROUPS:-2}"
+UR5_VIEWPOINTS_JSON="${UR5_VIEWPOINTS_JSON:-$REPO_ROOT/data/viewpoints/berkeley_autolab_ur5_viewpoints.json}"
+VIEWPOINT_REFINED_PNP_JSON_NAME="${VIEWPOINT_REFINED_PNP_JSON_NAME:-pnp_fovy${UR5_CAMERA_FOV}_viewpoint_silhouette_refined.json}"
 SIL_REFINE_FRAME_STRIDE="${SIL_REFINE_FRAME_STRIDE:-4}"
 SIL_REFINE_MAX_FRAMES="${SIL_REFINE_MAX_FRAMES:-24}"
 SIL_REFINE_MAX_EVALS="${SIL_REFINE_MAX_EVALS:-240}"
@@ -113,6 +116,27 @@ if [[ "$RUN_SILHOUETTE_REFINE" == "1" ]]; then
       --max_evals "$SIL_REFINE_MAX_EVALS" \
       --viz_dir_name silhouette_refined_viz
     VIS_PNP_JSON_NAME="$REFINED_PNP_JSON_NAME"
+
+    if [[ "$RUN_VIEWPOINT_INIT_REFINE" == "1" ]]; then
+      echo
+      echo "==> refine UR5 from provided viewpoint initialization"
+      "$PYTHON" "$REPO_ROOT/tools/refine_cam2base_silhouette.py" \
+        --oxe_root "$OXE_ROOT" \
+        --mask_root "$MASK_ROOT" \
+        --dataset "$DATASET" \
+        --pnp_json_name "$PNP_JSON_NAME" \
+        --out_pnp_json_name "$VIEWPOINT_REFINED_PNP_JSON_NAME" \
+        --init_pose_source best_viewpoint \
+        --viewpoints_json "$UR5_VIEWPOINTS_JSON" \
+        --mujoco_xml_path "$UR5_MUJOCO_XML_PATH" \
+        --mujoco_qpos_key "$UR5_MUJOCO_QPOS_KEY" \
+        --mujoco_geom_groups "$UR5_MUJOCO_GEOM_GROUPS" \
+        --mask_dirs 000 001 \
+        --frame_stride "$SIL_REFINE_FRAME_STRIDE" \
+        --max_frames "$SIL_REFINE_MAX_FRAMES" \
+        --max_evals "$SIL_REFINE_MAX_EVALS" \
+        --viz_dir_name silhouette_refined_from_viewpoint_viz
+    fi
   fi
 fi
 
@@ -158,8 +182,25 @@ if [[ "$VIS_PNP_JSON_NAME" != "$PNP_JSON_NAME" ]]; then
     --labels ur5-pnp-init
 fi
 
+if [[ "$RUN_VIEWPOINT_INIT_REFINE" == "1" ]]; then
+  echo
+  echo "==> PnP reprojection summary: UR5 viewpoint refined $VIEWPOINT_REFINED_PNP_JSON_NAME"
+  "$PYTHON" "$REPO_ROOT/tools/summarize_pnp_errors.py" \
+    --mask_root "$MASK_ROOT" \
+    --dataset "$DATASET" \
+    --pnp_json_name "$VIEWPOINT_REFINED_PNP_JSON_NAME"
+  echo
+  echo "==> Silhouette IoU improvement summary: UR5 viewpoint init"
+  "$PYTHON" "$REPO_ROOT/tools/summarize_silhouette_refine.py" \
+    --mask_root "$MASK_ROOT" \
+    --dataset "$DATASET" \
+    --pnp_json_names "$VIEWPOINT_REFINED_PNP_JSON_NAME" \
+    --labels ur5-view-init
+fi
+
 echo
 echo "Done."
 echo "Masks:     $MASK_ROOT/$DATASET/episode_XXXX/{000,001,combined}/"
 echo "PnP JSON:  $MASK_ROOT/$DATASET/episode_XXXX/$PNP_JSON_NAME"
 echo "Audit:     $MASK_ROOT/$DATASET/episode_XXXX/pnp_audit_ur5/"
+echo "Viewpoint refined PnP: $MASK_ROOT/$DATASET/episode_XXXX/$VIEWPOINT_REFINED_PNP_JSON_NAME (when RUN_VIEWPOINT_INIT_REFINE=1)"

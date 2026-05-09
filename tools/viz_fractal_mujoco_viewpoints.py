@@ -155,6 +155,31 @@ class FreeCameraGoogleRobotRenderer:
             return mask
         return np.zeros(rgb.shape[:2], dtype=bool)
 
+    def T_cam2base_from_viewpoint(self, qpos: np.ndarray, viewpoint: dict) -> np.ndarray:
+        """Return OpenCV cam2base for the current MuJoCo free-camera viewpoint."""
+        self._set_qpos(qpos)
+        self._set_viewpoint(viewpoint)
+        self.renderer.update_scene(self.data, camera=self.camera, scene_option=self.scene_option)
+        gl_cam = self.renderer.scene.camera[0]
+        pos = np.asarray(gl_cam.pos, dtype=np.float64).reshape(3)
+        forward = np.asarray(gl_cam.forward, dtype=np.float64).reshape(3)
+        up = np.asarray(gl_cam.up, dtype=np.float64).reshape(3)
+
+        forward = forward / max(1e-12, np.linalg.norm(forward))
+        up = up / max(1e-12, np.linalg.norm(up))
+        right = np.cross(forward, up)
+        right = right / max(1e-12, np.linalg.norm(right))
+        up = np.cross(-forward, right)
+        up = up / max(1e-12, np.linalg.norm(up))
+
+        # MuJoCo/OpenGL camera columns are +x right, +y up, +z backward.
+        R_mj_cam2base = np.column_stack([right, up, -forward])
+        R_cv_cam2base = R_mj_cam2base @ np.diag([1.0, -1.0, -1.0])
+        T = np.eye(4, dtype=np.float64)
+        T[:3, :3] = R_cv_cam2base
+        T[:3, 3] = pos
+        return T
+
 
 def _load_qpos(traj) -> np.ndarray:
     if "google_robot_all_qpos" not in traj.files:

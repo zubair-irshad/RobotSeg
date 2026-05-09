@@ -31,7 +31,9 @@ RUN_URDF_IK="${RUN_URDF_IK:-0}"
 RUN_AUGE_IK="${RUN_AUGE_IK:-0}"
 RUN_VIEWPOINT_CHECK="${RUN_VIEWPOINT_CHECK:-0}"
 RUN_SILHOUETTE_REFINE="${RUN_SILHOUETTE_REFINE:-0}"
+RUN_VIEWPOINT_INIT_REFINE="${RUN_VIEWPOINT_INIT_REFINE:-0}"
 REFINED_PNP_JSON_NAME="${REFINED_PNP_JSON_NAME:-pnp_fovy${FRACTAL_CAMERA_FOV}_silhouette_refined.json}"
+VIEWPOINT_REFINED_PNP_JSON_NAME="${VIEWPOINT_REFINED_PNP_JSON_NAME:-pnp_fovy${FRACTAL_CAMERA_FOV}_viewpoint_silhouette_refined.json}"
 AUGE_ROOT="${AUGE_ROOT:-$HOME/AugE-Toolkit}"
 GOOGLE_URDF_PATH="${GOOGLE_URDF_PATH:-$HOME/RobotSeg/data/urdfs/google_robot/google_robot_description/urdf/google_robot.urdf}"
 GOOGLE_URDF_BACKEND="${GOOGLE_URDF_BACKEND:-yourdfpy}"
@@ -137,6 +139,23 @@ if [[ "$RUN_SILHOUETTE_REFINE" == "1" ]]; then
       --max_frames 24 \
       --viz_dir_name silhouette_refined_viz
     VIS_PNP_JSON_NAME="$REFINED_PNP_JSON_NAME"
+
+    if [[ "$RUN_VIEWPOINT_INIT_REFINE" == "1" ]]; then
+      echo
+      echo "==> refine from best AugE viewpoint IoU initialization"
+      "$PYTHON" "$REPO_ROOT/tools/refine_cam2base_silhouette.py" \
+        --oxe_root "$OXE_ROOT" \
+        --mask_root "$MASK_ROOT" \
+        --dataset "$DATASET" \
+        --pnp_json_name "$PNP_JSON_NAME" \
+        --out_pnp_json_name "$VIEWPOINT_REFINED_PNP_JSON_NAME" \
+        --init_pose_source best_viewpoint \
+        --mujoco_xml_path "$GOOGLE_MUJOCO_XML_PATH" \
+        --mask_dirs 000 001 \
+        --frame_stride 4 \
+        --max_frames 24 \
+        --viz_dir_name silhouette_refined_from_viewpoint_viz
+    fi
   fi
 fi
 
@@ -238,11 +257,21 @@ if [[ "$VIS_PNP_JSON_NAME" != "$PNP_JSON_NAME" ]]; then
     --pnp_json_name "$VIS_PNP_JSON_NAME"
 fi
 
+if [[ "$RUN_VIEWPOINT_INIT_REFINE" == "1" ]]; then
+  echo
+  echo "==> PnP reprojection summary: best-viewpoint refined $VIEWPOINT_REFINED_PNP_JSON_NAME"
+  "$PYTHON" "$REPO_ROOT/tools/summarize_pnp_errors.py" \
+    --mask_root "$MASK_ROOT" \
+    --dataset "$DATASET" \
+    --pnp_json_name "$VIEWPOINT_REFINED_PNP_JSON_NAME"
+fi
+
 echo
 echo "Done."
 echo "Masks:       $MASK_ROOT/$DATASET/episode_XXXX/{000,001,combined}/"
 echo "PnP JSON:    $MASK_ROOT/$DATASET/episode_XXXX/$PNP_JSON_NAME"
 echo "Refined PnP: $MASK_ROOT/$DATASET/episode_XXXX/$REFINED_PNP_JSON_NAME (when RUN_SILHOUETTE_REFINE=1)"
+echo "Viewpoint refined PnP: $MASK_ROOT/$DATASET/episode_XXXX/$VIEWPOINT_REFINED_PNP_JSON_NAME (when RUN_VIEWPOINT_INIT_REFINE=1)"
 echo "TCP panels:  $MASK_ROOT/$DATASET/episode_XXXX/tcp_pnp_candidate_compare/"
 echo "PnP audit:   $MASK_ROOT/$DATASET/episode_XXXX/pnp_audit_fractal/"
 echo "Viewpoints:  $MASK_ROOT/$DATASET/episode_XXXX/mujoco_viewpoint_check/ (when RUN_VIEWPOINT_CHECK=1)"

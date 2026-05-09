@@ -40,6 +40,24 @@ from urdf_robot_masker import URDFRobotMasker  # noqa: E402
 from viz_cam2base_urdf import DEFAULT_URDF  # noqa: E402
 
 
+def _loss_from_metric(args: argparse.Namespace, rec: dict[str, float]) -> float:
+    if rec["render_area"] <= 0 or rec["target_area"] <= 0:
+        return args.distance_clip * 4.0
+    t2r = min(args.distance_clip, float(rec["target_to_render_px"]))
+    r2t = min(args.distance_clip, float(rec["render_to_target_px_trim75"]))
+    coverage = float(rec["target_coverage"])
+    precision = float(rec["render_precision"])
+    area_ratio = abs(math.log((float(rec["render_area"]) + 1.0)
+                              / (float(rec["target_area"]) + 1.0)))
+    return float(
+        args.w_target_to_render * t2r
+        + args.w_render_to_target * r2t
+        + args.w_coverage * (1.0 - coverage) * args.distance_clip
+        + args.w_precision * (1.0 - precision) * args.distance_clip
+        + args.w_area * area_ratio * args.distance_clip
+    )
+
+
 def _T_to_rvec_tvec(T_cam2base: np.ndarray) -> tuple[list[float], list[float], list[list[float]]]:
     T_base2cam = invert_se3(np.asarray(T_cam2base, dtype=np.float64))
     rvec, _ = cv2.Rodrigues(T_base2cam[:3, :3])
@@ -235,23 +253,7 @@ def _score_pose(args: argparse.Namespace, masker,
         rec["stem"] = sample["stem"]
         rows.append(rec)
 
-        if rec["render_area"] <= 0 or rec["target_area"] <= 0:
-            losses.append(args.distance_clip * 4.0)
-            continue
-        t2r = min(args.distance_clip, float(rec["target_to_render_px"]))
-        r2t = min(args.distance_clip, float(rec["render_to_target_px_trim75"]))
-        coverage = float(rec["target_coverage"])
-        precision = float(rec["render_precision"])
-        area_ratio = abs(math.log((float(rec["render_area"]) + 1.0)
-                                  / (float(rec["target_area"]) + 1.0)))
-        loss = (
-            args.w_target_to_render * t2r
-            + args.w_render_to_target * r2t
-            + args.w_coverage * (1.0 - coverage) * args.distance_clip
-            + args.w_precision * (1.0 - precision) * args.distance_clip
-            + args.w_area * area_ratio * args.distance_clip
-        )
-        losses.append(float(loss))
+        losses.append(_loss_from_metric(args, rec))
     if not losses:
         return float("inf"), rows
     return float(np.mean(losses)), rows
@@ -335,36 +337,102 @@ def _optimize_pose(args: argparse.Namespace, objective) -> tuple[np.ndarray, flo
 
 def _write_viz(args: argparse.Namespace, ep_oxe: Path, ep_seg: Path,
                masker, samples: list[dict[str, Any]],
-               K: dict[str, Any], T_cam2base: np.ndarray,
-               rows: list[dict[str, float]]) -> None:
+               K: dict[str, Any], T_initial: np.ndarray, T_final: np.ndarray,
+               init_rows: list[dict[str, float]], final_rows: list[dict[str, float]]) -> None:
     if not args.viz_dir_name:
         return
     out_dir = ep_seg / args.viz_dir_name
     out_dir.mkdir(parents=True, exist_ok=True)
-    render_mask_dir = out_dir / "render_masks"
+    init_render_mask_dir = out_dir / "init_render_masks"
+    final_render_mask_dir = out_dir / "final_render_masks"
     target_mask_dir = out_dir / "target_masks"
-    render_mask_dir.mkdir(exist_ok=True)
+    init_render_mask_dir.mkdir(exist_ok=True)
+    final_render_mask_dir.mkdir(exist_ok=True)
     target_mask_dir.mkdir(exist_ok=True)
     H, W = int(K["height"]), int(K["width"])
-    row_by_stem = {str(row["stem"]): row for row in rows}
+    init_by_stem = {str(row["stem"]): row for row in init_rows}
+    final_by_stem = {str(row["stem"]): row for row in final_rows}
     for sample in samples:
         stem = sample["stem"]
         img = cv2.imread(str(ep_oxe / "frames" / f"{stem}.jpg"))
         if img is None:
             continue
-        render = masker.render(
+        init_render = masker.render(
             K,
-            T_cam2base,
+            T_initial,
             sample["joint"],
             gripper_position=sample["gripper"],
             image_hw=(H, W),
         )
-        rec = row_by_stem.get(stem)
-        if rec is None:
-            rec = _mask_metrics(sample["target"], render, args.distance_clip)
-        cv2.imwrite(str(out_dir / f"{stem}.jpg"), _make_score_viz(img, sample["target"], render, rec))
-        cv2.imwrite(str(render_mask_dir / f"{stem}.png"), render.astype(np.uint8) * 255)
+        final_render = masker.render(
+            K,
+            T_final,
+            sample["joint"],
+            gripper_position=sample["gripper"],
+            image_hw=(H, W),
+        )
+        init_rec = init_by_stem.get(stem) or _mask_metrics(sample["target"], init_render, args.distance_clip)
+        final_rec = final_by_stem.get(stem) or _mask_metrics(sample["target"], final_render, args.distance_clip)
+        init_viz = _make_score_viz(img, sample["target"], init_render, init_rec)
+        final_viz = _make_score_viz(img, sample["target"], final_render, final_rec)
+        cv2.imwrite(str(out_dir / f"{stem}_init.jpg"), init_viz)
+        cv2.imwrite(str(out_dir / f"{stem}_final.jpg"), final_viz)
+        cv2.imwrite(str(out_dir / f"{stem}.jpg"), np.vstack([init_viz, final_viz]))
+        cv2.imwrite(str(init_render_mask_dir / f"{stem}.png"), init_render.astype(np.uint8) * 255)
+        cv2.imwrite(str(final_render_mask_dir / f"{stem}.png"), final_render.astype(np.uint8) * 255)
         cv2.imwrite(str(target_mask_dir / f"{stem}.png"), sample["target"].astype(np.uint8) * 255)
+
+
+def _best_viewpoint_initial_pose(
+    args: argparse.Namespace,
+    samples: list[dict[str, Any]],
+    K: dict[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    if args.mujoco_xml_path is None:
+        raise ValueError("--init_pose_source best_viewpoint requires --mujoco_xml_path")
+    from viz_fractal_mujoco_viewpoints import (  # noqa: E402
+        FRACTAL_VIEWPOINTS,
+        FreeCameraGoogleRobotRenderer,
+    )
+
+    H, W = int(K["height"]), int(K["width"])
+    renderer = FreeCameraGoogleRobotRenderer(args.mujoco_xml_path, H, W)
+    try:
+        best_idx = -1
+        best_score = -1.0
+        best_loss = float("inf")
+        best_rows: list[dict[str, float]] = []
+        best_metrics: dict[str, float] = {}
+        for idx, viewpoint in enumerate(FRACTAL_VIEWPOINTS):
+            rows = []
+            losses = []
+            for sample in samples:
+                render = renderer.render_mask(sample["joint"], viewpoint)
+                rec = _mask_metrics(sample["target"], render, args.distance_clip)
+                rec["stem"] = sample["stem"]
+                rows.append(rec)
+                losses.append(_loss_from_metric(args, rec))
+            loss = float(np.mean(losses)) if losses else float("inf")
+            metrics = _aggregate(rows)
+            score = float(metrics.get("iou_median", metrics.get("iou_mean", 0.0)))
+            if score > best_score or (score == best_score and loss < best_loss):
+                best_idx = idx
+                best_score = score
+                best_loss = loss
+                best_rows = rows
+                best_metrics = metrics
+        if best_idx < 0:
+            raise RuntimeError("no Fractal viewpoint produced a valid score")
+        T = renderer.T_cam2base_from_viewpoint(samples[0]["joint"], FRACTAL_VIEWPOINTS[best_idx])
+        return T, {
+            "viewpoint_index": best_idx,
+            "viewpoint": FRACTAL_VIEWPOINTS[best_idx],
+            "loss": best_loss,
+            "metrics": best_metrics,
+            "rows": best_rows,
+        }
+    finally:
+        renderer.close()
 
 
 def _process_episode(args: argparse.Namespace, masker,
@@ -387,7 +455,12 @@ def _process_episode(args: argparse.Namespace, masker,
             "skip_counts": skips,
         }
 
-    T0 = np.asarray(pnp["T_cam2base"], dtype=np.float64)
+    init_info: dict[str, Any] = {"source": args.init_pose_source}
+    if args.init_pose_source == "best_viewpoint":
+        T0, init_info = _best_viewpoint_initial_pose(args, samples, K)
+        init_info["source"] = "best_viewpoint"
+    else:
+        T0 = np.asarray(pnp["T_cam2base"], dtype=np.float64)
     init_loss, init_rows = _score_pose(args, masker, samples, K, T0)
     init_rvec = pnp.get("rvec")
     init_tvec = pnp.get("tvec")
@@ -434,6 +507,7 @@ def _process_episode(args: argparse.Namespace, masker,
         "written_loss": loss_out,
         "delta_rotvec_rad": x_best[:3].astype(float).tolist(),
         "delta_translation_m": x_best[3:].astype(float).tolist(),
+        "init_pose": {k: v for k, v in init_info.items() if k != "rows"},
         "num_samples": len(samples),
         "num_evals": evals,
         "mask_dirs": args.mask_dirs,
@@ -446,9 +520,11 @@ def _process_episode(args: argparse.Namespace, masker,
     }
     out_path = ep_seg / args.out_pnp_json_name
     out_path.write_text(json.dumps(out, indent=2))
-    _write_viz(args, ep_oxe, ep_seg, masker, samples, K, T_out, rows_out)
+    _write_viz(args, ep_oxe, ep_seg, masker, samples, K, T0, T_out, init_rows, rows_out)
 
     metrics = out["silhouette_refinement"]["metrics"]
+    init_metrics = out["silhouette_refinement"]["init_metrics"]
+    final_metrics = out["silhouette_refinement"]["final_metrics"]
     return {
         "episode": ep_name,
         "status": "ok",
@@ -458,6 +534,10 @@ def _process_episode(args: argparse.Namespace, masker,
         "written_loss": loss_out,
         "num_samples": len(samples),
         "num_evals": evals,
+        "init_pose_source": args.init_pose_source,
+        "viewpoint_index": init_info.get("viewpoint_index"),
+        "init_iou_median": init_metrics.get("iou_median"),
+        "final_iou_median": final_metrics.get("iou_median"),
         "iou_median": metrics.get("iou_median"),
         "coverage_median": metrics.get("target_coverage_median"),
         "t2r_median": metrics.get("target_to_render_px_median"),
@@ -473,6 +553,7 @@ def main() -> None:
     parser.add_argument("--episodes", nargs="+", default=None)
     parser.add_argument("--pnp_json_name", default="pnp.json")
     parser.add_argument("--out_pnp_json_name", default="pnp_silhouette_refined.json")
+    parser.add_argument("--init_pose_source", choices=["pnp", "best_viewpoint"], default="pnp")
     parser.add_argument("--urdf_path", type=Path, default=DEFAULT_URDF)
     parser.add_argument("--mesh_dir", type=Path, default=None)
     parser.add_argument("--urdf_backend", choices=["simple", "yourdfpy", "auto"], default="yourdfpy")
@@ -560,8 +641,11 @@ def main() -> None:
                 marker = "improved" if result["improved"] else "kept"
                 print(
                     f"[{args.dataset}/{ep}] {marker} "
+                    f"init={result.get('init_pose_source')}"
+                    f"{'' if result.get('viewpoint_index') is None else f':v{int(result.get('viewpoint_index')):02d}'} "
                     f"loss {_fmt_metric(result.get('init_loss'))}->{_fmt_metric(result.get('written_loss'))} "
-                    f"iou={_fmt_metric(result.get('iou_median'))} "
+                    f"iou {_fmt_metric(result.get('init_iou_median'))}->{_fmt_metric(result.get('final_iou_median'))} "
+                    f"written_iou={_fmt_metric(result.get('iou_median'))} "
                     f"cov={_fmt_metric(result.get('coverage_median'))} "
                     f"t2r={_fmt_metric(result.get('t2r_median'), 2)}px "
                     f"evals={result.get('num_evals')} n={result.get('num_samples')}"

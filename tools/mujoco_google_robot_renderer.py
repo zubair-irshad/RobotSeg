@@ -61,7 +61,15 @@ def _xml_with_camera(xml_path: Path, T_cam2base: np.ndarray, K: dict[str, float]
             "fovy": f"{fovy:.9g}",
         },
     )
-    tmp = tempfile.NamedTemporaryFile(prefix="google_robot_pnp_cam_", suffix=".xml", delete=False)
+    # Keep the temporary XML beside scene.xml. AugE's scene.xml includes
+    # robot.xml with a relative path, and robot.xml resolves assets/ relative
+    # to that same directory. A /tmp XML would break those includes.
+    tmp = tempfile.NamedTemporaryFile(
+        prefix=".google_robot_pnp_cam_",
+        suffix=".xml",
+        dir=str(xml_path.parent),
+        delete=False,
+    )
     tmp.close()
     ET.ElementTree(root).write(tmp.name)
     return Path(tmp.name)

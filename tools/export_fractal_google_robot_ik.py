@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +22,30 @@ from scipy.spatial.transform import Rotation as R
 
 
 GOOGLE_ARM_JOINTS = 7
+GOOGLE_GRIPPER_JOINT_IDS = {"google_robot": [7, 8]}
+GOOGLE_GRIPPER_RANGES = {
+    "google_robot": {
+        "open": 0.333,
+        "close": 1.0,
+        "actuators": ["gripper_r", "gripper_l"],
+    }
+}
+
+
+class _FixedRate:
+    def __init__(self, frequency: float = 500.0, warn: bool = False):
+        del warn
+        self.dt = 1.0 / float(frequency)
+
+
+@contextmanager
+def _pushd(path: Path):
+    old = Path.cwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(old)
 
 
 def _load_aug_e(auge_root: Path):
@@ -29,16 +54,18 @@ def _load_aug_e(auge_root: Path):
         raise FileNotFoundError(f"AugE root does not exist: {auge_root}")
     sys.path.insert(0, str(auge_root))
 
-    import mujoco  # type: ignore
-    import mink  # type: ignore
-    from loop_rate_limiters import RateLimiter  # type: ignore
-    from core.gripper_utils import GRIPPER_JOINT_IDS, GRIPPER_RANGES  # type: ignore
-    from core.utils import XML_PATH  # type: ignore
+    with _pushd(auge_root):
+        import mujoco  # type: ignore
+        import mink  # type: ignore
+        try:
+            from loop_rate_limiters import RateLimiter  # type: ignore
+        except ModuleNotFoundError:
+            RateLimiter = _FixedRate
 
-    xml_path = Path(XML_PATH["google_robot"])
-    if not xml_path.is_absolute():
-        xml_path = auge_root / xml_path
-    return mujoco, mink, RateLimiter, GRIPPER_JOINT_IDS, GRIPPER_RANGES, xml_path
+    xml_path = auge_root / "robot_xml" / "google_robot" / "scene.xml"
+    if not xml_path.exists():
+        raise FileNotFoundError(f"Missing AugE Google Robot XML: {xml_path}")
+    return mujoco, mink, RateLimiter, GOOGLE_GRIPPER_JOINT_IDS, GOOGLE_GRIPPER_RANGES, xml_path
 
 
 def _as_str(x) -> str | None:
@@ -110,6 +137,7 @@ def solve_episode(
     position_cost: float,
     orientation_cost: float,
     damping: float,
+    ik_solver: str,
     update_trajectory: bool,
 ) -> dict:
     mujoco, mink, RateLimiter, gripper_joint_ids, gripper_ranges, xml_path = _load_aug_e(auge_root)
@@ -163,7 +191,7 @@ def solve_episode(
         end_effector_task.set_target(target)
 
         for _ in range(max_iters):
-            vel = mink.solve_ik(configuration, tasks, rate.dt, "quadprog", damping)
+            vel = mink.solve_ik(configuration, tasks, rate.dt, ik_solver, damping)
             configuration.integrate_inplace(vel, rate.dt)
             err = end_effector_task.compute_error(configuration)
             if np.linalg.norm(err[:3]) <= 1e-5 and np.linalg.norm(err[3:]) <= 1e-5:
@@ -218,6 +246,11 @@ def main() -> None:
     p.add_argument("--position_cost", type=float, default=10.0)
     p.add_argument("--orientation_cost", type=float, default=1.0)
     p.add_argument("--damping", type=float, default=1e-3)
+    p.add_argument(
+        "--ik_solver",
+        default="daqp",
+        help="qpsolvers backend passed to mink.solve_ik. Use quadprog if that package is installed.",
+    )
     p.add_argument("--no_update_trajectory", action="store_true")
     args = p.parse_args()
 
@@ -236,6 +269,7 @@ def main() -> None:
             position_cost=args.position_cost,
             orientation_cost=args.orientation_cost,
             damping=args.damping,
+            ik_solver=args.ik_solver,
             update_trajectory=not args.no_update_trajectory,
         )
         if result["status"] == "ok":

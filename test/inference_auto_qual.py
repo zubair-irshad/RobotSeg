@@ -581,14 +581,23 @@ def process_sequences(args, gpu_id, seq_list):
                 )
                 # "Gripper observed" verdict, judged purely on what survived
                 # the subtraction: non-empty, single component, peak confidence
-                # high enough, and area at least a small floor.
+                # high enough, and area at least a small floor. Some low-res
+                # Fractal masks are visually valid but fragmented after arm
+                # subtraction; --relax_gripper_observed keeps those visible
+                # centroids from being painted as "not-observed" in overlays.
                 disjoint_area = int((disjoint > 127).sum())
-                s["observed"] = bool(
-                    s["centroid"] is not None
-                    and disjoint_area >= 16  # absolute pixel floor
-                    and s["conf_max"] >= 0.7
-                    and s["n_components"] == 1
-                )
+                if args.relax_gripper_observed:
+                    s["observed"] = bool(
+                        s["centroid"] is not None
+                        and disjoint_area >= args.relaxed_gripper_observed_area_px
+                    )
+                else:
+                    s["observed"] = bool(
+                        s["centroid"] is not None
+                        and disjoint_area >= 16  # absolute pixel floor
+                        and s["conf_max"] >= 0.7
+                        and s["n_components"] == 1
+                    )
                 s = _mark_pnp_acceptance(s, amask, args)
                 new_stats[stem] = s
             centroids_by_cat["gripper"] = new_stats
@@ -684,6 +693,12 @@ def main():
     p.add_argument("--max_gripper_arm_dist_frac", type=float, default=0.035,
                    help="Resolution-scaled proximity floor: effective distance is "
                         "max(--max_gripper_arm_dist_px, frac * max(H,W)).")
+    p.add_argument("--relax_gripper_observed", action="store_true",
+                   help="For overlays/centroids.json, consider a gripper observed "
+                        "when the post-subtraction mask has a centroid and enough "
+                        "area, even if it is fragmented or low-confidence. Useful "
+                        "for low-res Fractal masks; PnP still has its own filters.")
+    p.add_argument("--relaxed_gripper_observed_area_px", type=int, default=8)
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()
 

@@ -112,6 +112,18 @@ def _load_gripper(traj, n: int) -> np.ndarray:
     return np.zeros(n, dtype=np.float64)
 
 
+def _load_mujoco_qpos(traj) -> np.ndarray | None:
+    if "google_robot_all_qpos" in traj.files:
+        arr = np.asarray(traj["google_robot_all_qpos"], dtype=np.float64)
+    elif "all_qpos" in traj.files:
+        arr = np.asarray(traj["all_qpos"], dtype=np.float64)
+    else:
+        return None
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    return arr if arr.ndim == 2 else None
+
+
 def _serial_from_pnp(pnp: dict) -> str | None:
     source = pnp.get("K", {}).get("source") if isinstance(pnp.get("K"), dict) else None
     if not isinstance(source, str):
@@ -227,10 +239,12 @@ def process_episode(dataset: str, ep: str, args, masker: URDFRobotMasker | None)
     with np.load(ep_oxe / "trajectory.npz", allow_pickle=True) as traj:
         points = _load_points(dataset, traj, len(centroids), args, pnp.get("point_source", "eef_xyz"))
         joints = _load_joints(traj)
+        mujoco_qpos = _load_mujoco_qpos(traj) if args.mujoco_xml_path is not None else None
+        render_state = mujoco_qpos if mujoco_qpos is not None else joints
         gripper = _load_gripper(traj, len(joints)) if joints is not None else None
 
         out_root = ep_seg / args.out_dir_name
-        have_urdf = masker is not None and joints is not None
+        have_urdf = masker is not None and render_state is not None
         dir_names = ["raw", "masks", "reprojection", "panel"]
         if have_urdf:
             dir_names += ["urdf_pnp", "urdf_multiview"]
@@ -272,12 +286,12 @@ def process_episode(dataset: str, ep: str, args, masker: URDFRobotMasker | None)
                     err = float(np.linalg.norm(np.asarray(c, dtype=np.float64) - proj))
 
             urdf_img = None
-            if have_urdf and idx < len(joints):
+            if have_urdf and idx < len(render_state):
                 urdf_img, _ = masker.overlay(
                     image,
                     K,
                     T_cam2base,
-                    joints[idx],
+                    render_state[idx],
                     gripper_position=float(gripper[idx]) if gripper is not None and idx < len(gripper) else 0.0,
                     color_bgr=(255, 170, 40),
                     outline_bgr=(255, 225, 120),
@@ -288,13 +302,13 @@ def process_episode(dataset: str, ep: str, args, masker: URDFRobotMasker | None)
             if (
                 have_urdf
                 and T_ref_cam2base is not None
-                and idx < len(joints)
+                and idx < len(render_state)
             ):
                 urdf_ref_img, _ = masker.overlay(
                     image,
                     K,
                     T_ref_cam2base,
-                    joints[idx],
+                    render_state[idx],
                     gripper_position=float(gripper[idx]) if gripper is not None and idx < len(gripper) else 0.0,
                     color_bgr=(0, 145, 255),
                     outline_bgr=(0, 210, 255),
@@ -353,6 +367,9 @@ def main() -> None:
     parser.add_argument("--max_frames", type=int, default=0)
     parser.add_argument("--skip_bad_pnp", action="store_true")
     parser.add_argument("--no_urdf", action="store_true")
+    parser.add_argument("--mujoco_xml_path", type=Path, default=None,
+                        help="Render robot overlays with this MuJoCo XML instead of URDF. "
+                             "For Fractal, use AugE robot_xml/google_robot/scene.xml.")
     parser.add_argument("--urdf_path", type=Path, default=DEFAULT_URDF)
     parser.add_argument("--mesh_dir", type=Path, default=None)
     parser.add_argument("--urdf_backend", choices=["simple", "yourdfpy", "auto"], default="simple")
@@ -388,7 +405,10 @@ def main() -> None:
     args = parser.parse_args()
 
     masker = None
-    if not args.no_urdf:
+    if args.mujoco_xml_path is not None and not args.no_urdf:
+        from mujoco_google_robot_renderer import MuJoCoGoogleRobotRenderer  # noqa: E402
+        masker = MuJoCoGoogleRobotRenderer(args.mujoco_xml_path, verbose=True)
+    elif not args.no_urdf:
         masker = URDFRobotMasker(
             args.urdf_path,
             mesh_dir=args.mesh_dir,

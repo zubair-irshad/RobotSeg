@@ -43,6 +43,23 @@ convert(
     str(out_urdf),
     asset_file_prefix="package://google_robot_description/meshes/",
 )
+
+# Some converter versions emit generated OBJ files under a nested meshes/
+# folder and reference them as package://.../meshes/meshes/<file>. Flatten
+# those generated meshes into the package mesh directory and normalize the URDF
+# URIs so yourdfpy can resolve them.
+for mesh in out_pkg.rglob("*"):
+    if mesh.is_file() and mesh.suffix.lower() in {".obj", ".stl", ".dae", ".ply"}:
+        dst = out_mesh_dir / mesh.name
+        if mesh.resolve() != dst.resolve():
+            shutil.copy2(mesh, dst)
+
+text = out_urdf.read_text()
+text = text.replace(
+    "package://google_robot_description/meshes/meshes/",
+    "package://google_robot_description/meshes/",
+)
+out_urdf.write_text(text)
 print(f"Wrote: {out_urdf}")
 PY
 

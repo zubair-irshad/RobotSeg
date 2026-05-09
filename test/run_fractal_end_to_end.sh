@@ -25,13 +25,14 @@ MOGE_DEVICE="${MOGE_DEVICE:-cuda}"
 USE_MOGE_INTRINSICS="${USE_MOGE_INTRINSICS:-0}"
 FRACTAL_CAMERA_FOV="${FRACTAL_CAMERA_FOV:-57}"
 PNP_JSON_NAME="${PNP_JSON_NAME:-pnp_fovy${FRACTAL_CAMERA_FOV}.json}"
-SEG_EXTRA_ARGS_STR="${SEG_EXTRA_ARGS_STR:---no_require_gripper_near_arm}"
+SEG_EXTRA_ARGS_STR="${SEG_EXTRA_ARGS_STR:---no_require_gripper_near_arm --relax_gripper_observed}"
 PNP_EXTRA_ARGS_STR="${PNP_EXTRA_ARGS_STR:---no_use_observed_flag --no_use_mask_stage_accept --no_reject_fragmented --min_conf 0.0 --min_conf_max 0.0 --min_gripper_area_px 8 --min_post_subtract_area_ratio 0.0}"
 RUN_URDF_IK="${RUN_URDF_IK:-0}"
 RUN_AUGE_IK="${RUN_AUGE_IK:-0}"
 AUGE_ROOT="${AUGE_ROOT:-$HOME/AugE-Toolkit}"
 GOOGLE_URDF_PATH="${GOOGLE_URDF_PATH:-$HOME/RobotSeg/data/urdfs/google_robot/google_robot_description/urdf/google_robot.urdf}"
 GOOGLE_URDF_BACKEND="${GOOGLE_URDF_BACKEND:-yourdfpy}"
+GOOGLE_MUJOCO_XML_PATH="${GOOGLE_MUJOCO_XML_PATH:-$AUGE_ROOT/robot_xml/google_robot/scene.xml}"
 GOOGLE_EE_LINK="${GOOGLE_EE_LINK:-}"
 GOOGLE_JOINT_NAMES_STR="${GOOGLE_JOINT_NAMES_STR:-joint_torso joint_shoulder joint_bicep joint_elbow joint_forearm joint_wrist joint_gripper}"
 GOOGLE_GRIPPER_JOINT_NAMES_STR="${GOOGLE_GRIPPER_JOINT_NAMES_STR:-joint_finger_right joint_finger_left}"
@@ -132,19 +133,18 @@ echo "==> TCP projection panels: projected Fractal observation['state'][:3] vs g
 echo
 echo "==> exact PnP audit panels"
 AUDIT_URDF_ARGS=(--no_urdf)
-if [[ "$RUN_AUGE_IK" == "1" && -f "$GOOGLE_URDF_PATH" ]]; then
+if [[ "$RUN_AUGE_IK" == "1" && -f "$GOOGLE_MUJOCO_XML_PATH" ]]; then
   read -r -a GOOGLE_JOINT_NAMES <<< "$GOOGLE_JOINT_NAMES_STR"
   read -r -a GOOGLE_GRIPPER_JOINT_NAMES <<< "$GOOGLE_GRIPPER_JOINT_NAMES_STR"
   AUDIT_URDF_ARGS=(
-    --urdf_path "$GOOGLE_URDF_PATH"
-    --urdf_backend "$GOOGLE_URDF_BACKEND"
+    --mujoco_xml_path "$GOOGLE_MUJOCO_XML_PATH"
     --arm_joint_names "${GOOGLE_JOINT_NAMES[@]}"
     --gripper_joint_names "${GOOGLE_GRIPPER_JOINT_NAMES[@]}"
     --gripper_open_rad 0.333
     --gripper_closed_rad 1.0
   )
 else
-  echo "    URDF disabled. Set RUN_AUGE_IK=1 and provide GOOGLE_URDF_PATH to render the articulated Google Robot."
+  echo "    robot rendering disabled. Set RUN_AUGE_IK=1 and provide GOOGLE_MUJOCO_XML_PATH to render the articulated Google Robot."
 fi
 "$PYTHON" "$REPO_ROOT/tools/viz_pnp_audit_panel.py" \
   --oxe_root "$OXE_ROOT" \

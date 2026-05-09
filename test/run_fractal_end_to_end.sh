@@ -34,6 +34,11 @@ RUN_SILHOUETTE_REFINE="${RUN_SILHOUETTE_REFINE:-0}"
 RUN_VIEWPOINT_INIT_REFINE="${RUN_VIEWPOINT_INIT_REFINE:-0}"
 REFINED_PNP_JSON_NAME="${REFINED_PNP_JSON_NAME:-pnp_fovy${FRACTAL_CAMERA_FOV}_silhouette_refined.json}"
 VIEWPOINT_REFINED_PNP_JSON_NAME="${VIEWPOINT_REFINED_PNP_JSON_NAME:-pnp_fovy${FRACTAL_CAMERA_FOV}_viewpoint_silhouette_refined.json}"
+SIL_REFINE_FRAME_STRIDE="${SIL_REFINE_FRAME_STRIDE:-4}"
+SIL_REFINE_MAX_FRAMES="${SIL_REFINE_MAX_FRAMES:-24}"
+SIL_REFINE_MAX_EVALS="${SIL_REFINE_MAX_EVALS:-240}"
+SIL_REFINE_ROT_STEP_DEG="${SIL_REFINE_ROT_STEP_DEG:-8.0}"
+SIL_REFINE_TRANS_STEP_M="${SIL_REFINE_TRANS_STEP_M:-0.04}"
 AUGE_ROOT="${AUGE_ROOT:-$HOME/AugE-Toolkit}"
 GOOGLE_URDF_PATH="${GOOGLE_URDF_PATH:-$HOME/RobotSeg/data/urdfs/google_robot/google_robot_description/urdf/google_robot.urdf}"
 GOOGLE_URDF_BACKEND="${GOOGLE_URDF_BACKEND:-yourdfpy}"
@@ -135,8 +140,11 @@ if [[ "$RUN_SILHOUETTE_REFINE" == "1" ]]; then
       --out_pnp_json_name "$REFINED_PNP_JSON_NAME" \
       --mujoco_xml_path "$GOOGLE_MUJOCO_XML_PATH" \
       --mask_dirs 000 001 \
-      --frame_stride 4 \
-      --max_frames 24 \
+      --frame_stride "$SIL_REFINE_FRAME_STRIDE" \
+      --max_frames "$SIL_REFINE_MAX_FRAMES" \
+      --max_evals "$SIL_REFINE_MAX_EVALS" \
+      --rot_step_deg "$SIL_REFINE_ROT_STEP_DEG" \
+      --trans_step_m "$SIL_REFINE_TRANS_STEP_M" \
       --viz_dir_name silhouette_refined_viz
     VIS_PNP_JSON_NAME="$REFINED_PNP_JSON_NAME"
 
@@ -152,8 +160,11 @@ if [[ "$RUN_SILHOUETTE_REFINE" == "1" ]]; then
         --init_pose_source best_viewpoint \
         --mujoco_xml_path "$GOOGLE_MUJOCO_XML_PATH" \
         --mask_dirs 000 001 \
-        --frame_stride 4 \
-        --max_frames 24 \
+        --frame_stride "$SIL_REFINE_FRAME_STRIDE" \
+        --max_frames "$SIL_REFINE_MAX_FRAMES" \
+        --max_evals "$SIL_REFINE_MAX_EVALS" \
+        --rot_step_deg "$SIL_REFINE_ROT_STEP_DEG" \
+        --trans_step_m "$SIL_REFINE_TRANS_STEP_M" \
         --viz_dir_name silhouette_refined_from_viewpoint_viz
     fi
   fi
@@ -266,6 +277,22 @@ if [[ "$RUN_VIEWPOINT_INIT_REFINE" == "1" ]]; then
     --pnp_json_name "$VIEWPOINT_REFINED_PNP_JSON_NAME"
 fi
 
+if [[ "$RUN_SILHOUETTE_REFINE" == "1" ]]; then
+  echo
+  echo "==> Silhouette IoU improvement summary"
+  SIL_SUMMARY_NAMES=("$REFINED_PNP_JSON_NAME")
+  SIL_SUMMARY_LABELS=("pnp-init")
+  if [[ "$RUN_VIEWPOINT_INIT_REFINE" == "1" ]]; then
+    SIL_SUMMARY_NAMES+=("$VIEWPOINT_REFINED_PNP_JSON_NAME")
+    SIL_SUMMARY_LABELS+=("view-init")
+  fi
+  "$PYTHON" "$REPO_ROOT/tools/summarize_silhouette_refine.py" \
+    --mask_root "$MASK_ROOT" \
+    --dataset "$DATASET" \
+    --pnp_json_names "${SIL_SUMMARY_NAMES[@]}" \
+    --labels "${SIL_SUMMARY_LABELS[@]}"
+fi
+
 echo
 echo "Done."
 echo "Masks:       $MASK_ROOT/$DATASET/episode_XXXX/{000,001,combined}/"
@@ -276,3 +303,4 @@ echo "TCP panels:  $MASK_ROOT/$DATASET/episode_XXXX/tcp_pnp_candidate_compare/"
 echo "PnP audit:   $MASK_ROOT/$DATASET/episode_XXXX/pnp_audit_fractal/"
 echo "Viewpoints:  $MASK_ROOT/$DATASET/episode_XXXX/mujoco_viewpoint_check/ (when RUN_VIEWPOINT_CHECK=1)"
 echo "URDF IK:     $MASK_ROOT/$DATASET/episode_XXXX/urdf_tcp_ik_overlay/ (when RUN_URDF_IK=1)"
+echo "Silhouette refinement settings: frame_stride=$SIL_REFINE_FRAME_STRIDE max_frames=$SIL_REFINE_MAX_FRAMES max_evals=$SIL_REFINE_MAX_EVALS"

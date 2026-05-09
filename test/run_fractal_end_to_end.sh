@@ -23,7 +23,7 @@ MAX_FRAMES_PER_SEQ="${MAX_FRAMES_PER_SEQ:-64}"
 INFER_MAX_SIDE="${INFER_MAX_SIDE:-0}"
 MOGE_DEVICE="${MOGE_DEVICE:-cuda}"
 PNP_JSON_NAME="${PNP_JSON_NAME:-pnp_moge.json}"
-SEG_EXTRA_ARGS_STR="${SEG_EXTRA_ARGS_STR:---no_subtract_arm_from_gripper --no_require_gripper_near_arm}"
+SEG_EXTRA_ARGS_STR="${SEG_EXTRA_ARGS_STR:---no_require_gripper_near_arm}"
 PNP_EXTRA_ARGS_STR="${PNP_EXTRA_ARGS_STR:---no_use_observed_flag --no_use_mask_stage_accept --no_reject_fragmented --min_conf 0.0 --min_conf_max 0.0 --min_gripper_area_px 8 --min_post_subtract_area_ratio 0.0}"
 
 read -r -a SEG_EXTRA_ARGS <<< "$SEG_EXTRA_ARGS_STR"

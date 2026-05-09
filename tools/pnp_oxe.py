@@ -1294,6 +1294,7 @@ def main():
                    help="Reject centroids within N px of any image border.")
     p.add_argument("--reject_fragmented", action="store_true", default=True,
                    help="Reject frames whose mask has >1 connected component.")
+    p.add_argument("--no_reject_fragmented", dest="reject_fragmented", action="store_false")
     p.add_argument(
         "--require_gripper_near_robot",
         action="store_true",

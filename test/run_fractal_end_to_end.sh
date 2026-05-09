@@ -23,6 +23,11 @@ MAX_FRAMES_PER_SEQ="${MAX_FRAMES_PER_SEQ:-64}"
 INFER_MAX_SIDE="${INFER_MAX_SIDE:-0}"
 MOGE_DEVICE="${MOGE_DEVICE:-cuda}"
 PNP_JSON_NAME="${PNP_JSON_NAME:-pnp_moge.json}"
+SEG_EXTRA_ARGS_STR="${SEG_EXTRA_ARGS_STR:---no_subtract_arm_from_gripper --no_require_gripper_near_arm}"
+PNP_EXTRA_ARGS_STR="${PNP_EXTRA_ARGS_STR:---no_use_observed_flag --no_use_mask_stage_accept --no_reject_fragmented --min_conf 0.0 --min_conf_max 0.0 --min_gripper_area_px 8 --min_post_subtract_area_ratio 0.0}"
+
+read -r -a SEG_EXTRA_ARGS <<< "$SEG_EXTRA_ARGS_STR"
+read -r -a PNP_EXTRA_ARGS <<< "$PNP_EXTRA_ARGS_STR"
 
 if [[ "$DOWNLOAD" == "1" ]]; then
   echo "==> download Fractal RLDS subset: image key is native RLDS observation['image']"
@@ -51,6 +56,7 @@ PY
 
 echo
 echo "==> RobotSeg at native spatial resolution: infer_max_side=$INFER_MAX_SIDE"
+echo "    Fractal mask gates: $SEG_EXTRA_ARGS_STR"
 (cd "$REPO_ROOT/test" && \
   "$PYTHON" inference_auto_qual.py \
     --image_root "$OXE_ROOT/$DATASET" \
@@ -61,10 +67,12 @@ echo "==> RobotSeg at native spatial resolution: infer_max_side=$INFER_MAX_SIDE"
     --frame_stride 1 \
     --max_frames_per_seq "$MAX_FRAMES_PER_SEQ" \
     --no_offload_to_cpu \
+    "${SEG_EXTRA_ARGS[@]}" \
     --overwrite)
 
 echo
 echo "==> PnP with Fractal TCP state + MoGe intrinsics"
+echo "    Fractal PnP gates: $PNP_EXTRA_ARGS_STR"
 "$PYTHON" "$REPO_ROOT/tools/pnp_oxe.py" \
   --oxe_root "$OXE_ROOT" \
   --mask_root "$MASK_ROOT" \
@@ -75,6 +83,7 @@ echo "==> PnP with Fractal TCP state + MoGe intrinsics"
   --no_hfov_fallback \
   --print_intrinsics \
   --pnp_json_name "$PNP_JSON_NAME" \
+  "${PNP_EXTRA_ARGS[@]}" \
   --viz
 
 echo

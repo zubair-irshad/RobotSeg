@@ -76,7 +76,8 @@ def _xml_with_camera(xml_path: Path, T_cam2base: np.ndarray, K: dict[str, float]
 
 
 class MuJoCoGoogleRobotRenderer:
-    def __init__(self, xml_path: str | Path, verbose: bool = True):
+    def __init__(self, xml_path: str | Path, verbose: bool = True,
+                 postprocess: str = "none"):
         os.environ.setdefault("MUJOCO_GL", "egl")
         import mujoco  # type: ignore
 
@@ -90,6 +91,22 @@ class MuJoCoGoogleRobotRenderer:
         self.model = None
         self.data = None
         self.renderer = None
+        self.postprocess = postprocess
+
+    def _postprocess_mask(self, mask: np.ndarray) -> np.ndarray:
+        if self.postprocess == "none":
+            return mask
+        if self.postprocess == "auge":
+            # Matches AugE core.utils.get_overlay_img:
+            #   cv2.flip(mask, 1), then cv2.rotate(..., ROTATE_180)
+            return cv2.rotate(cv2.flip(mask.astype(np.uint8), 1), cv2.ROTATE_180) > 0
+        if self.postprocess == "flip_x":
+            return cv2.flip(mask.astype(np.uint8), 1) > 0
+        if self.postprocess == "flip_y":
+            return cv2.flip(mask.astype(np.uint8), 0) > 0
+        if self.postprocess == "rot180":
+            return cv2.rotate(mask.astype(np.uint8), cv2.ROTATE_180) > 0
+        raise ValueError(f"unknown MuJoCo postprocess: {self.postprocess}")
 
     def _ensure_renderer(self, K: dict[str, float], T_cam2base: np.ndarray,
                          image_hw: tuple[int, int]):
@@ -147,7 +164,7 @@ class MuJoCoGoogleRobotRenderer:
         mask = np.any(rgb > 12, axis=2)
         area = int(mask.sum())
         if 0 < area < int(0.65 * mask.size):
-            return mask
+            return self._postprocess_mask(mask)
 
         try:
             self.renderer.update_scene(self.data, camera="pnp_cam", scene_option=self.scene_option)
@@ -164,7 +181,7 @@ class MuJoCoGoogleRobotRenderer:
             # If segmentation semantics differ across MuJoCo versions and mark
             # most of the frame as foreground, fall back to depth.
             if 0 < int(mask.sum()) < int(0.65 * mask.size):
-                return mask
+                return self._postprocess_mask(mask)
         except Exception:
             try:
                 self.renderer.disable_segmentation_rendering()
@@ -178,7 +195,7 @@ class MuJoCoGoogleRobotRenderer:
             self.renderer.disable_depth_rendering()
             mask = np.isfinite(depth) & (depth > 0.0) & (depth < 0.99)
             if 0 < int(mask.sum()) < int(0.65 * mask.size):
-                return mask
+                return self._postprocess_mask(mask)
         except Exception:
             try:
                 self.renderer.disable_depth_rendering()

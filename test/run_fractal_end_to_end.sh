@@ -138,6 +138,7 @@ if [[ "$RUN_AUGE_IK" == "1" && -f "$GOOGLE_MUJOCO_XML_PATH" ]]; then
   read -r -a GOOGLE_GRIPPER_JOINT_NAMES <<< "$GOOGLE_GRIPPER_JOINT_NAMES_STR"
   AUDIT_URDF_ARGS=(
     --mujoco_xml_path "$GOOGLE_MUJOCO_XML_PATH"
+    --mujoco_postprocess auge
     --arm_joint_names "${GOOGLE_JOINT_NAMES[@]}"
     --gripper_joint_names "${GOOGLE_GRIPPER_JOINT_NAMES[@]}"
     --gripper_open_rad 0.333

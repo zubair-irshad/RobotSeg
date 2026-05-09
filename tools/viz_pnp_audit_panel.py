@@ -370,6 +370,12 @@ def main() -> None:
     parser.add_argument("--mujoco_xml_path", type=Path, default=None,
                         help="Render robot overlays with this MuJoCo XML instead of URDF. "
                              "For Fractal, use AugE robot_xml/google_robot/scene.xml.")
+    parser.add_argument(
+        "--mujoco_postprocess",
+        choices=["none", "auge", "flip_x", "flip_y", "rot180"],
+        default="none",
+        help="Optional postprocess for MuJoCo masks. 'auge' matches AugE get_overlay_img.",
+    )
     parser.add_argument("--urdf_path", type=Path, default=DEFAULT_URDF)
     parser.add_argument("--mesh_dir", type=Path, default=None)
     parser.add_argument("--urdf_backend", choices=["simple", "yourdfpy", "auto"], default="simple")
@@ -407,7 +413,11 @@ def main() -> None:
     masker = None
     if args.mujoco_xml_path is not None and not args.no_urdf:
         from mujoco_google_robot_renderer import MuJoCoGoogleRobotRenderer  # noqa: E402
-        masker = MuJoCoGoogleRobotRenderer(args.mujoco_xml_path, verbose=True)
+        masker = MuJoCoGoogleRobotRenderer(
+            args.mujoco_xml_path,
+            verbose=True,
+            postprocess=args.mujoco_postprocess,
+        )
     elif not args.no_urdf:
         masker = URDFRobotMasker(
             args.urdf_path,

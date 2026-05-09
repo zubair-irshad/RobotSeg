@@ -132,7 +132,7 @@ if [[ "$RUN_SILHOUETTE_REFINE" == "1" ]]; then
       --pnp_json_name "$PNP_JSON_NAME" \
       --out_pnp_json_name "$REFINED_PNP_JSON_NAME" \
       --mujoco_xml_path "$GOOGLE_MUJOCO_XML_PATH" \
-      --mask_dirs 000 \
+      --mask_dirs 000 001 \
       --frame_stride 4 \
       --max_frames 24 \
       --viz_dir_name silhouette_refined_viz

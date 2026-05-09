@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end Fractal / Google Everyday Robot demo:
 # download RLDS frames at native saved resolution, run RobotSeg without
-# spatial pre-downsampling, estimate intrinsics with MoGe, solve TCP PnP,
+# spatial pre-downsampling, use AugE/MuJoCo camera_fov, solve TCP PnP,
 # and visualize projected TCP against RobotSeg gripper centroids.
 
 set -euo pipefail
@@ -22,14 +22,19 @@ FRAME_STRIDE="${FRAME_STRIDE:-1}"
 MAX_FRAMES_PER_SEQ="${MAX_FRAMES_PER_SEQ:-64}"
 INFER_MAX_SIDE="${INFER_MAX_SIDE:-0}"
 MOGE_DEVICE="${MOGE_DEVICE:-cuda}"
-PNP_JSON_NAME="${PNP_JSON_NAME:-pnp_moge.json}"
+USE_MOGE_INTRINSICS="${USE_MOGE_INTRINSICS:-0}"
+FRACTAL_CAMERA_FOV="${FRACTAL_CAMERA_FOV:-57}"
+PNP_JSON_NAME="${PNP_JSON_NAME:-pnp_fovy${FRACTAL_CAMERA_FOV}.json}"
 SEG_EXTRA_ARGS_STR="${SEG_EXTRA_ARGS_STR:---no_require_gripper_near_arm}"
 PNP_EXTRA_ARGS_STR="${PNP_EXTRA_ARGS_STR:---no_use_observed_flag --no_use_mask_stage_accept --no_reject_fragmented --min_conf 0.0 --min_conf_max 0.0 --min_gripper_area_px 8 --min_post_subtract_area_ratio 0.0}"
 RUN_URDF_IK="${RUN_URDF_IK:-0}"
+RUN_AUGE_IK="${RUN_AUGE_IK:-0}"
+AUGE_ROOT="${AUGE_ROOT:-$HOME/AugE-Toolkit}"
 GOOGLE_URDF_PATH="${GOOGLE_URDF_PATH:-$HOME/RobotSeg/data/urdfs/google_robot/google_robot_description/urdf/google_robot.urdf}"
 GOOGLE_URDF_BACKEND="${GOOGLE_URDF_BACKEND:-yourdfpy}"
 GOOGLE_EE_LINK="${GOOGLE_EE_LINK:-}"
-GOOGLE_JOINT_NAMES_STR="${GOOGLE_JOINT_NAMES_STR:-}"
+GOOGLE_JOINT_NAMES_STR="${GOOGLE_JOINT_NAMES_STR:-joint_torso joint_shoulder joint_bicep joint_elbow joint_forearm joint_wrist joint_gripper}"
+GOOGLE_GRIPPER_JOINT_NAMES_STR="${GOOGLE_GRIPPER_JOINT_NAMES_STR:-joint_finger_right joint_finger_left}"
 
 read -r -a SEG_EXTRA_ARGS <<< "$SEG_EXTRA_ARGS_STR"
 read -r -a PNP_EXTRA_ARGS <<< "$PNP_EXTRA_ARGS_STR"
@@ -59,6 +64,15 @@ for ep in sorted(p for p in root.iterdir() if p.is_dir() and p.name.startswith("
     print(f"{ep.name}: {im.width}x{im.height} frames={len(imgs)}")
 PY
 
+if [[ "$RUN_AUGE_IK" == "1" ]]; then
+  echo
+  echo "==> solve Google Robot joints from Fractal TCP with AugE MuJoCo IK"
+  "$PYTHON" "$REPO_ROOT/tools/export_fractal_google_robot_ik.py" \
+    --oxe_root "$OXE_ROOT" \
+    --dataset "$DATASET" \
+    --auge_root "$AUGE_ROOT"
+fi
+
 echo
 echo "==> RobotSeg at native spatial resolution: infer_max_side=$INFER_MAX_SIDE"
 echo "    Fractal mask gates: $SEG_EXTRA_ARGS_STR"
@@ -76,16 +90,25 @@ echo "    Fractal mask gates: $SEG_EXTRA_ARGS_STR"
     --overwrite)
 
 echo
-echo "==> PnP with Fractal TCP state + MoGe intrinsics"
+echo "==> PnP with Fractal TCP state + AugE/MuJoCo camera_fov"
 echo "    Fractal PnP gates: $PNP_EXTRA_ARGS_STR"
+PNP_INTRINSIC_ARGS=(
+  --hfov_deg "$FRACTAL_CAMERA_FOV"
+  --fov_mode vertical
+)
+if [[ "$USE_MOGE_INTRINSICS" == "1" ]]; then
+  PNP_INTRINSIC_ARGS=(
+    --moge_intrinsics
+    --moge_device "$MOGE_DEVICE"
+    --no_hfov_fallback
+  )
+fi
 "$PYTHON" "$REPO_ROOT/tools/pnp_oxe.py" \
   --oxe_root "$OXE_ROOT" \
   --mask_root "$MASK_ROOT" \
   --datasets "$DATASET" \
   --pnp_point_source eef_xyz \
-  --moge_intrinsics \
-  --moge_device "$MOGE_DEVICE" \
-  --no_hfov_fallback \
+  "${PNP_INTRINSIC_ARGS[@]}" \
   --print_intrinsics \
   --pnp_json_name "$PNP_JSON_NAME" \
   "${PNP_EXTRA_ARGS[@]}" \
@@ -107,14 +130,29 @@ echo "==> TCP projection panels: projected Fractal observation['state'][:3] vs g
   --out_dir_name tcp_pnp_candidate_compare
 
 echo
-echo "==> exact PnP audit panels without URDF body rendering"
+echo "==> exact PnP audit panels"
+AUDIT_URDF_ARGS=(--no_urdf)
+if [[ "$RUN_AUGE_IK" == "1" && -f "$GOOGLE_URDF_PATH" ]]; then
+  read -r -a GOOGLE_JOINT_NAMES <<< "$GOOGLE_JOINT_NAMES_STR"
+  read -r -a GOOGLE_GRIPPER_JOINT_NAMES <<< "$GOOGLE_GRIPPER_JOINT_NAMES_STR"
+  AUDIT_URDF_ARGS=(
+    --urdf_path "$GOOGLE_URDF_PATH"
+    --urdf_backend "$GOOGLE_URDF_BACKEND"
+    --arm_joint_names "${GOOGLE_JOINT_NAMES[@]}"
+    --gripper_joint_names "${GOOGLE_GRIPPER_JOINT_NAMES[@]}"
+    --gripper_open_rad 0.333
+    --gripper_closed_rad 1.0
+  )
+else
+  echo "    URDF disabled. Set RUN_AUGE_IK=1 and provide GOOGLE_URDF_PATH to render the articulated Google Robot."
+fi
 "$PYTHON" "$REPO_ROOT/tools/viz_pnp_audit_panel.py" \
   --oxe_root "$OXE_ROOT" \
   --mask_root "$MASK_ROOT" \
   --dataset "$DATASET" \
   --pnp_json_name "$PNP_JSON_NAME" \
   --out_dir_name pnp_audit_fractal \
-  --no_urdf \
+  "${AUDIT_URDF_ARGS[@]}" \
   --skip_bad_pnp
 
 if [[ "$RUN_URDF_IK" == "1" ]]; then

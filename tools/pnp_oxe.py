@@ -382,10 +382,28 @@ def _valid_K_dict(K: dict | None, W: int, H: int) -> bool:
     return True
 
 
-def _default_K(W: int, H: int, hfov_deg: float) -> dict:
-    fx = 0.5 * W / math.tan(0.5 * math.radians(hfov_deg))
-    return {"fx": fx, "fy": fx, "cx": 0.5 * W, "cy": 0.5 * H,
-            "width": W, "height": H}
+def _default_K(
+    W: int,
+    H: int,
+    hfov_deg: float,
+    *,
+    fov_mode: str = "horizontal",
+) -> dict:
+    if fov_mode == "vertical":
+        f = 0.5 * H / math.tan(0.5 * math.radians(hfov_deg))
+        source = f"vfov={hfov_deg}deg"
+    else:
+        f = 0.5 * W / math.tan(0.5 * math.radians(hfov_deg))
+        source = f"hfov={hfov_deg}deg"
+    return {
+        "fx": f,
+        "fy": f,
+        "cx": 0.5 * W,
+        "cy": 0.5 * H,
+        "width": W,
+        "height": H,
+        "source": source,
+    }
 
 
 def _K_to_mat(K: dict) -> np.ndarray:
@@ -1106,9 +1124,8 @@ def process_episode(ds_name, ep_dir_oxe: Path, ep_dir_seg: Path,
         }
 
     if K is None:
-        K = _default_K(W, H, args.hfov_deg)
-        K["source"] = f"hfov={args.hfov_deg}deg"
-        selected_from = "hfov"
+        K = _default_K(W, H, args.hfov_deg, fov_mode=args.fov_mode)
+        selected_from = args.fov_mode + "_fov"
     if args.print_intrinsics:
         print(
             f"  [K/{ds_name}/{ep_dir_seg.name}] "
@@ -1240,6 +1257,16 @@ def main():
     p.add_argument("--K_json", type=Path, default=None,
                    help="Optional JSON: {dataset: {fx,fy,cx,cy}} intrinsics.")
     p.add_argument("--hfov_deg", type=float, default=60.0)
+    p.add_argument(
+        "--fov_mode",
+        choices=["horizontal", "vertical"],
+        default="horizontal",
+        help=(
+            "Interpret --hfov_deg as horizontal FOV (legacy/default) or vertical "
+            "FOV. MuJoCo's model.vis.global_.fovy and AugE camera_fov are "
+            "vertical FOV values."
+        ),
+    )
 
     # filtering
     p.add_argument("--use_observed_flag", action="store_true", default=True,

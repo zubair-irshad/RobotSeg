@@ -357,6 +357,21 @@ def main() -> None:
     parser.add_argument("--mesh_dir", type=Path, default=None)
     parser.add_argument("--urdf_backend", choices=["simple", "yourdfpy", "auto"], default="simple")
     parser.add_argument(
+        "--arm_joint_names",
+        nargs="+",
+        default=None,
+        help="Optional URDF joint names corresponding to trajectory['joint_position'] columns.",
+    )
+    parser.add_argument("--gripper_joint_name", default="finger_joint")
+    parser.add_argument(
+        "--gripper_joint_names",
+        nargs="+",
+        default=None,
+        help="Optional multiple gripper joints to set to the same open/closed value.",
+    )
+    parser.add_argument("--gripper_open_rad", type=float, default=0.0)
+    parser.add_argument("--gripper_closed_rad", type=float, default=0.7)
+    parser.add_argument(
         "--extrinsics_json",
         type=Path,
         default=None,
@@ -378,6 +393,11 @@ def main() -> None:
             args.urdf_path,
             mesh_dir=args.mesh_dir,
             backend=args.urdf_backend,
+            arm_joint_names=tuple(args.arm_joint_names) if args.arm_joint_names else None,
+            gripper_joint_name=args.gripper_joint_name,
+            gripper_joint_names=tuple(args.gripper_joint_names) if args.gripper_joint_names else None,
+            gripper_open_rad=args.gripper_open_rad,
+            gripper_closed_rad=args.gripper_closed_rad,
             downsample=2,
             dilate_px=2,
             verbose=True,

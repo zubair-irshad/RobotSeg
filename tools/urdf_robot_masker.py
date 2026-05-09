@@ -469,7 +469,9 @@ class URDFRobotMasker:
         dilate_px: int = 3,
         geometry: str = "collision",
         backend: str = "simple",
+        arm_joint_names: tuple[str, ...] | None = FRANKA_ARM_JOINT_NAMES,
         gripper_joint_name: str = "finger_joint",
+        gripper_joint_names: tuple[str, ...] | None = None,
         gripper_open_rad: float = 0.0,
         gripper_closed_rad: float = 0.7,
         verbose: bool = True,
@@ -511,17 +513,25 @@ class URDFRobotMasker:
             )
         self.downsample = max(1, int(downsample))
         self.dilate_px = int(dilate_px)
+        self.arm_joint_names = tuple(arm_joint_names or FRANKA_ARM_JOINT_NAMES)
         self.gripper_joint_name = gripper_joint_name
+        self.gripper_joint_names = tuple(gripper_joint_names) if gripper_joint_names is not None else None
         self._grip_span = (float(gripper_open_rad), float(gripper_closed_rad))
 
     def _cfg(self, joint_positions: np.ndarray, gripper_position: float) -> dict[str, float]:
         q_arm = np.asarray(joint_positions, dtype=np.float64).reshape(-1)
         cfg: dict[str, float] = {}
-        for i, name in enumerate(FRANKA_ARM_JOINT_NAMES):
+        for i, name in enumerate(self.arm_joint_names):
             if i >= len(q_arm):
                 break
             cfg[name] = float(q_arm[i])
-        if self.gripper_joint_name:
+        if self.gripper_joint_names is not None:
+            g = float(np.clip(gripper_position, 0.0, 1.0))
+            lo, hi = self._grip_span
+            value = lo + g * (hi - lo)
+            for name in self.gripper_joint_names:
+                cfg[name] = value
+        elif self.gripper_joint_name:
             g = float(np.clip(gripper_position, 0.0, 1.0))
             lo, hi = self._grip_span
             cfg[self.gripper_joint_name] = lo + g * (hi - lo)

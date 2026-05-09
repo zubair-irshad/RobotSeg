@@ -281,6 +281,7 @@ def process_episode(episode, cfg: dict, ep_dir: Path, frame_stride: int) -> dict
     states, actions, kept_idx = [], [], []
     joint_positions = []
     eef_xyz, eef_rot, gripper = [], [], []
+    eef_rot_format_override = None
 
     for i, step in enumerate(steps):
         if i % frame_stride != 0:
@@ -311,8 +312,19 @@ def process_episode(episode, cfg: dict, ep_dir: Path, frame_stride: int) -> dict
                     pass
 
         # Standardized EEF extraction (xyz + rot + gripper) — the path
-        # downstream PnP / pose code prefers.
-        if extractor is not None:
+        # downstream PnP / pose code prefers. AugE's Fractal replay uses
+        # base_pose_tool_reached[:3], base_pose_tool_reached[3:7] and
+        # gripper_closed, so prefer those fields when the TFDS shard has them.
+        if ds_name == "fractal20220817_data" and "base_pose_tool_reached" in step["observation"]:
+            pose = np.asarray(step["observation"]["base_pose_tool_reached"], dtype=np.float32).ravel()
+            if pose.size >= 7:
+                eef_xyz.append(pose[:3])
+                eef_rot.append(pose[3:7])
+                eef_rot_format_override = "quat_xyzw"
+                g = _nested_get(step["observation"], "gripper_closed")
+                if g is not None:
+                    gripper.append(np.asarray(g, dtype=np.float32).ravel()[:1])
+        elif extractor is not None:
             rec = extract_step_proprio(step["observation"], extractor)
             if rec is not None:
                 eef_xyz.append(rec["xyz"])
@@ -348,7 +360,9 @@ def process_episode(episode, cfg: dict, ep_dir: Path, frame_stride: int) -> dict
         traj["eef_xyz"] = np.stack(eef_xyz, axis=0).astype(np.float32)
     if eef_rot:
         traj["eef_rot"] = np.stack(eef_rot, axis=0).astype(np.float32)
-        if extractor is not None and extractor.rot_format is not None:
+        if eef_rot_format_override is not None:
+            traj["eef_rot_format"] = np.array(eef_rot_format_override)
+        elif extractor is not None and extractor.rot_format is not None:
             traj["eef_rot_format"] = np.array(extractor.rot_format)
     if gripper:
         traj["gripper"] = np.stack(gripper, axis=0).astype(np.float32)

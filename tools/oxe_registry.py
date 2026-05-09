@@ -73,17 +73,17 @@ OXE_DATASETS = {
         "fps_note": "10 Hz",
     },
     # --- Google Everyday Robot ---
-    # Per AugE (process_fractal20220817_data): EE pose is published as
-    #   observation['base_pose_tool_reached'] = [x, y, z, qw, qx, qy, qz]
-    # in the robot base frame (suitable for PnP).
+    # Fractal / RT-1 shards expose observation['state'][7]:
+    #   xyz(0:3), rotation-ish/euler(3:6), gripper/open(6).
+    # Some older docs/scripts call the same pose base_pose_tool_reached.
     "fractal20220817_data": {
         "embodiment": "Google Everyday Robot",
         "version": "0.1.0",
         "rgb_keys": ["image"],
-        "state_key": "base_pose_tool_reached",
+        "state_key": "state",
         "action_key": "action",
         "state_schema": (
-            "base_pose_tool_reached[7]: xyz(0:3), quat(3:7). "
+            "state[7]: tcp_xyz(0:3), tcp_rot(3:6), gripper/open(6). "
             "EE xyz for PnP = [0:3]."
         ),
         "fps_note": "3 Hz",

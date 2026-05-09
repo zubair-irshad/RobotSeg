@@ -230,10 +230,11 @@ def process_episode(dataset: str, ep: str, args, masker: URDFRobotMasker | None)
         gripper = _load_gripper(traj, len(joints)) if joints is not None else None
 
         out_root = ep_seg / args.out_dir_name
-        dirs = {
-            name: out_root / name
-            for name in ("raw", "masks", "urdf_pnp", "urdf_multiview", "reprojection", "panel")
-        }
+        have_urdf = masker is not None and joints is not None
+        dir_names = ["raw", "masks", "reprojection", "panel"]
+        if have_urdf:
+            dir_names += ["urdf_pnp", "urdf_multiview"]
+        dirs = {name: out_root / name for name in dir_names}
         for d in dirs.values():
             d.mkdir(parents=True, exist_ok=True)
 
@@ -270,8 +271,8 @@ def process_episode(dataset: str, ep: str, args, masker: URDFRobotMasker | None)
                     cv2.line(reproj, cc, pp, color, 2)
                     err = float(np.linalg.norm(np.asarray(c, dtype=np.float64) - proj))
 
-            urdf_img = image.copy()
-            if masker is not None and joints is not None and idx < len(joints):
+            urdf_img = None
+            if have_urdf and idx < len(joints):
                 urdf_img, _ = masker.overlay(
                     image,
                     K,
@@ -283,11 +284,10 @@ def process_episode(dataset: str, ep: str, args, masker: URDFRobotMasker | None)
                     outline_px=1,
                     alpha=0.60,
                 )
-            urdf_ref_img = image.copy()
+            urdf_ref_img = None
             if (
-                masker is not None
+                have_urdf
                 and T_ref_cam2base is not None
-                and joints is not None
                 and idx < len(joints)
             ):
                 urdf_ref_img, _ = masker.overlay(
@@ -304,19 +304,23 @@ def process_episode(dataset: str, ep: str, args, masker: URDFRobotMasker | None)
 
             cv2.imwrite(str(dirs["raw"] / f"{stem}.jpg"), _draw_header(image, f"raw {stem}"))
             cv2.imwrite(str(dirs["masks"] / f"{stem}.jpg"), _draw_header(mask_img, "body=green gripper=red"))
-            cv2.imwrite(str(dirs["urdf_pnp"] / f"{stem}.jpg"), _draw_header(urdf_img, "URDF from PnP"))
-            ref_label = "URDF from multiview GT" if T_ref_cam2base is not None else "multiview GT missing"
-            cv2.imwrite(str(dirs["urdf_multiview"] / f"{stem}.jpg"), _draw_header(urdf_ref_img, ref_label))
             label = f"{status} err={err:.1f}px" if err is not None else status
             cv2.imwrite(str(dirs["reprojection"] / f"{stem}.jpg"), _draw_header(reproj, label))
 
             panels = [
                 _draw_header(image, f"raw {stem}"),
                 _draw_header(mask_img, "seg: body green / gripper red"),
-                _draw_header(urdf_img, "URDF: PnP estimate"),
-                _draw_header(urdf_ref_img, ref_label),
-                _draw_header(reproj, label),
             ]
+            if have_urdf and urdf_img is not None:
+                cv2.imwrite(str(dirs["urdf_pnp"] / f"{stem}.jpg"), _draw_header(urdf_img, "URDF from PnP"))
+                panels.append(_draw_header(urdf_img, "URDF: PnP estimate"))
+            if have_urdf:
+                ref_label = "URDF from multiview GT" if T_ref_cam2base is not None else "multiview GT missing"
+                if urdf_ref_img is None:
+                    urdf_ref_img = image.copy()
+                cv2.imwrite(str(dirs["urdf_multiview"] / f"{stem}.jpg"), _draw_header(urdf_ref_img, ref_label))
+                panels.append(_draw_header(urdf_ref_img, ref_label))
+            panels.append(_draw_header(reproj, label))
             ph = max(p.shape[0] for p in panels)
             panels = [_resize_to_h(p, ph) for p in panels]
             panel = np.hstack(panels)

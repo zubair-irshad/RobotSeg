@@ -579,6 +579,56 @@ class URDFRobotMasker:
             mask = cv2.dilate(mask, np.ones((k, k), np.uint8))
         return mask.astype(bool)
 
+    def render_cfg(
+        self,
+        K: dict[str, float],
+        T_cam2base: np.ndarray,
+        cfg: dict[str, float],
+        image_hw: tuple[int, int] | None = None,
+        include_link_prefixes: tuple[str, ...] | None = None,
+        exclude_link_prefixes: tuple[str, ...] | None = None,
+    ) -> np.ndarray:
+        H = int(image_hw[0] if image_hw is not None else K["height"])
+        W = int(image_hw[1] if image_hw is not None else K["width"])
+        s = self.downsample
+        Hs = max(1, H // s)
+        Ws = max(1, W // s)
+        Ks = {
+            "fx": float(K["fx"]) / s,
+            "fy": float(K["fy"]) / s,
+            "cx": float(K["cx"]) / s,
+            "cy": float(K["cy"]) / s,
+        }
+
+        vertices, faces = self.robot.combined_mesh(
+            self.robot.filter_cfg(cfg),
+            include_link_prefixes=include_link_prefixes,
+            exclude_link_prefixes=exclude_link_prefixes,
+        )
+        if len(vertices) == 0 or len(faces) == 0:
+            return np.zeros((H, W), dtype=bool)
+
+        T_base2cam = _invert_se3(np.asarray(T_cam2base, dtype=np.float64))
+        verts_cam = _apply_transform(vertices, T_base2cam)
+        z = verts_cam[:, 2]
+        keep = (
+            (z[faces[:, 0]] > 0.05)
+            & (z[faces[:, 1]] > 0.05)
+            & (z[faces[:, 2]] > 0.05)
+        )
+        tri = faces[keep]
+        mask = np.zeros((Hs, Ws), dtype=np.uint8)
+        if len(tri):
+            proj = _project(verts_cam, Ks)
+            polys = proj[:, :2][tri].astype(np.int32)
+            cv2.fillPoly(mask, polys, color=1)
+
+        mask = cv2.resize(mask, (W, H), interpolation=cv2.INTER_NEAREST)
+        if self.dilate_px > 0:
+            k = 2 * self.dilate_px + 1
+            mask = cv2.dilate(mask, np.ones((k, k), np.uint8))
+        return mask.astype(bool)
+
     def overlay(
         self,
         image_bgr: np.ndarray,
@@ -597,6 +647,44 @@ class URDFRobotMasker:
             joint_positions,
             gripper_position=gripper_position,
             image_hw=image_bgr.shape[:2],
+        )
+        out = image_bgr.copy()
+        if np.any(mask):
+            color = np.asarray(color_bgr, dtype=np.float32)
+            sel = mask
+            out_f = out.astype(np.float32)
+            out_f[sel] = (1.0 - alpha) * out_f[sel] + alpha * color
+            out = np.clip(out_f, 0, 255).astype(np.uint8)
+            if outline_px > 0:
+                contours, _ = cv2.findContours(
+                    mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+                cv2.drawContours(
+                    out, contours, -1, outline_bgr, int(outline_px),
+                    lineType=cv2.LINE_AA,
+                )
+        return out, mask
+
+    def overlay_cfg(
+        self,
+        image_bgr: np.ndarray,
+        K: dict[str, float],
+        T_cam2base: np.ndarray,
+        cfg: dict[str, float],
+        color_bgr: tuple[int, int, int] = (229, 132, 11),
+        outline_bgr: tuple[int, int, int] = (245, 165, 35),
+        outline_px: int = 0,
+        alpha: float = 0.60,
+        include_link_prefixes: tuple[str, ...] | None = None,
+        exclude_link_prefixes: tuple[str, ...] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        mask = self.render_cfg(
+            K,
+            T_cam2base,
+            cfg,
+            image_hw=image_bgr.shape[:2],
+            include_link_prefixes=include_link_prefixes,
+            exclude_link_prefixes=exclude_link_prefixes,
         )
         out = image_bgr.copy()
         if np.any(mask):

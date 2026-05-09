@@ -25,6 +25,11 @@ MOGE_DEVICE="${MOGE_DEVICE:-cuda}"
 PNP_JSON_NAME="${PNP_JSON_NAME:-pnp_moge.json}"
 SEG_EXTRA_ARGS_STR="${SEG_EXTRA_ARGS_STR:---no_require_gripper_near_arm}"
 PNP_EXTRA_ARGS_STR="${PNP_EXTRA_ARGS_STR:---no_use_observed_flag --no_use_mask_stage_accept --no_reject_fragmented --min_conf 0.0 --min_conf_max 0.0 --min_gripper_area_px 8 --min_post_subtract_area_ratio 0.0}"
+RUN_URDF_IK="${RUN_URDF_IK:-0}"
+GOOGLE_URDF_PATH="${GOOGLE_URDF_PATH:-$HOME/RobotSeg/data/urdfs/google_robot/google_robot_description/urdf/google_robot.urdf}"
+GOOGLE_URDF_BACKEND="${GOOGLE_URDF_BACKEND:-yourdfpy}"
+GOOGLE_EE_LINK="${GOOGLE_EE_LINK:-}"
+GOOGLE_JOINT_NAMES_STR="${GOOGLE_JOINT_NAMES_STR:-}"
 
 read -r -a SEG_EXTRA_ARGS <<< "$SEG_EXTRA_ARGS_STR"
 read -r -a PNP_EXTRA_ARGS <<< "$PNP_EXTRA_ARGS_STR"
@@ -87,7 +92,7 @@ echo "    Fractal PnP gates: $PNP_EXTRA_ARGS_STR"
   --viz
 
 echo
-echo "==> TCP projection panels: projected Fractal base_pose_tool_reached vs gripper centroid"
+echo "==> TCP projection panels: projected Fractal observation['state'][:3] vs gripper centroid"
 "$PYTHON" "$REPO_ROOT/tools/viz_eef_projection.py" \
   --oxe_root "$OXE_ROOT" \
   --mask_root "$MASK_ROOT" \
@@ -112,9 +117,44 @@ echo "==> exact PnP audit panels without URDF body rendering"
   --no_urdf \
   --skip_bad_pnp
 
+if [[ "$RUN_URDF_IK" == "1" ]]; then
+  if [[ ! -f "$GOOGLE_URDF_PATH" ]]; then
+    echo "[warn] Google Robot URDF not found: $GOOGLE_URDF_PATH" >&2
+    echo "       Run: bash tools/setup_google_robot_urdf.sh" >&2
+  else
+    echo
+    echo "==> Google Robot URDF overlay via TCP IK"
+    IK_ARGS=()
+    if [[ -n "$GOOGLE_EE_LINK" ]]; then
+      IK_ARGS+=(--ee_link "$GOOGLE_EE_LINK")
+    fi
+    if [[ -n "$GOOGLE_JOINT_NAMES_STR" ]]; then
+      read -r -a GOOGLE_JOINT_NAMES <<< "$GOOGLE_JOINT_NAMES_STR"
+      IK_ARGS+=(--joint_names "${GOOGLE_JOINT_NAMES[@]}")
+    fi
+    "$PYTHON" "$REPO_ROOT/tools/viz_urdf_from_tcp_ik.py" \
+      --oxe_root "$OXE_ROOT" \
+      --mask_root "$MASK_ROOT" \
+      --dataset "$DATASET" \
+      --pnp_json_name "$PNP_JSON_NAME" \
+      --urdf_path "$GOOGLE_URDF_PATH" \
+      --urdf_backend "$GOOGLE_URDF_BACKEND" \
+      --skip_bad_pnp \
+      "${IK_ARGS[@]}"
+  fi
+fi
+
+echo
+echo "==> PnP reprojection summary"
+"$PYTHON" "$REPO_ROOT/tools/summarize_pnp_errors.py" \
+  --mask_root "$MASK_ROOT" \
+  --dataset "$DATASET" \
+  --pnp_json_name "$PNP_JSON_NAME"
+
 echo
 echo "Done."
 echo "Masks:       $MASK_ROOT/$DATASET/episode_XXXX/{000,001,combined}/"
 echo "PnP JSON:    $MASK_ROOT/$DATASET/episode_XXXX/$PNP_JSON_NAME"
 echo "TCP panels:  $MASK_ROOT/$DATASET/episode_XXXX/tcp_pnp_candidate_compare/"
 echo "PnP audit:   $MASK_ROOT/$DATASET/episode_XXXX/pnp_audit_fractal/"
+echo "URDF IK:     $MASK_ROOT/$DATASET/episode_XXXX/urdf_tcp_ik_overlay/ (when RUN_URDF_IK=1)"

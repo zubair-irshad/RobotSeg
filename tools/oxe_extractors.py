@@ -68,10 +68,10 @@ EXTRACTORS: dict[str, EEFExtractor] = {
         units_note="meters; gripper_is_closed at [6]",
     ),
     "fractal20220817_data": EEFExtractor(
-        state_key="base_pose_tool_reached",
-        xyz_slice=(0, 3), rot_slice=(3, 7), rot_format="quat_wxyz",
-        gripper_obs_key="gripper_closed",
-        units_note="meters",
+        state_key="state",
+        xyz_slice=(0, 3), rot_slice=(3, 6), rot_format="euler_xyz",
+        gripper_slice=(6, 7),
+        units_note="meters; state[0:3] is TCP xyz, state[3:6] is TCP rotation",
     ),
     "kuka": EEFExtractor(
         state_key="clip_function_input/base_pose_tool_reached",

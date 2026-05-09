@@ -47,3 +47,9 @@ print(f"Wrote: {out_urdf}")
 PY
 
 echo "URDF package: $OUT_PKG"
+python "$(dirname "$0")/viz_urdf_from_tcp_ik.py" \
+  --oxe_root /tmp \
+  --mask_root /tmp \
+  --urdf_path "$OUT_PKG/urdf/google_robot.urdf" \
+  --urdf_backend yourdfpy \
+  --print_model_info 2>/dev/null || true

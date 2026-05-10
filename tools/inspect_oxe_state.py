@@ -34,7 +34,7 @@ from oxe_registry import OXE_DATASETS  # noqa: E402
 # Mirrors EE_XYZ_DIMS in pnp_oxe.py
 CLAIMED_EE_DIMS = {
     "taco_play": (0, 3),
-    "berkeley_autolab_ur5": (7, 10),
+    "berkeley_autolab_ur5": (6, 9),
     "ucsd_pick_and_place_dataset_converted_externally_to_rlds": (0, 3),
     "bridge": (0, 3),
     "fractal20220817_data": (0, 3),

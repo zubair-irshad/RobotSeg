@@ -248,7 +248,7 @@ def _berkeley_ur5_mujoco_qpos(robot_state) -> np.ndarray:
     state = np.asarray(robot_state, dtype=np.float32).ravel()
     if state.size < 6:
         return state
-    is_closed = bool(state[-2] > 0.5) if state.size >= 2 else False
+    is_closed = bool(state[13] > 0.5) if state.size >= 14 else False
     if is_closed:
         gripper = np.asarray(
             [1.0, 0.025, 0.80, -0.80, 1.0, 0.0252768, 0.80, -0.80],
@@ -326,7 +326,7 @@ def process_episode(episode, cfg: dict, ep_dir: Path, frame_stride: int) -> dict
                     joint = np.asarray(v).ravel()
                     if ds_name == "berkeley_autolab_ur5":
                         # Match AugE replay: qpos = six UR5 arm joints plus
-                        # eight synthetic gripper joints from robot_state[-2].
+                        # eight synthetic gripper joints from robot_state[13].
                         joint = _berkeley_ur5_mujoco_qpos(joint)
                     joint_positions.append(joint)
                 except Exception:

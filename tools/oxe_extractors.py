@@ -63,9 +63,9 @@ EXTRACTORS: dict[str, EEFExtractor] = {
     ),
     "berkeley_autolab_ur5": EEFExtractor(
         state_key="robot_state",
-        xyz_slice=(7, 10), rot_slice=(10, 14), rot_format="quat_wxyz",
-        gripper_slice=(6, 7),
-        units_note="meters; gripper_is_closed at [6]",
+        xyz_slice=(6, 9), rot_slice=(9, 13), rot_format="quat_xyzw",
+        gripper_slice=(13, 14),
+        units_note="meters; robot_state=[j0..j5, xyz, quat_xyzw, gripper_closed, action_blocked]",
     ),
     "fractal20220817_data": EEFExtractor(
         state_key="state",

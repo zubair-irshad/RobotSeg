@@ -68,7 +68,7 @@ DEFAULT_URDF = (
 # Where in trajectory["state"] the EE xyz lives, parsed from the registry schema.
 EE_XYZ_DIMS: dict[str, tuple[int, int]] = {
     "taco_play": (0, 3),
-    "berkeley_autolab_ur5": (7, 10),
+    "berkeley_autolab_ur5": (6, 9),
     "ucsd_pick_and_place_dataset_converted_externally_to_rlds": (0, 3),
     "bridge": (0, 3),
     # fractal: registry sets state_key='base_pose_tool_reached'.

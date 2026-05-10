@@ -1,0 +1,3 @@
+[submodule "third_party/AugE-Toolkit"]
+	path = third_party/AugE-Toolkit
+	url = https://github.com/BerkeleyAutomation/AugE-Toolkit.git

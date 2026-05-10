@@ -9,6 +9,7 @@ renders the current MuJoCo qpos into an image-sized mask.
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -77,7 +78,9 @@ def _xml_with_camera(xml_path: Path, T_cam2base: np.ndarray, K: dict[str, float]
 
 class MuJoCoGoogleRobotRenderer:
     def __init__(self, xml_path: str | Path, verbose: bool = True,
-                 postprocess: str = "none", geom_groups: tuple[int, ...] = (2,)):
+                 postprocess: str = "none", geom_groups: tuple[int, ...] = (2,),
+                 geom_name_include: str | None = None,
+                 geom_name_exclude: str | None = None):
         os.environ.setdefault("MUJOCO_GL", "egl")
         import mujoco  # type: ignore
 
@@ -93,6 +96,31 @@ class MuJoCoGoogleRobotRenderer:
         self.renderer = None
         self.postprocess = postprocess
         self.geom_groups = tuple(int(g) for g in geom_groups)
+        self.geom_name_include = geom_name_include
+        self.geom_name_exclude = geom_name_exclude
+        self._robot_geom_ids: set[int] | None = None
+
+    def _geom_name(self, geom_id: int) -> str:
+        assert self.model is not None
+        name = self.mujoco.mj_id2name(self.model, self.mujoco.mjtObj.mjOBJ_GEOM, int(geom_id))
+        return name or ""
+
+    def _allowed_geom_ids(self) -> set[int]:
+        assert self.model is not None
+        include_re = re.compile(self.geom_name_include) if self.geom_name_include else None
+        exclude_re = re.compile(self.geom_name_exclude) if self.geom_name_exclude else None
+        allowed: set[int] = set()
+        for gid in range(int(self.model.ngeom)):
+            group = int(self.model.geom_group[gid])
+            if self.geom_groups and group not in self.geom_groups:
+                continue
+            name = self._geom_name(gid)
+            if include_re is not None and not include_re.search(name):
+                continue
+            if exclude_re is not None and exclude_re.search(name):
+                continue
+            allowed.add(gid)
+        return allowed
 
     def _postprocess_mask(self, mask: np.ndarray, mode: str | None = None) -> np.ndarray:
         mode = self.postprocess if mode is None else mode
@@ -141,13 +169,38 @@ class MuJoCoGoogleRobotRenderer:
         for group in self.geom_groups:
             if 0 <= group < len(self.scene_option.geomgroup):
                 self.scene_option.geomgroup[group] = 1
+        self._robot_geom_ids = self._allowed_geom_ids()
         self._cache_key = key
         if self.verbose:
+            preview = []
+            for gid in sorted(self._robot_geom_ids)[:8]:
+                preview.append(self._geom_name(gid) or f"geom_{gid}")
             print(
                 f"[mujoco_render] loaded {self.xml_path} camera=pnp_cam "
                 f"size={W}x{H} nq={self.model.nq} ngeom={self.model.ngeom} "
-                f"geom_groups={self.geom_groups}"
+                f"geom_groups={self.geom_groups} selected_geoms={len(self._robot_geom_ids)} "
+                f"preview={preview}"
             )
+
+    def _segmentation_mask(self, seg: np.ndarray) -> np.ndarray | None:
+        if self._robot_geom_ids is None or not self._robot_geom_ids:
+            return None
+        if seg.ndim != 3:
+            return None
+        ids = seg[..., 0]
+        # MuJoCo Renderer segmentation commonly returns geom/object ids in the
+        # first channel. Depending on version, ids can be either 0-based with
+        # -1 as background or 1-based with 0 as background. Try both and keep
+        # the one with a plausible foreground area.
+        candidates = [
+            np.isin(ids, list(self._robot_geom_ids)),
+            np.isin(ids - 1, list(self._robot_geom_ids)),
+        ]
+        for mask in candidates:
+            area = int(mask.sum())
+            if 0 < area < int(0.65 * mask.size):
+                return mask
+        return None
 
     def render(self, K: dict[str, float], T_cam2base: np.ndarray,
                qpos: np.ndarray, gripper_position: float = 0.0,
@@ -166,37 +219,29 @@ class MuJoCoGoogleRobotRenderer:
             self.data.qpos[7:9] = 0.333 + g * (1.0 - 0.333)
         self.mujoco.mj_forward(self.model, self.data)
 
-        # Primary path: render only the robot visual geom group into an empty
-        # scene and threshold non-background RGB. This is more reliable across
-        # MuJoCo versions than depth, whose background value can appear finite.
-        self.renderer.update_scene(self.data, camera="pnp_cam", scene_option=self.scene_option)
-        rgb = self.renderer.render()
-        mask = np.any(rgb > 12, axis=2)
-        area = int(mask.sum())
-        if 0 < area < int(0.65 * mask.size):
-            return self._postprocess_mask(mask, postprocess)
-
         try:
             self.renderer.update_scene(self.data, camera="pnp_cam", scene_option=self.scene_option)
             self.renderer.enable_segmentation_rendering()
             seg = self.renderer.render()
             self.renderer.disable_segmentation_rendering()
-            if seg.ndim == 3:
-                if np.issubdtype(seg.dtype, np.signedinteger):
-                    mask = seg[..., 0] >= 0
-                else:
-                    mask = seg[..., 0] > 0
-            else:
-                mask = seg >= 0 if np.issubdtype(seg.dtype, np.signedinteger) else seg > 0
-            # If segmentation semantics differ across MuJoCo versions and mark
-            # most of the frame as foreground, fall back to depth.
-            if 0 < int(mask.sum()) < int(0.65 * mask.size):
+            mask = self._segmentation_mask(seg)
+            if mask is not None:
                 return self._postprocess_mask(mask, postprocess)
         except Exception:
             try:
                 self.renderer.disable_segmentation_rendering()
             except Exception:
                 pass
+
+        # Fallback: render selected geom groups and threshold non-background
+        # RGB. This can include same-group scene props, so segmentation above
+        # is preferred whenever MuJoCo exposes usable geom ids.
+        self.renderer.update_scene(self.data, camera="pnp_cam", scene_option=self.scene_option)
+        rgb = self.renderer.render()
+        mask = np.any(rgb > 12, axis=2)
+        area = int(mask.sum())
+        if 0 < area < int(0.65 * mask.size):
+            return self._postprocess_mask(mask, postprocess)
 
         try:
             self.renderer.update_scene(self.data, camera="pnp_cam", scene_option=self.scene_option)

@@ -34,14 +34,25 @@ AUGE_ROOT="${AUGE_ROOT:-$HOME/AugE-Toolkit}"
 UR5_MUJOCO_XML_PATH="${UR5_MUJOCO_XML_PATH:-$AUGE_ROOT/robot_xml/universal_robots_ur5e/scene.xml}"
 UR5_MUJOCO_QPOS_KEY="${UR5_MUJOCO_QPOS_KEY:-joint_position}"
 UR5_MUJOCO_GEOM_GROUPS="${UR5_MUJOCO_GEOM_GROUPS:-2}"
+UR5_MUJOCO_GEOM_NAME_INCLUDE="${UR5_MUJOCO_GEOM_NAME_INCLUDE:-}"
+UR5_MUJOCO_GEOM_NAME_EXCLUDE="${UR5_MUJOCO_GEOM_NAME_EXCLUDE:-floor|table|desk|wall|world|scene|camera|light|object|prop|box|bin|tray|cloth|pad|plane}"
 UR5_VIEWPOINTS_JSON="${UR5_VIEWPOINTS_JSON:-$REPO_ROOT/data/viewpoints/berkeley_autolab_ur5_viewpoints.json}"
 VIEWPOINT_REFINED_PNP_JSON_NAME="${VIEWPOINT_REFINED_PNP_JSON_NAME:-pnp_fovy${UR5_CAMERA_FOV}_viewpoint_silhouette_refined.json}"
 SIL_REFINE_FRAME_STRIDE="${SIL_REFINE_FRAME_STRIDE:-4}"
 SIL_REFINE_MAX_FRAMES="${SIL_REFINE_MAX_FRAMES:-24}"
 SIL_REFINE_MAX_EVALS="${SIL_REFINE_MAX_EVALS:-240}"
+SIL_REFINE_EXTRA_ARGS_STR="${SIL_REFINE_EXTRA_ARGS_STR:---w_render_to_target 1.0 --w_precision 1.0 --w_area 0.35}"
 
 read -r -a PNP_EXTRA_ARGS <<< "$PNP_EXTRA_ARGS_STR"
 read -r -a SEG_EXTRA_ARGS <<< "$SEG_EXTRA_ARGS_STR"
+read -r -a SIL_REFINE_EXTRA_ARGS <<< "$SIL_REFINE_EXTRA_ARGS_STR"
+MUJOCO_NAME_FILTER_ARGS=()
+if [[ -n "$UR5_MUJOCO_GEOM_NAME_INCLUDE" ]]; then
+  MUJOCO_NAME_FILTER_ARGS+=(--mujoco_geom_name_include "$UR5_MUJOCO_GEOM_NAME_INCLUDE")
+fi
+if [[ -n "$UR5_MUJOCO_GEOM_NAME_EXCLUDE" ]]; then
+  MUJOCO_NAME_FILTER_ARGS+=(--mujoco_geom_name_exclude "$UR5_MUJOCO_GEOM_NAME_EXCLUDE")
+fi
 
 if [[ "$DOWNLOAD" == "1" ]]; then
   echo "==> download UR5 OXE subset"
@@ -127,10 +138,12 @@ if [[ "$RUN_SILHOUETTE_REFINE" == "1" ]]; then
       --mujoco_xml_path "$UR5_MUJOCO_XML_PATH" \
       --mujoco_qpos_key "$UR5_MUJOCO_QPOS_KEY" \
       --mujoco_geom_groups "$UR5_MUJOCO_GEOM_GROUPS" \
+      "${MUJOCO_NAME_FILTER_ARGS[@]}" \
       --mask_dirs 000 001 \
       --frame_stride "$SIL_REFINE_FRAME_STRIDE" \
       --max_frames "$SIL_REFINE_MAX_FRAMES" \
       --max_evals "$SIL_REFINE_MAX_EVALS" \
+      "${SIL_REFINE_EXTRA_ARGS[@]}" \
       --viz_dir_name silhouette_refined_viz
     VIS_PNP_JSON_NAME="$REFINED_PNP_JSON_NAME"
 
@@ -148,10 +161,12 @@ if [[ "$RUN_SILHOUETTE_REFINE" == "1" ]]; then
         --mujoco_xml_path "$UR5_MUJOCO_XML_PATH" \
         --mujoco_qpos_key "$UR5_MUJOCO_QPOS_KEY" \
         --mujoco_geom_groups "$UR5_MUJOCO_GEOM_GROUPS" \
+        "${MUJOCO_NAME_FILTER_ARGS[@]}" \
         --mask_dirs 000 001 \
         --frame_stride "$SIL_REFINE_FRAME_STRIDE" \
         --max_frames "$SIL_REFINE_MAX_FRAMES" \
         --max_evals "$SIL_REFINE_MAX_EVALS" \
+        "${SIL_REFINE_EXTRA_ARGS[@]}" \
         --viz_dir_name silhouette_refined_from_viewpoint_viz
       VIS_PNP_JSON_NAME="$VIEWPOINT_REFINED_PNP_JSON_NAME"
     fi
@@ -166,6 +181,7 @@ if [[ "$RUN_MUJOCO_RENDER" == "1" && -f "$UR5_MUJOCO_XML_PATH" ]]; then
     --mujoco_xml_path "$UR5_MUJOCO_XML_PATH"
     --mujoco_qpos_key "$UR5_MUJOCO_QPOS_KEY"
     --mujoco_geom_groups "$UR5_MUJOCO_GEOM_GROUPS"
+    "${MUJOCO_NAME_FILTER_ARGS[@]}"
   )
 fi
 "$PYTHON" "$REPO_ROOT/tools/viz_pnp_audit_panel.py" \

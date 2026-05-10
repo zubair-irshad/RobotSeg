@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 
 import cv2
@@ -129,7 +130,9 @@ def _parse_groups(text: str) -> tuple[int, ...]:
 
 class FreeCameraGoogleRobotRenderer:
     def __init__(self, xml_path: Path, height: int, width: int,
-                 geom_groups: tuple[int, ...] = (2,)):
+                 geom_groups: tuple[int, ...] = (2,),
+                 geom_name_include: str | None = None,
+                 geom_name_exclude: str | None = None):
         os.environ.setdefault("MUJOCO_GL", "egl")
         import mujoco  # type: ignore
 
@@ -143,8 +146,44 @@ class FreeCameraGoogleRobotRenderer:
         for group in self.geom_groups:
             if 0 <= group < len(self.scene_option.geomgroup):
                 self.scene_option.geomgroup[group] = 1
+        self.geom_name_include = geom_name_include
+        self.geom_name_exclude = geom_name_exclude
+        self._robot_geom_ids = self._allowed_geom_ids()
         self.camera = mujoco.MjvCamera()
         self.camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+
+    def _geom_name(self, geom_id: int) -> str:
+        name = self.mujoco.mj_id2name(self.model, self.mujoco.mjtObj.mjOBJ_GEOM, int(geom_id))
+        return name or ""
+
+    def _allowed_geom_ids(self) -> set[int]:
+        include_re = re.compile(self.geom_name_include) if self.geom_name_include else None
+        exclude_re = re.compile(self.geom_name_exclude) if self.geom_name_exclude else None
+        allowed: set[int] = set()
+        for gid in range(int(self.model.ngeom)):
+            group = int(self.model.geom_group[gid])
+            if self.geom_groups and group not in self.geom_groups:
+                continue
+            name = self._geom_name(gid)
+            if include_re is not None and not include_re.search(name):
+                continue
+            if exclude_re is not None and exclude_re.search(name):
+                continue
+            allowed.add(gid)
+        return allowed
+
+    def _segmentation_mask(self, seg: np.ndarray) -> np.ndarray | None:
+        if seg.ndim != 3 or not self._robot_geom_ids:
+            return None
+        ids = seg[..., 0]
+        for mask in (
+            np.isin(ids, list(self._robot_geom_ids)),
+            np.isin(ids - 1, list(self._robot_geom_ids)),
+        ):
+            area = int(mask.sum())
+            if 0 < area < int(0.75 * mask.size):
+                return mask
+        return None
 
     def close(self) -> None:
         self.renderer.close()
@@ -170,11 +209,8 @@ class FreeCameraGoogleRobotRenderer:
             self.renderer.enable_segmentation_rendering()
             seg = self.renderer.render()
             self.renderer.disable_segmentation_rendering()
-            if seg.ndim == 3:
-                mask = seg[..., 0] >= 0 if np.issubdtype(seg.dtype, np.signedinteger) else seg[..., 0] > 0
-            else:
-                mask = seg >= 0 if np.issubdtype(seg.dtype, np.signedinteger) else seg > 0
-            if 0 < int(mask.sum()) < int(0.75 * mask.size):
+            mask = self._segmentation_mask(seg)
+            if mask is not None:
                 return mask
         except Exception:
             try:
@@ -277,6 +313,8 @@ def process_episode(args: argparse.Namespace, ep_name: str) -> dict:
                 H,
                 W,
                 geom_groups=_parse_groups(args.mujoco_geom_groups),
+                geom_name_include=args.mujoco_geom_name_include,
+                geom_name_exclude=args.mujoco_geom_name_exclude,
             )
             viewpoints = _load_viewpoints(args.viewpoints_json)
             frame_dir = out_root / f"frame_{stem}"
@@ -325,6 +363,8 @@ def main() -> None:
     p.add_argument("--mujoco_xml_path", type=Path, required=True)
     p.add_argument("--mujoco_qpos_key", default=None)
     p.add_argument("--mujoco_geom_groups", default="2")
+    p.add_argument("--mujoco_geom_name_include", default=None)
+    p.add_argument("--mujoco_geom_name_exclude", default=None)
     p.add_argument("--viewpoints_json", type=Path, default=None)
     p.add_argument("--target_mask_dirs", nargs="+", default=["000"])
     p.add_argument("--out_dir_name", default="mujoco_viewpoint_check")

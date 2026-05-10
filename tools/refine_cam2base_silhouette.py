@@ -23,7 +23,7 @@ import numpy as np
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 from cam2base_json import invert_se3  # noqa: E402
-from pnp_oxe import EE_XYZ_DIMS, _fk_point_sequence, _K_to_mat  # noqa: E402
+from pnp_oxe import EE_XYZ_DIMS, _eef_rot_to_R, _fk_point_sequence, _K_to_mat  # noqa: E402
 from score_urdf_silhouette import (  # noqa: E402
     _aggregate,
     _available_stems,
@@ -127,6 +127,16 @@ def _reprojection_metrics(
             points, status = _fk_point_sequence(traj, n, fk_args)
             if points is None:
                 return {"num_reprojection_stems": 0, "reprojection_skip": status}
+        if "tool_offset" in pnp and "eef_rot" in traj.files:
+            try:
+                fmt = str(traj["eef_rot_format"]) if "eef_rot_format" in traj.files else "quat_xyzw"
+                R_wrist = _eef_rot_to_R(traj["eef_rot"], fmt)
+                offset = np.asarray(pnp["tool_offset"], dtype=np.float64).reshape(3)
+                n_apply = min(len(points), len(R_wrist))
+                points = np.asarray(points, dtype=np.float64).copy()
+                points[:n_apply] = points[:n_apply] + (R_wrist[:n_apply] @ offset)
+            except Exception as exc:
+                return {"num_reprojection_stems": 0, "reprojection_skip": f"tool-offset-failed:{exc}"}
 
     K_mat = _K_to_mat(K)
     rvec_arr = np.asarray(rvec, dtype=np.float64).reshape(3, 1)
@@ -165,6 +175,27 @@ def _reprojection_metrics(
         "mean_err_px": float(arr.mean()),
         "median_err_px": float(np.median(arr)),
     }
+
+
+def _reprojection_guard(args: argparse.Namespace,
+                        init_reproj: dict[str, Any],
+                        final_reproj: dict[str, Any]) -> tuple[bool, str]:
+    final_rmse = final_reproj.get("rmse_px")
+    if final_rmse is None:
+        return True, "no-final-reprojection"
+    final_rmse_f = float(final_rmse)
+    if args.max_refined_reprojection_rmse > 0 and final_rmse_f > args.max_refined_reprojection_rmse:
+        return False, f"rmse {final_rmse_f:.2f}px > {args.max_refined_reprojection_rmse:.2f}px"
+    init_rmse = init_reproj.get("rmse_px")
+    if init_rmse is not None and args.max_refined_reprojection_worsen > 0:
+        init_rmse_f = max(1e-6, float(init_rmse))
+        ratio = final_rmse_f / init_rmse_f
+        if ratio > args.max_refined_reprojection_worsen:
+            return False, (
+                f"rmse worsened {ratio:.2f}x > "
+                f"{args.max_refined_reprojection_worsen:.2f}x"
+            )
+    return True, "ok"
 
 
 def _apply_delta(T0: np.ndarray, x: np.ndarray) -> np.ndarray:
@@ -423,6 +454,8 @@ def _best_viewpoint_initial_pose(
         H,
         W,
         geom_groups=_parse_groups(args.mujoco_geom_groups),
+        geom_name_include=args.mujoco_geom_name_include,
+        geom_name_exclude=args.mujoco_geom_name_exclude,
     )
     try:
         best_idx = -1
@@ -489,11 +522,8 @@ def _process_episode(args: argparse.Namespace, masker,
     else:
         T0 = np.asarray(pnp["T_cam2base"], dtype=np.float64)
     init_loss, init_rows = _score_pose(args, masker, samples, K, T0)
-    init_rvec = pnp.get("rvec")
-    init_tvec = pnp.get("tvec")
-    init_reproj = {}
-    if init_rvec is not None and init_tvec is not None:
-        init_reproj = _reprojection_metrics(args, ep_oxe, ep_seg, pnp, K, init_rvec, init_tvec)
+    init_rvec, init_tvec, init_T_base2cam = _T_to_rvec_tvec(T0)
+    init_reproj = _reprojection_metrics(args, ep_oxe, ep_seg, pnp, K, init_rvec, init_tvec)
 
     cache: dict[tuple[float, ...], float] = {}
 
@@ -507,14 +537,22 @@ def _process_episode(args: argparse.Namespace, masker,
     x_best, best_loss, evals = _optimize_pose(args, objective)
     T_best = _apply_delta(T0, x_best)
     final_loss, final_rows = _score_pose(args, masker, samples, K, T_best)
+    final_rvec, final_tvec, final_T_base2cam = _T_to_rvec_tvec(T_best)
+    final_reproj = _reprojection_metrics(args, ep_oxe, ep_seg, pnp, K, final_rvec, final_tvec)
+    reproj_ok, reproj_guard_reason = _reprojection_guard(args, init_reproj, final_reproj)
 
-    improved = final_loss + args.min_loss_improvement < init_loss
+    silhouette_improved = final_loss + args.min_loss_improvement < init_loss
+    improved = silhouette_improved and reproj_ok
     T_out = T_best if improved else T0
     rows_out = final_rows if improved else init_rows
     loss_out = final_loss if improved else init_loss
 
-    rvec, tvec, T_base2cam = _T_to_rvec_tvec(T_out)
-    reproj = _reprojection_metrics(args, ep_oxe, ep_seg, pnp, K, rvec, tvec)
+    if improved:
+        rvec, tvec, T_base2cam = final_rvec, final_tvec, final_T_base2cam
+        reproj = final_reproj
+    else:
+        rvec, tvec, T_base2cam = init_rvec, init_tvec, init_T_base2cam
+        reproj = init_reproj
     out = copy.deepcopy(pnp)
     out["T_cam2base"] = np.asarray(T_out, dtype=float).tolist()
     out["T_base2cam"] = T_base2cam
@@ -529,6 +567,9 @@ def _process_episode(args: argparse.Namespace, masker,
         out["refined_reprojection"] = reproj
     out["silhouette_refinement"] = {
         "status": "improved" if improved else "kept-initial",
+        "silhouette_improved": silhouette_improved,
+        "reprojection_guard_ok": reproj_ok,
+        "reprojection_guard_reason": reproj_guard_reason,
         "init_loss": init_loss,
         "final_loss": final_loss,
         "written_loss": loss_out,
@@ -543,6 +584,7 @@ def _process_episode(args: argparse.Namespace, masker,
         "init_metrics": _aggregate(init_rows),
         "final_metrics": _aggregate(final_rows),
         "init_reprojection": init_reproj,
+        "final_reprojection": final_reproj,
         "written_reprojection": reproj,
     }
     out_path = ep_seg / args.out_pnp_json_name
@@ -556,6 +598,9 @@ def _process_episode(args: argparse.Namespace, masker,
         "episode": ep_name,
         "status": "ok",
         "improved": improved,
+        "silhouette_improved": silhouette_improved,
+        "reprojection_guard_ok": reproj_ok,
+        "reprojection_guard_reason": reproj_guard_reason,
         "init_loss": init_loss,
         "final_loss": final_loss,
         "written_loss": loss_out,
@@ -598,6 +643,10 @@ def main() -> None:
     parser.add_argument("--mujoco_geom_groups", default="2",
                         help="Comma-separated MuJoCo geom groups to render. Google Robot uses 2; "
                              "other XMLs may need 0,1,2,3,4,5.")
+    parser.add_argument("--mujoco_geom_name_include", default=None,
+                        help="Optional regex for MuJoCo geom names to keep in rendered masks.")
+    parser.add_argument("--mujoco_geom_name_exclude", default=None,
+                        help="Optional regex for MuJoCo geom names to remove from rendered masks.")
     parser.add_argument(
         "--mujoco_postprocess",
         choices=["none", "auge", "flip_x", "flip_y", "rot180"],
@@ -625,6 +674,18 @@ def main() -> None:
     parser.add_argument("--sweeps_per_scale", type=int, default=4)
     parser.add_argument("--max_evals", type=int, default=240)
     parser.add_argument("--min_loss_improvement", type=float, default=1e-4)
+    parser.add_argument(
+        "--max_refined_reprojection_rmse",
+        type=float,
+        default=60.0,
+        help="Keep the initial pose if a silhouette update raises TCP reprojection RMSE above this many pixels. Set <=0 to disable.",
+    )
+    parser.add_argument(
+        "--max_refined_reprojection_worsen",
+        type=float,
+        default=10.0,
+        help="Keep the initial pose if a silhouette update worsens TCP reprojection RMSE by more than this factor. Set <=0 to disable.",
+    )
     parser.add_argument("--polish", action="store_true", default=True)
     parser.add_argument("--no_polish", dest="polish", action="store_false")
     parser.add_argument("--w_target_to_render", type=float, default=1.0)
@@ -645,6 +706,8 @@ def main() -> None:
             verbose=True,
             postprocess=args.mujoco_postprocess,
             geom_groups=_parse_groups(args.mujoco_geom_groups),
+            geom_name_include=args.mujoco_geom_name_include,
+            geom_name_exclude=args.mujoco_geom_name_exclude,
         )
     else:
         include_prefixes = _parse_prefixes(args.render_link_prefixes)
@@ -685,7 +748,8 @@ def main() -> None:
                     f"written_iou={_fmt_metric(result.get('iou_median'))} "
                     f"cov={_fmt_metric(result.get('coverage_median'))} "
                     f"t2r={_fmt_metric(result.get('t2r_median'), 2)}px "
-                    f"evals={result.get('num_evals')} n={result.get('num_samples')}"
+                    f"evals={result.get('num_evals')} n={result.get('num_samples')} "
+                    f"reproj_guard={result.get('reprojection_guard_reason')}"
                 )
             else:
                 print(f"[{args.dataset}/{ep}] {result.get('status')}")

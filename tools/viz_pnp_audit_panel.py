@@ -407,6 +407,10 @@ def main() -> None:
     parser.add_argument("--mujoco_geom_groups", default="2",
                         help="Comma-separated MuJoCo geom groups to render. Google Robot uses 2; "
                              "other XMLs may need 0,1,2,3,4,5.")
+    parser.add_argument("--mujoco_geom_name_include", default=None,
+                        help="Optional regex for MuJoCo geom names to keep in rendered masks.")
+    parser.add_argument("--mujoco_geom_name_exclude", default=None,
+                        help="Optional regex for MuJoCo geom names to remove from rendered masks.")
     parser.add_argument(
         "--mujoco_postprocess",
         choices=["none", "auge", "flip_x", "flip_y", "rot180"],
@@ -456,6 +460,8 @@ def main() -> None:
             verbose=True,
             postprocess=args.mujoco_postprocess,
             geom_groups=_parse_groups(args.mujoco_geom_groups),
+            geom_name_include=args.mujoco_geom_name_include,
+            geom_name_exclude=args.mujoco_geom_name_exclude,
         )
     elif not args.no_urdf:
         masker = URDFRobotMasker(

@@ -334,8 +334,24 @@ def _K_from_trajectory_npz(traj, W: int, H: int) -> tuple[dict | None, list[dict
     Handles direct 3x3 K, flattened 9-vector K, packed [fx,fy,cx,cy], and
     per-frame stacks of those. Returns (best, candidates).
     """
+    skip_keys = {
+        "state",
+        "action",
+        "eef_xyz",
+        "eef_rot",
+        "eef_rot_format",
+        "gripper",
+        "joint_position",
+        "joint_positions",
+        "joints",
+        "q",
+        "arm_joints",
+        "frame_indices_in_episode",
+    }
     candidates = []
     for key in getattr(traj, "files", []):
+        if key in skip_keys:
+            continue
         try:
             cand = _K_candidate_from_array(traj[key], key, W, H)
         except Exception:

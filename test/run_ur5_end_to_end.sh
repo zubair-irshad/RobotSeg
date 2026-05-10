@@ -25,18 +25,22 @@ REFINED_PNP_JSON_NAME="${REFINED_PNP_JSON_NAME:-pnp_fovy${UR5_CAMERA_FOV}_silhou
 PNP_EXTRA_ARGS_STR="${PNP_EXTRA_ARGS_STR:---no_use_observed_flag --no_use_mask_stage_accept --no_reject_fragmented --min_conf 0.0 --min_conf_max 0.0 --min_gripper_area_px 8 --min_post_subtract_area_ratio 0.0}"
 SEG_EXTRA_ARGS_STR="${SEG_EXTRA_ARGS_STR:---no_require_gripper_near_arm --relax_gripper_observed}"
 REPAIR_UR5_QPOS="${REPAIR_UR5_QPOS:-1}"
-UR5_SOLVE_TOOL_OFFSET="${UR5_SOLVE_TOOL_OFFSET:-1}"
+UR5_SOLVE_TOOL_OFFSET="${UR5_SOLVE_TOOL_OFFSET:-0}"
 UR5_TOOL_OFFSET_BOUND="${UR5_TOOL_OFFSET_BOUND:-0.30}"
 RUN_MUJOCO_RENDER="${RUN_MUJOCO_RENDER:-1}"
 RUN_SILHOUETTE_REFINE="${RUN_SILHOUETTE_REFINE:-0}"
 RUN_VIEWPOINT_INIT_REFINE="${RUN_VIEWPOINT_INIT_REFINE:-0}"
 AUGE_ROOT="${AUGE_ROOT:-$HOME/AugE-Toolkit}"
+if [[ ! -d "$AUGE_ROOT" && -d "$REPO_ROOT/third_party/AugE-Toolkit" ]]; then
+  AUGE_ROOT="$REPO_ROOT/third_party/AugE-Toolkit"
+fi
 UR5_MUJOCO_XML_PATH="${UR5_MUJOCO_XML_PATH:-$AUGE_ROOT/robot_xml/universal_robots_ur5e/scene.xml}"
 UR5_MUJOCO_QPOS_KEY="${UR5_MUJOCO_QPOS_KEY:-joint_position}"
+UR5_TCP_SOURCE="${UR5_TCP_SOURCE:-auge_fk}"
 UR5_MUJOCO_GEOM_GROUPS="${UR5_MUJOCO_GEOM_GROUPS:-2}"
 UR5_MUJOCO_GEOM_NAME_INCLUDE="${UR5_MUJOCO_GEOM_NAME_INCLUDE:-}"
 UR5_MUJOCO_GEOM_NAME_EXCLUDE="${UR5_MUJOCO_GEOM_NAME_EXCLUDE:-floor|table|desk|wall|world|scene|camera|light|object|prop|box|bin|tray|cloth|pad|plane}"
-UR5_MUJOCO_BASE_BODY="${UR5_MUJOCO_BASE_BODY:-auto}"
+UR5_MUJOCO_BASE_BODY="${UR5_MUJOCO_BASE_BODY:-ur5e/base}"
 UR5_VIEWPOINTS_JSON="${UR5_VIEWPOINTS_JSON:-$REPO_ROOT/data/viewpoints/berkeley_autolab_ur5_viewpoints.json}"
 VIEWPOINT_REFINED_PNP_JSON_NAME="${VIEWPOINT_REFINED_PNP_JSON_NAME:-pnp_fovy${UR5_CAMERA_FOV}_viewpoint_silhouette_refined.json}"
 SIL_REFINE_FRAME_STRIDE="${SIL_REFINE_FRAME_STRIDE:-4}"
@@ -67,23 +71,39 @@ fi
 
 if [[ "$REPAIR_UR5_QPOS" == "1" ]]; then
   echo
-  echo "==> repair UR5 MuJoCo qpos to match AugE convention"
-  "$PYTHON" "$REPO_ROOT/tools/repair_ur5_mujoco_qpos.py" \
-    --oxe_root "$OXE_ROOT" \
-    --dataset "$DATASET"
+  echo "==> repair UR5 MuJoCo qpos/TCP to match AugE convention"
+  REPAIR_ARGS=(--oxe_root "$OXE_ROOT" --dataset "$DATASET" --tcp_source "$UR5_TCP_SOURCE")
+  if [[ "$UR5_TCP_SOURCE" == "auge_fk" ]]; then
+    REPAIR_ARGS+=(--mujoco_xml_path "$UR5_MUJOCO_XML_PATH")
+  fi
+  "$PYTHON" "$REPO_ROOT/tools/repair_ur5_mujoco_qpos.py" "${REPAIR_ARGS[@]}"
 fi
 
 if [[ -f "$UR5_MUJOCO_XML_PATH" ]]; then
   echo
-  echo "==> check UR5 MuJoCo FK against logged TCP"
+  echo "==> check UR5 MuJoCo FK against active PnP TCP"
   "$PYTHON" "$REPO_ROOT/tools/check_mujoco_fk_vs_tcp.py" \
     --oxe_root "$OXE_ROOT" \
     --dataset "$DATASET" \
     --mujoco_xml_path "$UR5_MUJOCO_XML_PATH" \
     --qpos_key "$UR5_MUJOCO_QPOS_KEY" \
+    --tcp_key eef_xyz \
     --base_body "$UR5_MUJOCO_BASE_BODY" \
     --frame_stride 8 \
     --max_frames 32
+  if [[ "$UR5_TCP_SOURCE" == "auge_fk" ]]; then
+    echo
+    echo "==> check UR5 MuJoCo FK against official logged TCP for reference"
+    "$PYTHON" "$REPO_ROOT/tools/check_mujoco_fk_vs_tcp.py" \
+      --oxe_root "$OXE_ROOT" \
+      --dataset "$DATASET" \
+      --mujoco_xml_path "$UR5_MUJOCO_XML_PATH" \
+      --qpos_key "$UR5_MUJOCO_QPOS_KEY" \
+      --tcp_key logged_eef_xyz \
+      --base_body "$UR5_MUJOCO_BASE_BODY" \
+      --frame_stride 8 \
+      --max_frames 32
+  fi
 fi
 
 echo
@@ -118,7 +138,7 @@ echo "==> RobotSeg at native spatial resolution: infer_max_side=$INFER_MAX_SIDE"
     --overwrite)
 
 echo
-echo "==> PnP with UR5 TCP state + viewpoint fovy"
+echo "==> PnP with UR5 TCP source=$UR5_TCP_SOURCE + viewpoint fovy"
 PNP_OFFSET_ARGS=()
 if [[ "$UR5_SOLVE_TOOL_OFFSET" == "1" ]]; then
   echo "    UR5 PnP: --solve_tool_offset --tool_offset_bound $UR5_TOOL_OFFSET_BOUND"

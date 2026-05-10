@@ -169,7 +169,7 @@ class FreeCameraGoogleRobotRenderer:
             if requested in names:
                 return names.index(requested)
             raise ValueError(f"base body {requested!r} not found. Bodies: {names}")
-        for target in ("base", "base_link", "ur5_base", "ur5e_base", "world"):
+        for target in ("ur5e/base", "ur5_base", "ur5e_base", "base_link", "base", "world"):
             if target in names:
                 return names.index(target)
         for i, name in enumerate(names):

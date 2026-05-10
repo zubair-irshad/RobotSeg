@@ -30,7 +30,7 @@ def _find_base_body(mujoco, model, requested: str | None) -> int:
         if requested in names:
             return names.index(requested)
         raise ValueError(f"base body {requested!r} not found. Bodies: {names}")
-    for target in ("base", "base_link", "ur5_base", "ur5e_base", "world"):
+    for target in ("ur5e/base", "ur5_base", "ur5e_base", "base_link", "base", "world"):
         if target in names:
             return names.index(target)
     for i, name in enumerate(names):
@@ -60,17 +60,21 @@ def _load_qpos(traj, key: str) -> np.ndarray:
     return arr
 
 
-def _load_tcp(traj) -> np.ndarray:
+def _load_tcp(traj, key: str) -> tuple[np.ndarray, str]:
+    if key in traj.files:
+        return np.asarray(traj[key], dtype=np.float64), key
+    if key != "eef_xyz":
+        raise KeyError(f"trajectory.npz has no TCP key {key!r}")
     if "eef_xyz" in traj.files:
-        return np.asarray(traj["eef_xyz"], dtype=np.float64)
-    return np.asarray(traj["state"], dtype=np.float64)[:, 6:9]
+        return np.asarray(traj["eef_xyz"], dtype=np.float64), "eef_xyz"
+    return np.asarray(traj["state"], dtype=np.float64)[:, 6:9], "state[:,6:9]"
 
 
 def _candidate_names(names: list[str], requested: list[str] | None) -> list[str]:
     if requested:
         return requested
     keep = []
-    needles = ("tcp", "tool", "ee", "eef", "end", "gripper", "finger", "wrist", "flange")
+    needles = ("tcp", "tool", "ee", "eef", "end", "gripper", "finger", "wrist", "flange", "attachment")
     for name in names:
         low = name.lower()
         if any(k in low for k in needles):
@@ -92,7 +96,7 @@ def _stats(err: list[float]) -> dict[str, float]:
 def process_episode(args, mujoco, model, ep_dir: Path) -> dict:
     traj_path = ep_dir / "trajectory.npz"
     with np.load(traj_path, allow_pickle=True) as traj:
-        tcp = _load_tcp(traj)
+        tcp, tcp_key = _load_tcp(traj, args.tcp_key)
         qpos = _load_qpos(traj, args.qpos_key)
 
     n = min(len(tcp), len(qpos))
@@ -147,6 +151,7 @@ def process_episode(args, mujoco, model, ep_dir: Path) -> dict:
     rows.sort(key=lambda r: r["base"]["median_m"])
     return {
         "episode": ep_dir.name,
+        "tcp_key": tcp_key,
         "num_frames": len(indices),
         "base_body": base_body_name,
         "best": rows[0] if rows else None,
@@ -162,6 +167,7 @@ def main() -> None:
     parser.add_argument("--dataset", default="berkeley_autolab_ur5")
     parser.add_argument("--mujoco_xml_path", type=Path, required=True)
     parser.add_argument("--qpos_key", default="joint_position")
+    parser.add_argument("--tcp_key", default="eef_xyz")
     parser.add_argument("--base_body", default="auto")
     parser.add_argument("--episodes", nargs="+", default=None)
     parser.add_argument("--site_names", nargs="+", default=None)
@@ -191,6 +197,7 @@ def main() -> None:
             continue
         print(
             f"[{args.dataset}/{ep}] base_body={result['base_body']} "
+            f"tcp={result['tcp_key']} "
             f"best={best['kind']}:{best['name']} "
             f"base_med={100*best['base']['median_m']:.2f}cm "
             f"world_med={100*best['world']['median_m']:.2f}cm "

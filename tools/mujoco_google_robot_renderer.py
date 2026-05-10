@@ -27,6 +27,15 @@ def _invert_se3(T: np.ndarray) -> np.ndarray:
     return out
 
 
+def _body_T_world(mujoco, model, data, body_id: int) -> np.ndarray:
+    T = np.eye(4, dtype=np.float64)
+    if body_id <= 0:
+        return T
+    T[:3, :3] = np.asarray(data.xmat[body_id], dtype=np.float64).reshape(3, 3)
+    T[:3, 3] = np.asarray(data.xpos[body_id], dtype=np.float64)
+    return T
+
+
 def _camera_quat_wxyz_from_cv_cam2base(T_cam2base: np.ndarray) -> np.ndarray:
     # OpenCV camera: +x right, +y down, +z forward.
     # MuJoCo/OpenGL camera: +x right, +y up, -z forward.
@@ -80,7 +89,8 @@ class MuJoCoGoogleRobotRenderer:
     def __init__(self, xml_path: str | Path, verbose: bool = True,
                  postprocess: str = "none", geom_groups: tuple[int, ...] = (2,),
                  geom_name_include: str | None = None,
-                 geom_name_exclude: str | None = None):
+                 geom_name_exclude: str | None = None,
+                 base_body: str | None = None):
         os.environ.setdefault("MUJOCO_GL", "egl")
         import mujoco  # type: ignore
 
@@ -98,7 +108,44 @@ class MuJoCoGoogleRobotRenderer:
         self.geom_groups = tuple(int(g) for g in geom_groups)
         self.geom_name_include = geom_name_include
         self.geom_name_exclude = geom_name_exclude
+        self.base_body = base_body
         self._robot_geom_ids: set[int] | None = None
+        self._T_world_base = self._load_world_base_transform()
+
+    def _body_names(self, model) -> list[str]:
+        return [
+            self.mujoco.mj_id2name(model, self.mujoco.mjtObj.mjOBJ_BODY, i) or ""
+            for i in range(int(model.nbody))
+        ]
+
+    def _resolve_base_body(self, model, requested: str | None) -> int:
+        if requested is None or requested == "":
+            return 0
+        names = self._body_names(model)
+        if requested != "auto":
+            if requested in names:
+                return names.index(requested)
+            raise ValueError(f"base body {requested!r} not found. Bodies: {names}")
+        for target in ("base", "base_link", "ur5_base", "ur5e_base", "world"):
+            if target in names:
+                return names.index(target)
+        for i, name in enumerate(names):
+            if "base" in name.lower():
+                return i
+        return 0
+
+    def _load_world_base_transform(self) -> np.ndarray:
+        if self.base_body is None or self.base_body == "":
+            return np.eye(4, dtype=np.float64)
+        model = self.mujoco.MjModel.from_xml_path(str(self.xml_path))
+        data = self.mujoco.MjData(model)
+        self.mujoco.mj_forward(model, data)
+        body_id = self._resolve_base_body(model, self.base_body)
+        T = _body_T_world(self.mujoco, model, data, body_id)
+        if self.verbose:
+            names = self._body_names(model)
+            print(f"[mujoco_render] base_body={names[body_id] if body_id < len(names) else body_id} T_world_base={np.round(T[:3, 3], 5).tolist()}")
+        return T
 
     def _geom_name(self, geom_id: int) -> str:
         assert self.model is not None
@@ -158,7 +205,8 @@ class MuJoCoGoogleRobotRenderer:
                 self._tmp_xml.unlink()
             except FileNotFoundError:
                 pass
-        self._tmp_xml = _xml_with_camera(self.xml_path, T_cam2base, K, H, W)
+        T_cam2world = self._T_world_base @ np.asarray(T_cam2base, dtype=np.float64)
+        self._tmp_xml = _xml_with_camera(self.xml_path, T_cam2world, K, H, W)
         self.model = self.mujoco.MjModel.from_xml_path(str(self._tmp_xml))
         self.data = self.mujoco.MjData(self.model)
         self.renderer = self.mujoco.Renderer(self.model, height=H, width=W)

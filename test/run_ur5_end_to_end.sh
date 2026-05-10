@@ -36,6 +36,7 @@ UR5_MUJOCO_QPOS_KEY="${UR5_MUJOCO_QPOS_KEY:-joint_position}"
 UR5_MUJOCO_GEOM_GROUPS="${UR5_MUJOCO_GEOM_GROUPS:-2}"
 UR5_MUJOCO_GEOM_NAME_INCLUDE="${UR5_MUJOCO_GEOM_NAME_INCLUDE:-}"
 UR5_MUJOCO_GEOM_NAME_EXCLUDE="${UR5_MUJOCO_GEOM_NAME_EXCLUDE:-floor|table|desk|wall|world|scene|camera|light|object|prop|box|bin|tray|cloth|pad|plane}"
+UR5_MUJOCO_BASE_BODY="${UR5_MUJOCO_BASE_BODY:-auto}"
 UR5_VIEWPOINTS_JSON="${UR5_VIEWPOINTS_JSON:-$REPO_ROOT/data/viewpoints/berkeley_autolab_ur5_viewpoints.json}"
 VIEWPOINT_REFINED_PNP_JSON_NAME="${VIEWPOINT_REFINED_PNP_JSON_NAME:-pnp_fovy${UR5_CAMERA_FOV}_viewpoint_silhouette_refined.json}"
 SIL_REFINE_FRAME_STRIDE="${SIL_REFINE_FRAME_STRIDE:-4}"
@@ -53,6 +54,7 @@ fi
 if [[ -n "$UR5_MUJOCO_GEOM_NAME_EXCLUDE" ]]; then
   MUJOCO_NAME_FILTER_ARGS+=(--mujoco_geom_name_exclude "$UR5_MUJOCO_GEOM_NAME_EXCLUDE")
 fi
+MUJOCO_NAME_FILTER_ARGS+=(--mujoco_base_body "$UR5_MUJOCO_BASE_BODY")
 
 if [[ "$DOWNLOAD" == "1" ]]; then
   echo "==> download UR5 OXE subset"
@@ -69,6 +71,19 @@ if [[ "$REPAIR_UR5_QPOS" == "1" ]]; then
   "$PYTHON" "$REPO_ROOT/tools/repair_ur5_mujoco_qpos.py" \
     --oxe_root "$OXE_ROOT" \
     --dataset "$DATASET"
+fi
+
+if [[ -f "$UR5_MUJOCO_XML_PATH" ]]; then
+  echo
+  echo "==> check UR5 MuJoCo FK against logged TCP"
+  "$PYTHON" "$REPO_ROOT/tools/check_mujoco_fk_vs_tcp.py" \
+    --oxe_root "$OXE_ROOT" \
+    --dataset "$DATASET" \
+    --mujoco_xml_path "$UR5_MUJOCO_XML_PATH" \
+    --qpos_key "$UR5_MUJOCO_QPOS_KEY" \
+    --base_body "$UR5_MUJOCO_BASE_BODY" \
+    --frame_stride 8 \
+    --max_frames 32
 fi
 
 echo

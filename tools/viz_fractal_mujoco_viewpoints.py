@@ -132,7 +132,8 @@ class FreeCameraGoogleRobotRenderer:
     def __init__(self, xml_path: Path, height: int, width: int,
                  geom_groups: tuple[int, ...] = (2,),
                  geom_name_include: str | None = None,
-                 geom_name_exclude: str | None = None):
+                 geom_name_exclude: str | None = None,
+                 base_body: str | None = None):
         os.environ.setdefault("MUJOCO_GL", "egl")
         import mujoco  # type: ignore
 
@@ -149,8 +150,40 @@ class FreeCameraGoogleRobotRenderer:
         self.geom_name_include = geom_name_include
         self.geom_name_exclude = geom_name_exclude
         self._robot_geom_ids = self._allowed_geom_ids()
+        self.base_body = base_body
+        self._base_body_id = self._resolve_base_body(base_body)
         self.camera = mujoco.MjvCamera()
         self.camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+
+    def _body_names(self) -> list[str]:
+        return [
+            self.mujoco.mj_id2name(self.model, self.mujoco.mjtObj.mjOBJ_BODY, i) or ""
+            for i in range(int(self.model.nbody))
+        ]
+
+    def _resolve_base_body(self, requested: str | None) -> int:
+        if requested is None or requested == "":
+            return 0
+        names = self._body_names()
+        if requested != "auto":
+            if requested in names:
+                return names.index(requested)
+            raise ValueError(f"base body {requested!r} not found. Bodies: {names}")
+        for target in ("base", "base_link", "ur5_base", "ur5e_base", "world"):
+            if target in names:
+                return names.index(target)
+        for i, name in enumerate(names):
+            if "base" in name.lower():
+                return i
+        return 0
+
+    def _T_world_base(self) -> np.ndarray:
+        T = np.eye(4, dtype=np.float64)
+        if self._base_body_id <= 0:
+            return T
+        T[:3, :3] = np.asarray(self.data.xmat[self._base_body_id], dtype=np.float64).reshape(3, 3)
+        T[:3, 3] = np.asarray(self.data.xpos[self._base_body_id], dtype=np.float64)
+        return T
 
     def _geom_name(self, geom_id: int) -> str:
         name = self.mujoco.mj_id2name(self.model, self.mujoco.mjtObj.mjOBJ_GEOM, int(geom_id))
@@ -248,7 +281,7 @@ class FreeCameraGoogleRobotRenderer:
         T = np.eye(4, dtype=np.float64)
         T[:3, :3] = R_cv_cam2base
         T[:3, 3] = pos
-        return T
+        return np.linalg.inv(self._T_world_base()) @ T
 
 
 def _load_qpos(traj, key: str | None = None) -> np.ndarray:
@@ -315,6 +348,7 @@ def process_episode(args: argparse.Namespace, ep_name: str) -> dict:
                 geom_groups=_parse_groups(args.mujoco_geom_groups),
                 geom_name_include=args.mujoco_geom_name_include,
                 geom_name_exclude=args.mujoco_geom_name_exclude,
+                base_body=args.mujoco_base_body,
             )
             viewpoints = _load_viewpoints(args.viewpoints_json)
             frame_dir = out_root / f"frame_{stem}"
@@ -365,6 +399,7 @@ def main() -> None:
     p.add_argument("--mujoco_geom_groups", default="2")
     p.add_argument("--mujoco_geom_name_include", default=None)
     p.add_argument("--mujoco_geom_name_exclude", default=None)
+    p.add_argument("--mujoco_base_body", default=None)
     p.add_argument("--viewpoints_json", type=Path, default=None)
     p.add_argument("--target_mask_dirs", nargs="+", default=["000"])
     p.add_argument("--out_dir_name", default="mujoco_viewpoint_check")

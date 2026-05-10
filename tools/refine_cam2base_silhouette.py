@@ -456,6 +456,7 @@ def _best_viewpoint_initial_pose(
         geom_groups=_parse_groups(args.mujoco_geom_groups),
         geom_name_include=args.mujoco_geom_name_include,
         geom_name_exclude=args.mujoco_geom_name_exclude,
+        base_body=args.mujoco_base_body,
     )
     try:
         best_idx = -1
@@ -647,6 +648,8 @@ def main() -> None:
                         help="Optional regex for MuJoCo geom names to keep in rendered masks.")
     parser.add_argument("--mujoco_geom_name_exclude", default=None,
                         help="Optional regex for MuJoCo geom names to remove from rendered masks.")
+    parser.add_argument("--mujoco_base_body", default=None,
+                        help="Body whose frame is the dataset robot base. Use 'auto' to infer; default assumes MuJoCo world == dataset base.")
     parser.add_argument(
         "--mujoco_postprocess",
         choices=["none", "auge", "flip_x", "flip_y", "rot180"],
@@ -708,6 +711,7 @@ def main() -> None:
             geom_groups=_parse_groups(args.mujoco_geom_groups),
             geom_name_include=args.mujoco_geom_name_include,
             geom_name_exclude=args.mujoco_geom_name_exclude,
+            base_body=args.mujoco_base_body,
         )
     else:
         include_prefixes = _parse_prefixes(args.render_link_prefixes)

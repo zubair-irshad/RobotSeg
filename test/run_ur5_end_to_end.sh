@@ -24,6 +24,9 @@ PNP_JSON_NAME="${PNP_JSON_NAME:-pnp_fovy${UR5_CAMERA_FOV}.json}"
 REFINED_PNP_JSON_NAME="${REFINED_PNP_JSON_NAME:-pnp_fovy${UR5_CAMERA_FOV}_silhouette_refined.json}"
 PNP_EXTRA_ARGS_STR="${PNP_EXTRA_ARGS_STR:---no_use_observed_flag --no_use_mask_stage_accept --no_reject_fragmented --min_conf 0.0 --min_conf_max 0.0 --min_gripper_area_px 8 --min_post_subtract_area_ratio 0.0}"
 SEG_EXTRA_ARGS_STR="${SEG_EXTRA_ARGS_STR:---no_require_gripper_near_arm --relax_gripper_observed}"
+REPAIR_UR5_QPOS="${REPAIR_UR5_QPOS:-1}"
+UR5_SOLVE_TOOL_OFFSET="${UR5_SOLVE_TOOL_OFFSET:-1}"
+UR5_TOOL_OFFSET_BOUND="${UR5_TOOL_OFFSET_BOUND:-0.30}"
 RUN_MUJOCO_RENDER="${RUN_MUJOCO_RENDER:-1}"
 RUN_SILHOUETTE_REFINE="${RUN_SILHOUETTE_REFINE:-0}"
 RUN_VIEWPOINT_INIT_REFINE="${RUN_VIEWPOINT_INIT_REFINE:-0}"
@@ -47,6 +50,14 @@ if [[ "$DOWNLOAD" == "1" ]]; then
     --datasets "$DATASET" \
     --num_episodes "$NUM_EPISODES" \
     --frame_stride "$FRAME_STRIDE"
+fi
+
+if [[ "$REPAIR_UR5_QPOS" == "1" ]]; then
+  echo
+  echo "==> repair UR5 MuJoCo qpos to match AugE convention"
+  "$PYTHON" "$REPO_ROOT/tools/repair_ur5_mujoco_qpos.py" \
+    --oxe_root "$OXE_ROOT" \
+    --dataset "$DATASET"
 fi
 
 echo
@@ -82,6 +93,11 @@ echo "==> RobotSeg at native spatial resolution: infer_max_side=$INFER_MAX_SIDE"
 
 echo
 echo "==> PnP with UR5 TCP state + viewpoint fovy"
+PNP_OFFSET_ARGS=()
+if [[ "$UR5_SOLVE_TOOL_OFFSET" == "1" ]]; then
+  echo "    UR5 PnP: --solve_tool_offset --tool_offset_bound $UR5_TOOL_OFFSET_BOUND"
+  PNP_OFFSET_ARGS=(--solve_tool_offset --tool_offset_bound "$UR5_TOOL_OFFSET_BOUND")
+fi
 "$PYTHON" "$REPO_ROOT/tools/pnp_oxe.py" \
   --oxe_root "$OXE_ROOT" \
   --mask_root "$MASK_ROOT" \
@@ -91,6 +107,7 @@ echo "==> PnP with UR5 TCP state + viewpoint fovy"
   --fov_mode vertical \
   --print_intrinsics \
   --pnp_json_name "$PNP_JSON_NAME" \
+  "${PNP_OFFSET_ARGS[@]}" \
   "${PNP_EXTRA_ARGS[@]}" \
   --viz
 
@@ -136,6 +153,7 @@ if [[ "$RUN_SILHOUETTE_REFINE" == "1" ]]; then
         --max_frames "$SIL_REFINE_MAX_FRAMES" \
         --max_evals "$SIL_REFINE_MAX_EVALS" \
         --viz_dir_name silhouette_refined_from_viewpoint_viz
+      VIS_PNP_JSON_NAME="$VIEWPOINT_REFINED_PNP_JSON_NAME"
     fi
   fi
 fi

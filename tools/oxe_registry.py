@@ -52,9 +52,9 @@ OXE_DATASETS = {
         "joint_key": "robot_state",
         "action_key": "action",
         "state_schema": (
-            "robot_state[15]: joints(0:6), gripper_is_closed(6), "
-            "tcp_xyz(7:10), tcp_quat_wxyz(10:14), gripper_state(14). "
-            "EE xyz = [7:10]."
+            "robot_state[15]: first 6 dims are UR5 arm joints. AugE/MuJoCo "
+            "qpos uses those 6 plus 8 synthetic gripper joints selected from "
+            "robot_state[-2]. EE xyz currently uses [7:10]."
         ),
         "fps_note": "5 Hz",
     },

@@ -118,8 +118,18 @@ def _metrics(target: np.ndarray, render: np.ndarray) -> dict[str, float]:
     }
 
 
+def _parse_groups(text: str) -> tuple[int, ...]:
+    vals = []
+    for part in str(text).split(","):
+        part = part.strip()
+        if part:
+            vals.append(int(part))
+    return tuple(vals) or (2,)
+
+
 class FreeCameraGoogleRobotRenderer:
-    def __init__(self, xml_path: Path, height: int, width: int):
+    def __init__(self, xml_path: Path, height: int, width: int,
+                 geom_groups: tuple[int, ...] = (2,)):
         os.environ.setdefault("MUJOCO_GL", "egl")
         import mujoco  # type: ignore
 
@@ -129,8 +139,10 @@ class FreeCameraGoogleRobotRenderer:
         self.renderer = mujoco.Renderer(self.model, height=height, width=width)
         self.scene_option = mujoco.MjvOption()
         self.scene_option.geomgroup[:] = 0
-        if len(self.scene_option.geomgroup) > 2:
-            self.scene_option.geomgroup[2] = 1
+        self.geom_groups = tuple(int(g) for g in geom_groups)
+        for group in self.geom_groups:
+            if 0 <= group < len(self.scene_option.geomgroup):
+                self.scene_option.geomgroup[group] = 1
         self.camera = mujoco.MjvCamera()
         self.camera.type = mujoco.mjtCamera.mjCAMERA_FREE
 
@@ -203,10 +215,17 @@ class FreeCameraGoogleRobotRenderer:
         return T
 
 
-def _load_qpos(traj) -> np.ndarray:
-    if "google_robot_all_qpos" not in traj.files:
-        raise RuntimeError("trajectory.npz has no google_robot_all_qpos; run RUN_AUGE_IK=1 first")
-    qpos = np.asarray(traj["google_robot_all_qpos"], dtype=np.float64)
+def _load_qpos(traj, key: str | None = None) -> np.ndarray:
+    candidates = []
+    if key:
+        candidates.append(key)
+    candidates += ["google_robot_all_qpos", "all_qpos", "joint_position", "joint_positions", "joints", "q"]
+    for name in candidates:
+        if name in traj.files:
+            qpos = np.asarray(traj[name], dtype=np.float64)
+            break
+    else:
+        raise RuntimeError(f"trajectory.npz has no MuJoCo qpos. Tried: {candidates}")
     if qpos.ndim == 1:
         qpos = qpos.reshape(1, -1)
     return qpos
@@ -239,7 +258,7 @@ def process_episode(args: argparse.Namespace, ep_name: str) -> dict:
     out_root.mkdir(parents=True, exist_ok=True)
     rows = []
     with np.load(traj_path, allow_pickle=True) as traj:
-        qpos = _load_qpos(traj)
+        qpos = _load_qpos(traj, args.mujoco_qpos_key)
         for stem in stems:
             img = cv2.imread(str(ep_oxe / "frames" / f"{stem}.jpg"))
             if img is None:
@@ -253,7 +272,12 @@ def process_episode(args: argparse.Namespace, ep_name: str) -> dict:
             target = np.zeros((H, W), dtype=bool)
             for mask_dir in args.target_mask_dirs:
                 target |= _read_mask(_mask_path(ep_seg, mask_dir, stem), (H, W))
-            renderer = FreeCameraGoogleRobotRenderer(args.mujoco_xml_path, H, W)
+            renderer = FreeCameraGoogleRobotRenderer(
+                args.mujoco_xml_path,
+                H,
+                W,
+                geom_groups=_parse_groups(args.mujoco_geom_groups),
+            )
             viewpoints = _load_viewpoints(args.viewpoints_json)
             frame_dir = out_root / f"frame_{stem}"
             frame_dir.mkdir(parents=True, exist_ok=True)
@@ -299,6 +323,8 @@ def main() -> None:
     p.add_argument("--frames", nargs="+", default=None)
     p.add_argument("--pnp_json_name", default="pnp_fovy57.json")
     p.add_argument("--mujoco_xml_path", type=Path, required=True)
+    p.add_argument("--mujoco_qpos_key", default=None)
+    p.add_argument("--mujoco_geom_groups", default="2")
     p.add_argument("--viewpoints_json", type=Path, default=None)
     p.add_argument("--target_mask_dirs", nargs="+", default=["000"])
     p.add_argument("--out_dir_name", default="mujoco_viewpoint_check")

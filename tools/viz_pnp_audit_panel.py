@@ -25,7 +25,7 @@ from cam2base_json import (  # noqa: E402
     find_T_cam2base,
     load_json,
 )
-from pnp_oxe import EE_XYZ_DIMS, _fk_point_sequence, _K_to_mat  # noqa: E402
+from pnp_oxe import EE_XYZ_DIMS, _eef_rot_to_R, _fk_point_sequence, _K_to_mat  # noqa: E402
 from urdf_robot_masker import URDFRobotMasker  # noqa: E402
 from viz_cam2base_urdf import DEFAULT_URDF  # noqa: E402
 
@@ -99,6 +99,22 @@ def _load_points(dataset: str, traj, n: int, args, point_source: str) -> np.ndar
     if pts is None:
         raise RuntimeError(f"could not load PnP point source {point_source}: {status}")
     return pts
+
+
+def _points_with_tool_offset(points: np.ndarray, traj, pnp: dict) -> np.ndarray:
+    if "tool_offset" not in pnp or "eef_rot" not in traj.files:
+        return points
+    try:
+        fmt = str(traj["eef_rot_format"]) if "eef_rot_format" in traj.files else "quat_xyzw"
+        R = _eef_rot_to_R(traj["eef_rot"], fmt)
+        offset = np.asarray(pnp["tool_offset"], dtype=np.float64).reshape(3)
+        n = min(len(points), len(R))
+        out = np.asarray(points, dtype=np.float64).copy()
+        out[:n] = out[:n] + (R[:n] @ offset)
+        return out
+    except Exception as exc:
+        print(f"[warn] could not apply PnP tool_offset in audit panel: {exc}")
+        return points
 
 
 def _load_joints(traj) -> np.ndarray | None:
@@ -252,6 +268,7 @@ def process_episode(dataset: str, ep: str, args, masker: URDFRobotMasker | None)
 
     with np.load(ep_oxe / "trajectory.npz", allow_pickle=True) as traj:
         points = _load_points(dataset, traj, len(centroids), args, pnp.get("point_source", "eef_xyz"))
+        points = _points_with_tool_offset(points, traj, pnp)
         joints = _load_joints(traj)
         mujoco_qpos = _load_mujoco_qpos(traj, args.mujoco_qpos_key) if args.mujoco_xml_path is not None else None
         render_state = mujoco_qpos if mujoco_qpos is not None else joints

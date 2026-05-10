@@ -418,7 +418,12 @@ def _best_viewpoint_initial_pose(
 
     H, W = int(K["height"]), int(K["width"])
     viewpoints = _load_viewpoints(args.viewpoints_json)
-    renderer = FreeCameraGoogleRobotRenderer(args.mujoco_xml_path, H, W)
+    renderer = FreeCameraGoogleRobotRenderer(
+        args.mujoco_xml_path,
+        H,
+        W,
+        geom_groups=_parse_groups(args.mujoco_geom_groups),
+    )
     try:
         best_idx = -1
         best_score = -1.0

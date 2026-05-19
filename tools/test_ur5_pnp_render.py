@@ -17,12 +17,64 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import numpy as np
 import imageio.v3 as iio
 
 from mujoco_ur5_renderer import MuJoCoUR5Renderer, UR5_CLOSED_GRIPPER  # noqa: E402
+
+
+# AugE config["berkeley_autolab_ur5"]["viewpoints"][0], pasted verbatim.
+AUGE_VIEWPOINT_BERKELEY_UR5 = {
+    "lookat":     [0.24398564, 0.23394822, 0.25454247],
+    "distance":   0.36241041268887836,
+    "azimuth":    140.5502567979282 - 180.0,
+    "elevation": -42.125,
+    "camera_fov": 57.82240163683314,
+}
+
+
+def auge_viewpoint_to_pnp_inputs(viewpoint: dict, H: int, W: int,
+                                 ) -> tuple[dict, np.ndarray]:
+    """Convert an AugE MjvCamera-style viewpoint to (K_dict, T_cam2base_OpenCV).
+
+    Returns the same shapes the MuJoCoUR5Renderer expects from PnP, so the
+    renderer code path is identical for both inputs. Assumes the robot's base
+    body sits at the world origin (true for AugE's UR5e scene.xml — confirmed
+    by renderer's T_world_base_t=[0,0,0]).
+    """
+    az = math.radians(float(viewpoint["azimuth"]))
+    el = math.radians(float(viewpoint["elevation"]))
+    d  = float(viewpoint["distance"])
+    lookat = np.asarray(viewpoint["lookat"], dtype=np.float64)
+
+    # Direction the camera is looking (world frame).
+    forward = np.array([math.cos(el) * math.cos(az),
+                        math.cos(el) * math.sin(az),
+                        math.sin(el)], dtype=np.float64)
+    cam_pos = lookat - d * forward
+
+    # MuJoCo/GL camera local axes (right, up, -forward) expressed in world.
+    world_up = np.array([0.0, 0.0, 1.0])
+    right = np.cross(forward, world_up); right /= np.linalg.norm(right)
+    up    = np.cross(right, forward);    up    /= np.linalg.norm(up)
+    R_cam2world_mj = np.column_stack([right, up, -forward])
+
+    # Renderer expects OpenCV cam2base; it re-applies diag(1,-1,-1) to map
+    # back to MuJoCo. So pre-bake the inverse here.
+    R_cam2world_cv = R_cam2world_mj @ np.diag([1.0, -1.0, -1.0])
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R_cam2world_cv
+    T[:3, 3]  = cam_pos
+
+    # MuJoCo uses vertical FOV with square pixels; recover K from fovy.
+    fovy = float(viewpoint["camera_fov"])
+    fy = 0.5 * H / math.tan(math.radians(fovy) * 0.5)
+    K = {"fx": float(fy), "fy": float(fy),
+         "cx": float(W) / 2.0, "cy": float(H) / 2.0}
+    return K, T
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -96,6 +148,8 @@ def main() -> None:
     ap.add_argument("--geom-groups", type=int, nargs="+", default=[2])
     ap.add_argument("--side-by-side", action="store_true",
                     help="emit [image | render-mask | overlay] panel")
+    ap.add_argument("--also-auge", action="store_true",
+                    help="also render the AugE viewpoint and stack it underneath the PnP panel")
     ap.add_argument("--fps",   type=int,   default=5)
     ap.add_argument("--alpha", type=float, default=0.65)
     ap.add_argument("--limit", type=int,   default=0, help="max frames (0 = all)")
@@ -125,22 +179,62 @@ def main() -> None:
         base_body=args.base_body,
     )
 
-    out_frames = []
-    for i in range(n):
-        mask = renderer.render(K=K, T_cam2base=T_cam2base,
-                               qpos=qpos[i], gripper_closed=bool(gripper[i]),
-                               image_hw=(H, W))
-        overlay = colorize_robot(mask, frames[i], alpha=args.alpha)
+    K_auge = T_auge = None
+    if args.also_auge:
+        K_auge, T_auge = auge_viewpoint_to_pnp_inputs(
+            AUGE_VIEWPOINT_BERKELEY_UR5, H=H, W=W,
+        )
+        print(f"[test] AugE K fx=fy={K_auge['fx']:.2f} cx={K_auge['cx']:.1f} cy={K_auge['cy']:.1f}")
+        print(f"[test] AugE T_cam2base t={np.round(T_auge[:3, 3], 4).tolist()}")
+
+    def _render_panel(K_in, T_in, bg, qp, gc, tag: str) -> np.ndarray:
+        mask = renderer.render(K=K_in, T_cam2base=T_in,
+                               qpos=qp, gripper_closed=gc, image_hw=(H, W))
+        overlay = colorize_robot(mask, bg, alpha=args.alpha)
         if args.side_by_side:
             mask_rgb = (np.stack([mask] * 3, axis=-1) * 255).astype(np.uint8)
-            panel = np.concatenate([frames[i], mask_rgb, overlay], axis=1)
-            out_frames.append(panel)
+            row = np.concatenate([bg, mask_rgb, overlay], axis=1)
         else:
-            out_frames.append(overlay)
+            row = overlay
+        # tiny label burn-in (top-left)
+        import cv2  # local import to avoid hard dep elsewhere
+        cv2.putText(row, tag, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+        return row
+
+    out_frames = []
+    for i in range(n):
+        pnp_row = _render_panel(K, T_cam2base, frames[i], qpos[i],
+                                bool(gripper[i]), "PnP")
+        if args.also_auge:
+            auge_row = _render_panel(K_auge, T_auge, frames[i], qpos[i],
+                                     bool(gripper[i]), "AugE viewpoint")
+            out_frames.append(np.concatenate([pnp_row, auge_row], axis=0))
+        else:
+            out_frames.append(pnp_row)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    iio.imwrite(args.out, np.stack(out_frames), fps=args.fps)
-    print(f"[test] wrote {args.out}")
+    stacked = np.stack(out_frames)
+    wrote = False
+    for kwargs in (
+        {"fps": args.fps, "codec": "libx264", "pixel_format": "yuv420p"},
+        {"fps": args.fps, "codec": "mpeg4"},
+        {"fps": args.fps, "plugin": "FFMPEG"},
+    ):
+        try:
+            iio.imwrite(args.out, stacked, **kwargs)
+            print(f"[test] wrote {args.out} with {kwargs}")
+            wrote = True
+            break
+        except Exception as e:
+            print(f"[test] writer {kwargs} failed: {e}")
+    if not wrote:
+        # last resort: dump per-frame PNGs next to the requested path
+        dump_dir = args.out.with_suffix("")
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        for i, fr in enumerate(stacked):
+            iio.imwrite(dump_dir / f"frame_{i:04d}.png", fr)
+        print(f"[test] no video writer worked; wrote PNG frames to {dump_dir}/")
     renderer.close()
 
 

@@ -1,10 +1,38 @@
 # Per-embodiment thresholds for mask -> keypoint extraction.
-# Phase 0: start with `default` for everyone, tune per-embodiment after inspecting overlays.
-# Embodiment key matches the middle token of VRS video name, e.g. "01_franka".
+# Keys match the middle token of VRS video names, e.g. "01_franka".
+# Any embodiment not listed inherits from `default`.
+
 default:
   min_gripper_area: 200
-  largest_cc_frac: 0.70
+  min_cc_area: 30
+  max_cc: 6
   junction_dilate: 3
   center_exclude_dilate: 5
   min_separation: 8.0
   edge_margin: 4
+  bimanual: 0
+  cluster_eps: 60.0
+
+# IIWA gripper is small / distant in many frames.
+08_kukaiiwa:
+  min_gripper_area: 50
+  min_cc_area: 15
+  max_cc: 6
+  junction_dilate: 3
+  center_exclude_dilate: 5
+  min_separation: 6.0
+  edge_margin: 4
+  bimanual: 0
+  cluster_eps: 60.0
+
+# Mobile-Aloha has two arms; cluster gripper CCs into instances.
+04_mobilealoha:
+  min_gripper_area: 150
+  min_cc_area: 30
+  max_cc: 8
+  junction_dilate: 3
+  center_exclude_dilate: 5
+  min_separation: 8.0
+  edge_margin: 4
+  bimanual: 1
+  cluster_eps: 60.0

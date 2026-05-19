@@ -115,25 +115,37 @@ def read_mask(p: Path) -> np.ndarray | None:
     return m > 0
 
 
-def overlay(img_bgr: np.ndarray, arm: np.ndarray, gri: np.ndarray, res) -> np.ndarray:
+def overlay(img_bgr: np.ndarray, arm: np.ndarray, gri: np.ndarray,
+            results: list) -> np.ndarray:
     out = img_bgr.copy()
     tint = np.zeros_like(out)
     tint[arm] = (200, 60, 0)        # arm: blue
     tint[gri] = (0, 40, 200)        # gripper: red
     out = cv2.addWeighted(out, 0.65, tint, 0.35, 0.0)
-    if res.junction_xy is not None:
-        cv2.circle(out, (int(res.junction_xy[0]), int(res.junction_xy[1])),
-                   5, (0, 255, 0), -1, lineType=cv2.LINE_AA)
-    if res.center_xy is not None:
-        cv2.circle(out, (int(res.center_xy[0]), int(res.center_xy[1])),
-                   5, (0, 255, 255), -1, lineType=cv2.LINE_AA)
-    if (res.junction_xy is not None) and (res.center_xy is not None):
-        cv2.line(out,
-                 (int(res.junction_xy[0]), int(res.junction_xy[1])),
-                 (int(res.center_xy[0]), int(res.center_xy[1])),
-                 (255, 255, 255), 1, lineType=cv2.LINE_AA)
-    label = res.reason if res.reason != "ok" else "ok"
-    color = (0, 255, 0) if res.reason == "ok" else (0, 0, 255)
+
+    for res in results:
+        if res.junction_xy is not None:
+            cv2.circle(out, (int(res.junction_xy[0]), int(res.junction_xy[1])),
+                       5, (0, 255, 0), -1, lineType=cv2.LINE_AA)
+        if res.center_xy is not None:
+            cv2.circle(out, (int(res.center_xy[0]), int(res.center_xy[1])),
+                       5, (0, 255, 255), -1, lineType=cv2.LINE_AA)
+        if (res.junction_xy is not None) and (res.center_xy is not None):
+            cv2.line(out,
+                     (int(res.junction_xy[0]), int(res.junction_xy[1])),
+                     (int(res.center_xy[0]), int(res.center_xy[1])),
+                     (255, 255, 255), 1, lineType=cv2.LINE_AA)
+
+    n_ok = sum(1 for r in results if r.reason == "ok")
+    if n_ok == len(results) and n_ok > 0:
+        label = f"ok x{n_ok}" if n_ok > 1 else "ok"
+        color = (0, 255, 0)
+    else:
+        reasons = [r.reason for r in results if r.reason != "ok"]
+        label = reasons[0] if reasons else "no_instances"
+        if n_ok > 0:
+            label = f"{n_ok}ok+{label}"
+        color = (0, 0, 255)
     cv2.putText(out, label, (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
     cv2.putText(out, label, (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
     return out
@@ -224,9 +236,10 @@ def main():
             if arm.shape != gri.shape or arm.shape != img.shape[:2]:
                 reasons["shape_mismatch"] += 1
                 continue
-            res = extract_keypoints(arm, gri, thr)
-            reasons[res.reason] += 1
-            tiles.append(overlay(img, arm, gri, res))
+            results = extract_keypoints(arm, gri, thr)
+            for r in results:
+                reasons[r.reason] += 1
+            tiles.append(overlay(img, arm, gri, results))
 
         if not tiles:
             print(f"[{emb}] all candidate frames were unreadable")

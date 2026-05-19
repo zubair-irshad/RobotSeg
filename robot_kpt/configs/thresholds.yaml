@@ -1,0 +1,10 @@
+# Per-embodiment thresholds for mask -> keypoint extraction.
+# Phase 0: start with `default` for everyone, tune per-embodiment after inspecting overlays.
+# Embodiment key matches the middle token of VRS video name, e.g. "01_franka".
+default:
+  min_gripper_area: 200
+  largest_cc_frac: 0.70
+  junction_dilate: 3
+  center_exclude_dilate: 5
+  min_separation: 8.0
+  edge_margin: 4

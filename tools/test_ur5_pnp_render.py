@@ -50,11 +50,14 @@ def auge_viewpoint_to_pnp_inputs(viewpoint: dict, H: int, W: int,
     d  = float(viewpoint["distance"])
     lookat = np.asarray(viewpoint["lookat"], dtype=np.float64)
 
-    # Direction the camera is looking (world frame).
-    forward = np.array([math.cos(el) * math.cos(az),
-                        math.cos(el) * math.sin(az),
-                        math.sin(el)], dtype=np.float64)
-    cam_pos = lookat - d * forward
+    # MuJoCo free-camera convention (engine_vis_init / mjv_moveCamera):
+    #   cam_pos = lookat + distance * (cos(az)*cos(el), sin(az)*cos(el), sin(el))
+    #   forward = -(cos(az)*cos(el), sin(az)*cos(el), sin(el))   # what the camera looks at
+    backward = np.array([math.cos(el) * math.cos(az),
+                         math.cos(el) * math.sin(az),
+                         math.sin(el)], dtype=np.float64)
+    cam_pos = lookat + d * backward
+    forward = -backward
 
     # MuJoCo/GL camera local axes (right, up, -forward) expressed in world.
     world_up = np.array([0.0, 0.0, 1.0])
